@@ -120,8 +120,8 @@ MUTANTS = [
     ),
     (
         "parts assembled out of order",
-        [(GATEWAY, "let (head, parts) = (planned.clone(), parts.clone());",
-          "let (head, parts) = (planned.clone(), parts.iter().rev().copied().collect());")],
+        [(GATEWAY, "let (head, parts) = (head.clone(), parts.clone());",
+          "let (head, parts) = (head.clone(), parts.iter().rev().copied().collect());")],
     ),
     (
         "a stale gateway entry is kept",
@@ -160,6 +160,33 @@ MUTANTS = [
     (
         "the home ignores stale reports",
         [(NODE, "stale.take().is_some_and(|stale| stale == meta.etag)", "false")],
+    ),
+    (
+        "requests queued behind a 404 each wait for their own fetch",
+        [(NODE, "let shared_answer = !known && (head.status == 404 || head.status >= 500);", "let shared_answer = false;")],
+    ),
+    (
+        "nodes never give up on S3 requests",
+        [(NODE, ".filter(|(_, request)| !request.answered && request.sent.0 + timeout <= now.0)",
+          ".filter(|(_, request)| !request.answered && request.sent.0 + timeout <= now.0 && false)")],
+    ),
+    (
+        "gateways never fail over",
+        [(GATEWAY, ".filter(|(_, part)| !part.answered && part.sent.0 + timeout <= now.0)",
+          ".filter(|(_, part)| !part.answered && part.sent.0 + timeout <= now.0 && false)")],
+    ),
+    (
+        "failover retries the node that timed out",
+        [(GATEWAY, ".filter(|node| !tried.contains(node))", ".filter(|_| true)")],
+    ),
+    (
+        "the gateway fails one read in ten",
+        [(GATEWAY, "fn plan_with(&mut self, id: ClientRequestId, meta: &ObjectMeta) {",
+          "fn plan_with(&mut self, id: ClientRequestId, meta: &ObjectMeta) {\n        if self.next_node_request % 10 == 0 { self.next_node_request += 1; return self.finish(id, ResponseHead::status(503), Vec::new()); }")],
+    ),
+    (
+        "failover candidates cache metadata the home's writes never reach",
+        [(NODE, "} if direct || !self.is_home(&request.key) => {", "} if direct => {")],
     ),
     (
         "metadata never forgotten",

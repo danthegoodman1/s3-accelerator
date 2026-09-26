@@ -9,7 +9,7 @@
 use crate::Time;
 use crate::doorkeeper::Doorkeeper;
 use crate::layout::Layout;
-use crate::placement::{NodeId, Ring};
+use crate::placement::{NodeId, Placement, Ring};
 use crate::s3::{
     Answer, ByteRange, ContentRange, ETag, Method, ObjectKey, Request, ResponseHead, answer,
     preconditions,
@@ -92,6 +92,9 @@ pub struct Config {
     pub fill_budget: u64,
     /// Objects whose metadata the home keeps; the least recently used goes first.
     pub metadata_capacity: usize,
+    /// Milliseconds after which an unanswered S3 request is abandoned and
+    /// treated as S3 failing with 503.
+    pub origin_timeout: u64,
     pub default_policy: BucketPolicy,
     pub buckets: BTreeMap<String, BucketPolicy>,
 }
@@ -147,6 +150,9 @@ pub enum Action {
     },
     /// The node needs no more of S3's response body to `origin`.
     Release { origin: OriginRequestId },
+    /// The node gave up on S3 request `origin`: drop its response if it
+    /// arrives.
+    Cancel { origin: OriginRequestId },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -174,6 +180,8 @@ pub struct StoredBlock<'a> {
 
 pub struct Node {
     id: NodeId,
+    /// The latest time an input carried.
+    now: Time,
     ring: Ring,
     config: Config,
     objects: BTreeMap<ObjectKey, Object>,
@@ -235,7 +243,10 @@ struct Version {
 struct OriginRequest {
     purpose: Purpose,
     method: Method,
+    sent: Time,
     answered: bool,
+    /// Timed out: its response, if it comes, is the owner's to drop.
+    cancelled: bool,
     /// The object's offset of the first byte of the response body.
     body_start: u64,
     /// Responses and writes that still read the body.
@@ -303,6 +314,7 @@ impl Node {
         assert!(config.metadata_capacity > 0, "no room for metadata");
         Node {
             id,
+            now: Time::default(),
             ring,
             store: Store::new(config.store),
             doorkeeper: Doorkeeper::new(config.doorkeeper_window),
@@ -363,6 +375,52 @@ impl Node {
         })
     }
 
+    /// A one-line summary of the work in progress, for debugging.
+    pub fn describe(&self) -> String {
+        let fetching = self
+            .objects
+            .iter()
+            .filter_map(|(key, object)| match object {
+                Object::Fetching {
+                    origin, waiting, ..
+                } => Some(format!(
+                    "{}: first fetch {origin:?} with {} waiting",
+                    key.key,
+                    waiting.len()
+                )),
+                Object::Known {
+                    revalidation: Some((origin, waiting)),
+                    ..
+                } => Some(format!(
+                    "{}: revalidation {origin:?} with {} waiting",
+                    key.key,
+                    waiting.len()
+                )),
+                Object::Known { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let origins = self
+            .origins
+            .iter()
+            .map(|(origin, request)| {
+                format!(
+                    "{origin:?} answered {} cancelled {} readers {} waiters {}",
+                    request.answered,
+                    request.cancelled,
+                    request.readers,
+                    request.waiters.len()
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "{} waiting, {} sending, objects [{}], origins [{}]",
+            self.waiting.len(),
+            self.sending.len(),
+            fetching.join("; "),
+            origins.join("; ")
+        )
+    }
+
     /// True when no request, response, fill or write is in progress.
     pub fn is_idle(&self) -> bool {
         self.waiting.is_empty()
@@ -378,13 +436,14 @@ impl Node {
     }
 
     pub fn on_request(&mut self, now: Time, id: GatewayRequestId, read: Read) {
+        self.now = self.now.max(now);
         self.stats.reads += 1;
         match read {
+            // Only the home keeps an object's metadata, since writes reach
+            // only the home; a failover candidate reads S3 directly.
             Read::Object {
-                request,
-                direct: true,
-                ..
-            } => {
+                request, direct, ..
+            } if direct || !self.is_home(&request.key) => {
                 let purpose = Purpose::Direct { request: id };
                 self.fetch(purpose, request);
             }
@@ -446,6 +505,10 @@ impl Node {
         self.plan_body(id, &range.key, &range.etag, range.size, body);
     }
 
+    fn is_home(&self, key: &ObjectKey) -> bool {
+        self.ring.owner(Placement::Home(key).hash()) == Some(self.id)
+    }
+
     /// The `GetObject` or `HeadObject` a home serves.
     fn object_request(&self, id: GatewayRequestId) -> &Request {
         match &self.waiting[&id].read {
@@ -455,6 +518,7 @@ impl Node {
     }
 
     pub fn on_origin_response(&mut self, now: Time, origin: OriginRequestId, head: ResponseHead) {
+        self.now = self.now.max(now);
         let Some(request) = self.origins.get_mut(&origin) else {
             return;
         };
@@ -485,6 +549,7 @@ impl Node {
     /// A write to `key` passed through this node and succeeded: its
     /// metadata no longer holds.
     pub fn on_write(&mut self, now: Time, key: &ObjectKey) {
+        self.now = self.now.max(now);
         match self.objects.get_mut(key) {
             Some(Object::Fetching { superseded, .. }) => *superseded = true,
             Some(Object::Known { .. }) => {
@@ -499,6 +564,27 @@ impl Node {
                 }
             }
             None => {}
+        }
+    }
+
+    /// Time passed: S3 requests unanswered past the timeout are abandoned,
+    /// and whatever waited on them proceeds as if S3 failed with 503.
+    pub fn on_tick(&mut self, now: Time) {
+        self.now = self.now.max(now);
+        let timeout = self.config.origin_timeout;
+        let expired: Vec<OriginRequestId> = self
+            .origins
+            .iter()
+            .filter(|(_, request)| !request.answered && request.sent.0 + timeout <= now.0)
+            .map(|(&origin, _)| origin)
+            .collect();
+        for origin in expired {
+            self.origins
+                .get_mut(&origin)
+                .expect("expired request")
+                .cancelled = true;
+            self.actions.push(Action::Cancel { origin });
+            self.on_origin_response(now, origin, ResponseHead::status(503));
         }
     }
 
@@ -636,7 +722,9 @@ impl Node {
             OriginRequest {
                 purpose,
                 method: request.method,
+                sent: self.now,
                 answered: false,
+                cancelled: false,
                 body_start,
                 readers: 0,
                 blocks: Vec::new(),
@@ -679,6 +767,7 @@ impl Node {
             return;
         }
         let meta = metadata(&head);
+        let has_meta = meta.is_some();
         if !relay {
             if superseded {
                 self.serve(now, request);
@@ -690,10 +779,7 @@ impl Node {
                 let head = ResponseHead::status(head.status);
                 self.respond(request, head, Vec::new(), Holds::default(), None);
             }
-            for waiter in waiters {
-                self.serve(now, waiter);
-            }
-            return;
+            return self.resume(now, waiters, sent, &head, has_meta);
         }
         if let Some(meta) = meta.as_ref().filter(|_| !superseded) {
             self.know(key.clone(), meta.clone(), sent);
@@ -741,8 +827,30 @@ impl Node {
         {
             self.store_first_fetch(origin, &key, &meta, &head);
         }
+        self.resume(now, waiters, sent, &head, has_meta);
+    }
+
+    /// Serves the requests that waited on a first fetch sent at `sent`. A
+    /// 404 or a 5xx without metadata answers those that arrived before the
+    /// fetch left, since S3 checked after they did; the rest start over.
+    fn resume(
+        &mut self,
+        now: Time,
+        waiters: Vec<GatewayRequestId>,
+        sent: Time,
+        head: &ResponseHead,
+        known: bool,
+    ) {
+        let shared_answer = !known && (head.status == 404 || head.status >= 500);
         for waiter in waiters {
-            self.serve(now, waiter);
+            let arrived = self.waiting.get(&waiter).map(|waiting| waiting.arrived);
+            if shared_answer && arrived.is_some_and(|arrived| arrived <= sent) {
+                self.waiting.remove(&waiter);
+                let head = ResponseHead::status(head.status);
+                self.respond(waiter, head, Vec::new(), Holds::default(), None);
+            } else {
+                self.serve(now, waiter);
+            }
         }
     }
 
@@ -1192,7 +1300,9 @@ impl Node {
                 self.unref(block.version);
             }
         }
-        self.actions.push(Action::Release { origin });
+        if !request.cancelled {
+            self.actions.push(Action::Release { origin });
+        }
     }
 
     fn track_in_flight(&mut self, block: BlockKey, origin: OriginRequestId) {

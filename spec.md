@@ -67,7 +67,7 @@ A distributed NVMe read cache in front of S3. S3 remains the source of truth, an
 - **Object home** = `rendezvous(bucket, key)`. The home holds the object's metadata, chunk 0 and every block overlapping the object's final 16 MiB. Most file formats keep their metadata at the head or tail (Parquet and ORC footers, safetensors headers), so the home serves those reads in one hop. Objects up to 32 MiB live entirely on their home.
 - **Other chunks** belong to `rendezvous(bucket, key, chunk_index)`. Large objects spread across the cluster, and a large read fans out to several owners in parallel.
 - **Ownership costs disk only for blocks readers touch.** Blocks fill on read, so a large tail region reserves no space.
-- **Unresponsive nodes** stay in the ring for a grace period while gateways route around them. A brief failure therefore doesn't reshuffle ownership.
+- **Unresponsive nodes** stay in the ring for a grace period while gateways route around them. A brief failure therefore doesn't reshuffle ownership. A gateway fails over from a node that times out or answers 5xx to the next rendezvous candidate. Only the home keeps an object's metadata, since writes reach only the home, so a candidate standing in for it reads S3 directly and caches nothing.
 - **Disagreement about the ring** costs duplicate fills, never wrong data. A node asked for a chunk it doesn't own serves its own copy if it has one; otherwise it fetches the data without admitting it to disk.
 
 ### Read path
@@ -95,7 +95,7 @@ A distributed NVMe read cache in front of S3. S3 remains the source of truth, an
 - **Gateway metadata cache.** Gateways keep object metadata in a bounded LRU and answer `HeadObject` and preconditions from it. Entries for `immutable` objects last until evicted; others expire after a short TTL, and never outlive the bucket's TTL counted from when the home last confirmed them. A stale entry is safe: an owner serves the old version consistently, or its fill fails `If-Match`. Then the Gateway drops the entry and retries through the home, telling it the ETag failed, so the home revalidates instead of handing the ETag out again. After a few such retries, the home reads S3 directly and relays the answer uncached, so a read of an object that keeps changing still finishes. Answers to reads sent before a write through the Gateway never restore its entry.
 - **Writes go through the object's home.** Once the write succeeds, the home drops the metadata, or replaces it when warming on write. It discards any first fetch that started before then, so a read racing the write can't pin the old version. It forwards the invalidation to replica holders. The Gateway that proxied the write drops its own cached entry; other gateways catch up when their entries expire. Clusters in other zones see the change through their freshness mode.
 - **Versioned reads.** Requests with a `versionId` are immutable and are cached without revalidation.
-- **No negative caching.** Misses (404s) aren't cached, which preserves S3's read-after-write guarantee for new keys.
+- **No negative caching.** Misses (404s) aren't cached, which preserves S3's read-after-write guarantee for new keys. Requests queued at the home behind a first fetch share its 404 only if they arrived before the fetch was sent, since S3 checked after they did.
 
 ### Storage
 

@@ -13,6 +13,7 @@ fn main() -> ExitCode {
     let config = match std::fs::read_to_string(&path)
         .map_err(|error| error.to_string())
         .and_then(|text| toml::from_str::<config::Config>(&text).map_err(|error| error.to_string()))
+        .and_then(|config| config.cache.check().map(|()| config))
     {
         Ok(config) => config,
         Err(error) => {

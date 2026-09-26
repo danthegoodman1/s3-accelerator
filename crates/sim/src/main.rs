@@ -33,7 +33,10 @@ fn main() -> ExitCode {
 }
 
 fn run_one(seed: u64) -> ExitCode {
-    let simulator = Simulator::from_seed(seed);
+    let mut simulator = Simulator::from_seed(seed);
+    if std::env::var_os("SIM_TRACE").is_some() {
+        simulator = simulator.trace();
+    }
     println!("seed {seed}: {:?}", simulator.options());
     match simulator.run() {
         Ok(summary) => {

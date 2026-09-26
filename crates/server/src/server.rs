@@ -53,6 +53,14 @@ pub async fn run(listener: TcpListener, config: Config) -> io::Result<()> {
         clients: config.clients,
         max_body: config.max_body,
     });
+    let ticking = context.engine.clone();
+    tokio::task::spawn_local(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            Engine::tick(&ticking);
+        }
+    });
     loop {
         let (stream, _) = listener.accept().await?;
         stream.set_nodelay(true)?;

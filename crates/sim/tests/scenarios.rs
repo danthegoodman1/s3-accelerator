@@ -378,3 +378,92 @@ fn an_answer_older_than_a_write_is_not_cached() {
     assert_eq!(head.etag.as_ref(), Some(&current.etag));
     assert_eq!(body.len(), 120);
 }
+
+/// Requests that queued behind a first fetch share its 404 if they arrived
+/// before it left, since S3 checked after they did. Later ones need a fetch
+/// of their own, which they share in turn. The simulator found the
+/// alternative, one request answered per S3 round trip, as a metastable
+/// collapse: client retries outran the queue.
+#[test]
+fn requests_queued_behind_a_404_share_it() {
+    let mut sim = Simulator::new(1, Options::scenario());
+    let key = key(TTL_BUCKET, "absent");
+    let mut reads: Vec<u64> = (0..5)
+        .map(|_| sim.start(Request::get(key.clone())))
+        .collect();
+    // These five reach the home two ticks after the first fetch leaves.
+    for _ in 0..2 {
+        sim.step().unwrap();
+    }
+    reads.extend((0..5).map(|_| sim.start(Request::get(key.clone()))));
+    for read in reads {
+        assert_eq!(sim.finish(read).unwrap().0.status, 404);
+    }
+    assert_eq!(sim.summary().origin_requests, 2);
+}
+
+/// The owner of a chunk is cut off: the gateway times out, reads the chunk
+/// from the next rendezvous candidate, and the client never notices. With no
+/// suspect period, only the gateway's record of nodes tried moves it on.
+#[test]
+fn reads_fail_over_from_a_partitioned_owner() {
+    for suspect_ttl in [0, 100] {
+        let mut options = cluster();
+        options.suspect_ttl = suspect_ttl;
+        let mut sim = Simulator::new(1, options);
+        let key = key(IMMUTABLE_BUCKET, "k");
+        sim.put(&key, 2_048);
+        sim.read(Request::get(key.clone())).unwrap();
+        for node in 0..4 {
+            sim.partition(node, 5_000);
+            let started = sim.summary().ticks;
+            let (head, body) = sim.read(Request::get(key.clone())).unwrap();
+            let context = format!("node {node} cut off, suspect ttl {suspect_ttl}");
+            assert_eq!((head.status, body.len()), (200, 2_048), "{context}");
+            assert!(sim.summary().ticks - started < 5_000, "{context}");
+            assert_eq!(sim.summary().client_retries, 0, "{context}");
+            sim.partition(node, 0);
+        }
+    }
+}
+
+/// The home and its next candidate are both cut off, and suspicion lapses
+/// at once: only the gateway's record of nodes tried keeps it from going
+/// back to one of them.
+#[test]
+fn failover_moves_past_every_node_tried() {
+    let mut options = cluster();
+    options.suspect_ttl = 0;
+    let mut sim = Simulator::new(1, options);
+    let key = key(IMMUTABLE_BUCKET, "small");
+    sim.put(&key, 100);
+    let candidates = sim.home_candidates(&key);
+    sim.partition(candidates[0], 1_000_000);
+    sim.partition(candidates[1], 1_000_000);
+    let started = sim.summary().ticks;
+    let (head, body) = sim.read(Request::get(key)).unwrap();
+    assert_eq!((head.status, body.len()), (200, 100));
+    assert_eq!(sim.summary().client_retries, 0);
+    assert!(sim.summary().ticks - started < 10_000);
+}
+
+/// With the home cut off, a candidate answers its reads, but writes reach
+/// only the home: the candidate must not keep metadata a write would leave
+/// stale. A `HeadObject` shows it, since metadata alone answers it.
+#[test]
+fn a_candidate_standing_in_for_the_home_keeps_no_metadata() {
+    let mut options = cluster();
+    options.ttl = 1_000_000;
+    options.suspect_ttl = 1_000_000;
+    let mut sim = Simulator::new(1, options);
+    let key = key(TTL_BUCKET, "k");
+    sim.put(&key, 100);
+    let home = sim.home(&key);
+    sim.partition(home, 1_000_000);
+    sim.read(Request::get(key.clone())).unwrap();
+    sim.write_through(&key, 120).unwrap();
+    let (head, _) = sim.read(Request::head(key.clone())).unwrap();
+    let current = sim.origin().current(&key).unwrap();
+    assert_eq!(head.etag.as_ref(), Some(&current.etag));
+    assert_eq!(head.content_length, 120);
+}

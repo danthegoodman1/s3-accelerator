@@ -36,6 +36,8 @@ pub struct Engine {
     node_requests: BTreeMap<GatewayRequestId, NodeRequestId>,
     relayed: BTreeMap<NodeRequestId, Bytes>,
     fetches: Vec<(OriginRequestId, Request)>,
+    /// S3 requests in flight, which a cancellation aborts.
+    tasks: BTreeMap<OriginRequestId, tokio::task::AbortHandle>,
 }
 
 impl Engine {
@@ -60,6 +62,7 @@ impl Engine {
             node_requests: BTreeMap::new(),
             relayed: BTreeMap::new(),
             fetches: Vec::new(),
+            tasks: BTreeMap::new(),
         }))
     }
 
@@ -77,6 +80,19 @@ impl Engine {
         };
         start_fetches(engine, fetches);
         receiver
+    }
+
+    /// Lets the core's timeouts run: nodes give up on S3 requests, and
+    /// gateways fail over from nodes.
+    pub fn tick(engine: &Shared) {
+        let fetches = {
+            let mut this = engine.borrow_mut();
+            let now = this.now();
+            this.gateway.on_tick(now);
+            this.node.on_tick(now);
+            this.pump()
+        };
+        start_fetches(engine, fetches);
     }
 
     /// A write to `key` passed through to S3 and succeeded.
@@ -191,6 +207,11 @@ impl Engine {
             node::Action::Release { origin } => {
                 self.bodies.remove(&origin);
             }
+            node::Action::Cancel { origin } => {
+                if let Some(task) = self.tasks.remove(&origin) {
+                    task.abort();
+                }
+            }
         }
     }
 
@@ -249,12 +270,14 @@ impl Engine {
 
 fn start_fetches(engine: &Shared, fetches: Vec<(OriginRequestId, Request)>) {
     for (origin, request) in fetches {
-        let engine = engine.clone();
-        tokio::task::spawn_local(async move {
+        let handle = engine.clone();
+        let task = tokio::task::spawn_local(async move {
+            let engine = handle;
             let client = engine.borrow().origin.clone();
             let (head, body) = client.read(&request).await;
             let fetches = {
                 let mut this = engine.borrow_mut();
+                this.tasks.remove(&origin);
                 this.bodies.insert(origin, body);
                 let now = this.now();
                 this.node.on_origin_response(now, origin, head);
@@ -262,5 +285,9 @@ fn start_fetches(engine: &Shared, fetches: Vec<(OriginRequestId, Request)>) {
             };
             start_fetches(&engine, fetches);
         });
+        engine
+            .borrow_mut()
+            .tasks
+            .insert(origin, task.abort_handle());
     }
 }

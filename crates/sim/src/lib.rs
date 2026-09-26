@@ -29,7 +29,7 @@ use s3_accelerator_core::node::{
 use s3_accelerator_core::placement::{Member, NodeId, Placement, Ring};
 use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
 use s3_accelerator_core::store::{Location, StoreConfig};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroU32;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
@@ -65,6 +65,21 @@ pub struct Options {
     /// Chance that a gateway's range read reaches a node that does not own
     /// its blocks, as when gateways and nodes disagree about the ring.
     pub misroute_percent: u64,
+    /// Ticks before a node abandons an S3 request, a gateway fails over
+    /// from a node, and a client retries; and how long a gateway routes
+    /// around a node that timed out.
+    pub origin_timeout: u64,
+    pub node_timeout: u64,
+    pub client_timeout: u64,
+    pub suspect_ttl: u64,
+    /// Faults while clients are still issuing requests: lost messages,
+    /// delayed ones, nodes cut off from everyone for up to
+    /// `partition_max` ticks, and S3 answering 503.
+    pub loss_percent: u64,
+    pub spike_percent: u64,
+    pub partition_percent: u64,
+    pub partition_max: u64,
+    pub origin_error_percent: u64,
     /// Freshness of the TTL bucket's metadata, in ticks.
     pub ttl: u64,
     pub immutable_admit_on_first_read: bool,
@@ -96,7 +111,7 @@ impl Options {
         let block_size = 1 << prng.range(4..=9);
         let chunk_blocks = prng.range(1..=4);
         let delay_min = prng.range(0..=3);
-        Options {
+        let mut options = Options {
             nodes: prng.range(1..=6) as usize,
             gateways: prng.range(1..=3) as usize,
             clients: prng.range(1..=8) as usize,
@@ -127,7 +142,35 @@ impl Options {
             gateway_metadata_capacity: prng.range(1..=32) as usize,
             gateway_metadata_ttl: prng.range(0..=200),
             misroute_percent: prng.range(0..=20),
-        }
+            origin_timeout: 0,
+            node_timeout: 0,
+            client_timeout: 0,
+            suspect_ttl: 0,
+            loss_percent: 0,
+            spike_percent: 0,
+            partition_percent: 0,
+            partition_max: 0,
+            origin_error_percent: 0,
+        };
+        // Timeouts outlast every exchange of a fault-free run, so only
+        // faults make them fire: S3 answers within two hops, and a node
+        // within eight.
+        let hop = options.delay_max + options.disk_delay_max.max(options.send_delay_max) + 1;
+        options.origin_timeout = hop * prng.range(3..=6);
+        // A node may wait out one S3 timeout and then fetch again.
+        options.node_timeout = 2 * options.origin_timeout + hop * prng.range(4..=10);
+        options.client_timeout = options.node_timeout * (options.nodes as u64 + 2);
+        options.suspect_ttl = prng.range(0..=500);
+        options.loss_percent = if prng.percent(50) {
+            0
+        } else {
+            prng.range(1..=10)
+        };
+        options.spike_percent = prng.range(0..=5);
+        options.partition_percent = prng.range(0..=2);
+        options.partition_max = prng.range(1..=200);
+        options.origin_error_percent = prng.range(0..=5);
+        options
     }
 
     /// One node, one gateway, one client and no background workload: a
@@ -148,6 +191,15 @@ impl Options {
             gateway_metadata_capacity: 1_024,
             gateway_metadata_ttl: 1_000,
             misroute_percent: 0,
+            origin_timeout: 1_000,
+            node_timeout: 1_000,
+            client_timeout: 10_000,
+            suspect_ttl: 100,
+            loss_percent: 0,
+            spike_percent: 0,
+            partition_percent: 0,
+            partition_max: 0,
+            origin_error_percent: 0,
             ttl: 1_000,
             immutable_admit_on_first_read: false,
             ttl_admit_on_first_read: false,
@@ -173,6 +225,8 @@ impl Options {
             buckets: node.buckets,
             metadata_capacity: self.gateway_metadata_capacity,
             metadata_ttl: self.gateway_metadata_ttl,
+            node_timeout: self.node_timeout,
+            suspect_ttl: self.suspect_ttl,
         }
     }
 
@@ -194,6 +248,7 @@ impl Options {
             doorkeeper_window: self.doorkeeper_window,
             fill_budget: self.block_size * self.fill_budget_blocks,
             metadata_capacity: self.metadata_capacity,
+            origin_timeout: self.origin_timeout,
             default_policy: ttl,
             buckets: BTreeMap::from([
                 (IMMUTABLE_BUCKET.to_string(), immutable),
@@ -278,11 +333,13 @@ enum Event {
     },
 }
 
-/// A client request in flight.
+/// A client's request, which it sends again after a 5xx or a timeout.
 struct Pending {
     client: usize,
     read: Request,
     issued: u64,
+    /// When the latest attempt went out.
+    sent: u64,
 }
 
 /// A node write in progress: the bytes of an S3 response body to copy.
@@ -308,6 +365,15 @@ pub struct Simulator {
     writers: Prng,
     network: Prng,
     misroutes: Prng,
+    losses: Prng,
+    spikes: Prng,
+    partitions: Prng,
+    origin_errors: Prng,
+    retries: Prng,
+    /// Whether faults happen: while clients are still issuing requests.
+    faulty: bool,
+    /// Nodes cut off from everyone, until the tick given.
+    partitioned: BTreeMap<usize, u64>,
     disk_delays: Prng,
     send_delays: Prng,
     now: u64,
@@ -321,6 +387,11 @@ pub struct Simulator {
     in_flight: Vec<usize>,
     requests: BTreeMap<u64, Pending>,
     issued: u64,
+    /// Each attempt a client sent: its request and its client.
+    attempts: BTreeMap<u64, (u64, usize, u64)>,
+    /// When faults stopped.
+    quiet_since: Option<u64>,
+    next_attempt: u64,
     /// Scripted requests, and their answers once they arrive.
     watched: BTreeMap<u64, Option<(ResponseHead, Vec<u8>)>>,
     // What the server keeps per connection: who asked, and the bodies it
@@ -332,6 +403,10 @@ pub struct Simulator {
     origin_bodies: BTreeMap<(usize, OriginRequestId), Vec<u8>>,
     writes: BTreeMap<(usize, Location), Write>,
     sending: BTreeMap<(usize, GatewayRequestId), Sending>,
+    /// S3 requests a node gave up on, whose responses it drops.
+    cancelled: BTreeSet<(usize, OriginRequestId)>,
+    /// Print client attempts and answers to stderr.
+    trace: bool,
     summary: Summary,
 }
 
@@ -371,6 +446,13 @@ impl Simulator {
             writers: Prng::stream(seed, "writers"),
             network: Prng::stream(seed, "network"),
             misroutes: Prng::stream(seed, "misroutes"),
+            losses: Prng::stream(seed, "losses"),
+            spikes: Prng::stream(seed, "spikes"),
+            partitions: Prng::stream(seed, "partitions"),
+            origin_errors: Prng::stream(seed, "origin errors"),
+            retries: Prng::stream(seed, "retries"),
+            faulty: true,
+            partitioned: BTreeMap::new(),
             disk_delays: Prng::stream(seed, "disk delays"),
             send_delays: Prng::stream(seed, "send delays"),
             now: 0,
@@ -389,6 +471,9 @@ impl Simulator {
                 .collect(),
             in_flight: vec![0; options.clients],
             requests: BTreeMap::new(),
+            attempts: BTreeMap::new(),
+            quiet_since: None,
+            next_attempt: 0,
             issued: 0,
             watched: BTreeMap::new(),
             next_id: 0,
@@ -398,6 +483,8 @@ impl Simulator {
             origin_bodies: BTreeMap::new(),
             writes: BTreeMap::new(),
             sending: BTreeMap::new(),
+            cancelled: BTreeSet::new(),
+            trace: false,
             summary: Summary {
                 seed,
                 ..Summary::default()
@@ -410,15 +497,41 @@ impl Simulator {
         &self.options
     }
 
-    /// Runs the random workload until every request is answered.
+    /// Prints each client attempt and answer to stderr, for debugging a
+    /// seed.
+    pub fn trace(mut self) -> Simulator {
+        self.trace = true;
+        self
+    }
+
+    /// Runs the random workload with faults while clients issue requests,
+    /// then without: every request must then be answered in time.
     pub fn run(mut self) -> Result<Summary, Failure> {
         let per_hop =
             self.options.delay_max + self.options.disk_delay_max + self.options.send_delay_max;
-        let tick_limit = 20_000 + self.options.requests * (per_hop + 1) * 20;
+        // A runaway guard: with faults, requests wait out client timeouts.
+        let issue_limit =
+            20_000 + self.options.requests * ((per_hop + 1) * 20 + 2 * self.options.client_timeout);
+        let mut deadline = None;
         while self.issued < self.options.requests || !self.requests.is_empty() {
-            if self.now > tick_limit {
+            if self.issued == self.options.requests && deadline.is_none() {
+                self.faulty = false;
+                self.quiet_since = Some(self.now);
+                self.partitioned.clear();
+                deadline = Some(self.now + 20 * self.options.client_timeout + 10_000);
+            }
+            if self.now > deadline.unwrap_or(issue_limit) {
                 let unanswered = self.requests.len();
-                return Err(self.failure(format!("{unanswered} requests unanswered")));
+                let phase = match deadline {
+                    Some(_) => "after faults stopped",
+                    None => "while clients were issuing",
+                };
+                if self.trace {
+                    for (index, node) in self.nodes.iter().enumerate() {
+                        eprintln!("node {index}: {}", node.describe());
+                    }
+                }
+                return Err(self.failure(format!("{unanswered} requests unanswered {phase}")));
             }
             self.tick()?;
         }
@@ -481,6 +594,31 @@ impl Simulator {
         answer.ok_or_else(|| self.failure(format!("request {request} was never started")))
     }
 
+    /// The node that is `key`'s home.
+    pub fn home(&self, key: &ObjectKey) -> usize {
+        let home = self
+            .ring
+            .owner(Placement::Home(key).hash())
+            .expect("a node");
+        home.0 as usize
+    }
+
+    /// The rendezvous candidates for `key`'s home, best first.
+    pub fn home_candidates(&self, key: &ObjectKey) -> Vec<usize> {
+        let placement = Placement::Home(key).hash();
+        self.ring
+            .candidates(placement)
+            .into_iter()
+            .map(|node| node.0 as usize)
+            .collect()
+    }
+
+    /// Cuts `node` off from everyone for `ticks` ticks, whatever the options
+    /// say about faults.
+    pub fn partition(&mut self, node: usize, ticks: u64) {
+        self.partitioned.insert(node, self.now + ticks);
+    }
+
     /// The answer to a started request, once it has arrived.
     pub fn take_answer(&mut self, request: u64) -> Option<(ResponseHead, Vec<u8>)> {
         self.watched.get_mut(&request)?.take()
@@ -507,6 +645,7 @@ impl Simulator {
     }
 
     fn tick(&mut self) -> Result<(), Failure> {
+        self.tick_faults();
         self.tick_writes();
         self.tick_clients();
         let mut events = 0;
@@ -517,6 +656,15 @@ impl Simulator {
             }
             self.handle(event)?;
         }
+        let now = Time(self.now);
+        for node in 0..self.nodes.len() {
+            self.nodes[node].on_tick(now);
+            self.drain_node(node)?;
+        }
+        for gateway in 0..self.gateways.len() {
+            self.gateways[gateway].on_tick(now);
+            self.drain_gateway(gateway)?;
+        }
         if self.now.is_multiple_of(64) {
             self.check_disks()?;
         }
@@ -524,12 +672,32 @@ impl Simulator {
         Ok(())
     }
 
+    /// Heals partitions that ran their course and starts new ones.
+    fn tick_faults(&mut self) {
+        let now = self.now;
+        self.partitioned.retain(|_, until| *until > now);
+        if self.faulty && self.partitions.percent(self.options.partition_percent) {
+            let node = self.partitions.index(self.nodes.len());
+            let ticks = self.partitions.range(1..=self.options.partition_max);
+            self.partitioned.insert(node, now + ticks);
+            if self.trace {
+                eprintln!("{now} node {node} partitioned for {ticks} ticks");
+            }
+        }
+    }
+
     /// Runs until nothing is in flight, then checks that nothing is left
     /// behind.
     fn settle(&mut self) -> Result<(), Failure> {
-        while !self.queue.is_empty() {
+        let deadline = self.now
+            + 4 * (self.options.client_timeout
+                + self.options.node_timeout
+                + self.options.origin_timeout);
+        while !(self.queue.is_empty() && self.idle()) && self.now <= deadline {
             self.tick()?;
         }
+        // Responses to cancelled requests that were lost never arrive.
+        self.cancelled.clear();
         self.check_disks()?;
         let stranded = self.gateway_requests.len()
             + self.node_requests.len()
@@ -537,18 +705,27 @@ impl Simulator {
             + self.origin_bodies.len()
             + self.writes.len()
             + self.sending.len();
-        let busy = self.nodes.iter().filter(|node| !node.is_idle()).count()
-            + self
-                .gateways
-                .iter()
-                .filter(|gateway| !gateway.is_idle())
-                .count();
+        let busy = self.busy();
         if stranded > 0 || busy > 0 {
             return Err(self.failure(format!(
                 "{stranded} requests or bodies stranded and {busy} nodes or gateways busy after the last response"
             )));
         }
         Ok(())
+    }
+
+    fn idle(&self) -> bool {
+        self.busy() == 0
+    }
+
+    /// Nodes and gateways with work in progress.
+    fn busy(&self) -> usize {
+        self.nodes.iter().filter(|node| !node.is_idle()).count()
+            + self
+                .gateways
+                .iter()
+                .filter(|gateway| !gateway.is_idle())
+                .count()
     }
 
     fn tick_writes(&mut self) {
@@ -573,6 +750,17 @@ impl Simulator {
     }
 
     fn tick_clients(&mut self) {
+        let timeout = self.options.client_timeout;
+        let late: Vec<u64> = self
+            .requests
+            .iter()
+            .filter(|(_, pending)| pending.sent + timeout <= self.now)
+            .map(|(&request, _)| request)
+            .collect();
+        for request in late {
+            self.summary.client_retries += 1;
+            self.attempt(request);
+        }
         for client in 0..self.options.clients {
             if self.issued == self.options.requests
                 || self.in_flight[client] == self.options.requests_in_flight
@@ -592,15 +780,39 @@ impl Simulator {
         self.in_flight[client] += 1;
         let pending = Pending {
             client,
-            read: read.clone(),
+            read,
             issued: self.now,
+            sent: self.now,
         };
         self.requests.insert(request, pending);
-        self.send(
-            Address::Gateway(gateway),
-            Message::ClientRequest { request, read },
-        );
+        self.send_attempt(request, gateway);
         request
+    }
+
+    /// Sends a request again, through any gateway.
+    fn attempt(&mut self, request: u64) {
+        let gateway = self.retries.index(self.options.gateways);
+        self.send_attempt(request, gateway);
+    }
+
+    fn send_attempt(&mut self, request: u64, gateway: usize) {
+        let pending = self.requests.get_mut(&request).expect("a pending request");
+        pending.sent = self.now;
+        let (client, read) = (pending.client, pending.read.clone());
+        let attempt = self.next_attempt;
+        self.next_attempt += 1;
+        self.attempts.insert(attempt, (request, client, self.now));
+        if self.trace {
+            eprintln!(
+                "{} request {request} attempt {attempt} via gateway {gateway}: {read:?}",
+                self.now
+            );
+        }
+        let message = Message::ClientRequest {
+            request: attempt,
+            read,
+        };
+        self.send(Address::Client(client), Address::Gateway(gateway), message);
     }
 
     /// A read of a random key, with ranges and preconditions that S3 may
@@ -696,14 +908,24 @@ impl Simulator {
                 self.drain_node(node)
             }
             (Address::Node(node), Message::OriginResponse { origin, head, body }) => {
+                if self.cancelled.remove(&(node, origin)) {
+                    return Ok(());
+                }
                 self.origin_bodies.insert((node, origin), body);
                 self.nodes[node].on_origin_response(now, origin, head);
                 self.drain_node(node)
             }
             (Address::Origin, Message::OriginRequest { node, origin, read }) => {
-                let (head, body) = self.origin.respond_now(&read);
+                let (head, body) = match self.faulty
+                    && self
+                        .origin_errors
+                        .percent(self.options.origin_error_percent)
+                {
+                    true => (ResponseHead::status(503), Vec::new()),
+                    false => self.origin.respond_now(&read),
+                };
                 let response = Message::OriginResponse { origin, head, body };
-                self.send(Address::Node(node), response);
+                self.send(Address::Origin, Address::Node(node), response);
                 Ok(())
             }
             (
@@ -724,7 +946,7 @@ impl Simulator {
                 gateway::Action::Send { node, id, read } => {
                     let node = self.route(node.0 as usize, &read);
                     let message = Message::NodeRequest { gateway, id, read };
-                    self.send(Address::Node(node), message);
+                    self.send(Address::Gateway(gateway), Address::Node(node), message);
                 }
                 gateway::Action::Relay {
                     request,
@@ -778,13 +1000,13 @@ impl Simulator {
         let Some(request) = self.gateway_requests.remove(&(gateway, id)) else {
             return Err(self.failure(format!("gateway {gateway} answered {id:?} twice")));
         };
-        let client = self.requests[&request].client;
+        let (_, client, _) = self.attempts[&request];
         let response = Message::ClientResponse {
             request,
             head,
             body,
         };
-        self.send(Address::Client(client), response);
+        self.send(Address::Gateway(gateway), Address::Client(client), response);
         Ok(())
     }
 
@@ -797,7 +1019,7 @@ impl Simulator {
                         origin,
                         read: request,
                     };
-                    self.send(Address::Origin, message);
+                    self.send(Address::Node(node), Address::Origin, message);
                 }
                 node::Action::Respond {
                     request,
@@ -816,6 +1038,7 @@ impl Simulator {
                         return Err(self.failure(format!("node {node} answered {request:?} twice")));
                     };
                     self.send(
+                        Address::Node(node),
                         Address::Gateway(gateway),
                         Message::NodeMetadata { id, meta },
                     );
@@ -824,7 +1047,11 @@ impl Simulator {
                     let Some((gateway, id)) = self.node_requests.remove(&(node, request)) else {
                         return Err(self.failure(format!("node {node} answered {request:?} twice")));
                     };
-                    self.send(Address::Gateway(gateway), Message::NodeStale { id });
+                    self.send(
+                        Address::Node(node),
+                        Address::Gateway(gateway),
+                        Message::NodeStale { id },
+                    );
                 }
                 node::Action::Write {
                     location,
@@ -845,6 +1072,12 @@ impl Simulator {
                     let delay = self.disk_delays.range(0..=self.options.disk_delay_max);
                     self.queue
                         .push(self.now + delay, Event::Written { node, location });
+                }
+                node::Action::Cancel { origin } => {
+                    if self.trace {
+                        eprintln!("{} node {node} cancelled {origin:?}", self.now);
+                    }
+                    self.cancelled.insert((node, origin));
                 }
                 node::Action::Release { origin } => {
                     if self.origin_bodies.remove(&(node, origin)).is_none() {
@@ -927,20 +1160,50 @@ impl Simulator {
             body: bytes,
             meta,
         };
-        self.send(Address::Gateway(gateway), response);
+        self.send(Address::Node(node), Address::Gateway(gateway), response);
         self.nodes[node].on_sent(id);
         self.drain_node(node)
     }
 
-    fn answer(&mut self, request: u64, head: ResponseHead, body: Vec<u8>) -> Result<(), Failure> {
+    fn answer(&mut self, attempt: u64, head: ResponseHead, body: Vec<u8>) -> Result<(), Failure> {
+        let (request, _, sent) = self
+            .attempts
+            .remove(&attempt)
+            .expect("one response per attempt");
+        if self.trace {
+            let (status, len) = (head.status, body.len());
+            eprintln!(
+                "{} request {request} attempt {attempt} answered {status} ({len} bytes)",
+                self.now
+            );
+        }
+        if !self.requests.contains_key(&request) {
+            // An earlier attempt already answered it.
+            return Ok(());
+        }
+        if head.status >= 500 {
+            // Faults explain a 5xx until their effects have run their course:
+            // S3 and node timeouts, and messages held back by a spike.
+            let grace = 2 * (self.options.origin_timeout + self.options.node_timeout)
+                + 10 * self.options.delay_max
+                + 10;
+            if self.quiet_since.is_some_and(|quiet| sent >= quiet + grace) {
+                return Err(self.failure(format!(
+                    "{} for {request:?} with no fault to explain it",
+                    head.status
+                )));
+            }
+            self.summary.server_errors += 1;
+            self.summary.client_retries += 1;
+            self.attempt(request);
+            return Ok(());
+        }
         let Pending {
             client,
             read,
             issued,
-        } = self
-            .requests
-            .remove(&request)
-            .expect("one response per request");
+            ..
+        } = self.requests.remove(&request).expect("pending");
         self.in_flight[client] -= 1;
         let from = issued.saturating_sub(self.options.staleness(&read.key));
         properties::check_response(&self.origin, &read, from, self.now, &head, &body)
@@ -998,10 +1261,26 @@ impl Simulator {
         Ok(())
     }
 
-    fn send(&mut self, to: Address, message: Message) {
-        let delay = self
+    /// Puts a message on the network. While faults happen, it may be
+    /// lost, cut off by a partition, or held back far longer than usual.
+    fn send(&mut self, from: Address, to: Address, message: Message) {
+        let mut delay = self
             .network
             .range(self.options.delay_min..=self.options.delay_max);
+        let cut = |address: Address| matches!(address, Address::Node(node) if self.partitioned.contains_key(&node));
+        if cut(from) || cut(to) {
+            self.summary.lost += 1;
+            return;
+        }
+        if self.faulty {
+            if self.losses.percent(self.options.loss_percent) {
+                self.summary.lost += 1;
+                return;
+            }
+            if self.spikes.percent(self.options.spike_percent) {
+                delay = delay * 10 + 10;
+            }
+        }
         self.queue
             .push(self.now + delay, Event::Deliver { to, message });
     }
@@ -1036,6 +1315,11 @@ pub struct Summary {
     pub evicted_blocks: u64,
     /// Requests each node received from gateways.
     pub node_reads: Vec<u64>,
+    /// Messages lost to faults, 5xx answers clients got, and requests
+    /// clients sent again after a 5xx or a timeout.
+    pub lost: u64,
+    pub server_errors: u64,
+    pub client_retries: u64,
     /// A digest of every response: its request, tick, status and body.
     pub fingerprint: u64,
 }
@@ -1059,7 +1343,8 @@ impl fmt::Display for Summary {
             f,
             "seed {} passed: {} ticks, {} writes, {} retries, responses {}, \
              {}% of body bytes from disk, {} S3 requests, {} bytes written, \
-             {} blocks evicted, node reads {:?}, fingerprint {:016x}",
+             {} blocks evicted, node reads {:?}, {} messages lost, {} server errors, \
+             {} client retries, fingerprint {:016x}",
             self.seed,
             self.ticks,
             self.writes,
@@ -1070,6 +1355,9 @@ impl fmt::Display for Summary {
             self.written_bytes,
             self.evicted_blocks,
             self.node_reads,
+            self.lost,
+            self.server_errors,
+            self.client_retries,
             self.fingerprint
         )
     }

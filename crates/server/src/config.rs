@@ -79,6 +79,12 @@ pub struct CacheConfig {
     /// metadata of objects that may change, in milliseconds.
     pub gateway_metadata_capacity: usize,
     pub gateway_metadata_ttl_ms: u64,
+    /// How long a node waits for S3, and a gateway for a node, before
+    /// giving up; and how long a gateway routes around a node that timed
+    /// out.
+    pub origin_timeout_ms: u64,
+    pub node_timeout_ms: u64,
+    pub suspect_ttl_ms: u64,
     pub default_policy: PolicyConfig,
     pub buckets: BTreeMap<String, PolicyConfig>,
 }
@@ -96,6 +102,9 @@ impl Default for CacheConfig {
             metadata_capacity: 100_000,
             gateway_metadata_capacity: 100_000,
             gateway_metadata_ttl_ms: 1_000,
+            origin_timeout_ms: 60_000,
+            node_timeout_ms: 150_000,
+            suspect_ttl_ms: 10_000,
             default_policy: PolicyConfig::default(),
             buckets: BTreeMap::new(),
         }
@@ -135,6 +144,17 @@ impl PolicyConfig {
 }
 
 impl CacheConfig {
+    /// Settings the core would misbehave under.
+    pub fn check(&self) -> Result<(), String> {
+        if self.node_timeout_ms < 2 * self.origin_timeout_ms {
+            return Err(format!(
+                "node_timeout_ms ({}) must be at least twice origin_timeout_ms ({}): a node may wait out one S3 timeout and fetch again",
+                self.node_timeout_ms, self.origin_timeout_ms
+            ));
+        }
+        Ok(())
+    }
+
     pub fn gateway_config(&self) -> gateway::Config {
         let node = self.node_config();
         gateway::Config {
@@ -143,6 +163,8 @@ impl CacheConfig {
             buckets: node.buckets,
             metadata_capacity: self.gateway_metadata_capacity,
             metadata_ttl: self.gateway_metadata_ttl_ms,
+            node_timeout: self.node_timeout_ms,
+            suspect_ttl: self.suspect_ttl_ms,
         }
     }
 
@@ -158,6 +180,7 @@ impl CacheConfig {
             doorkeeper_window: self.doorkeeper_window,
             fill_budget: self.fill_budget,
             metadata_capacity: self.metadata_capacity,
+            origin_timeout: self.origin_timeout_ms,
             default_policy: self.default_policy.policy(),
             buckets: self
                 .buckets
