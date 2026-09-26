@@ -1,0 +1,10 @@
+[package]
+name = "s3-accelerator-core"
+description = "Gateway and storage-node logic as deterministic state machines."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+libm.workspace = true
+xxhash-rust.workspace = true

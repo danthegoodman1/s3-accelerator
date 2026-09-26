@@ -1,0 +1,10 @@
+[package]
+name = "s3-accelerator-sim"
+description = "Deterministic simulator for the gateway and storage nodes."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+s3-accelerator-core.workspace = true
+xxhash-rust.workspace = true

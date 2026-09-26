@@ -1,0 +1,17 @@
+[package]
+name = "s3-accelerator-conformance"
+description = "S3 behavior the accelerator must preserve, tested against a live endpoint."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+path = "harness.rs"
+
+[[test]]
+name = "get_object"
+path = "get_object.rs"
+
+[dependencies]
+aws-sdk-s3.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

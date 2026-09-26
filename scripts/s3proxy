@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Runs the s3proxy the conformance suite tests against, in memory, on
+# 127.0.0.1:${S3PROXY_PORT:-8080}.
+#
+#   scripts/s3proxy start   # start it and wait until it answers
+#   scripts/s3proxy wait    # wait for one started elsewhere, as in CI
+#   scripts/s3proxy stop
+set -euo pipefail
+
+image=andrewgaul/s3proxy:4.1.1@sha256:87662b2a5afcdfa5f478a1c61650bae4c87bbd15f6ff2823236bcfd66ef7fe04
+name=s3-accelerator-s3proxy
+port=${S3PROXY_PORT:-8080}
+
+wait_for_s3proxy() {
+  for _ in $(seq 120); do
+    if curl -s -o /dev/null "http://127.0.0.1:$port/"; then
+      echo "s3proxy is listening on http://127.0.0.1:$port"
+      return
+    fi
+    sleep 0.5
+  done
+  echo "s3proxy did not answer on port $port" >&2
+  exit 1
+}
+
+case "${1:-}" in
+  start)
+    docker run -d --rm --name "$name" -p "127.0.0.1:$port:80" \
+      -e JCLOUDS_PROVIDER=transient "$image" >/dev/null
+    wait_for_s3proxy
+    ;;
+  wait) wait_for_s3proxy ;;
+  stop) docker rm -f "$name" >/dev/null ;;
+  *)
+    echo "usage: $0 start|wait|stop" >&2
+    exit 2
+    ;;
+esac

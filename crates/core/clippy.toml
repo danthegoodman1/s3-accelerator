@@ -1,0 +1,10 @@
+# The core must behave identically in the server and the simulator.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is random; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order is random; use BTreeSet" },
+    { path = "std::time::Instant", reason = "time is an input to the core" },
+    { path = "std::time::SystemTime", reason = "time is an input to the core" },
+]
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "the core runs on its owner's thread" },
+]

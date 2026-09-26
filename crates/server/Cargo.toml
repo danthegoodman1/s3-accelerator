@@ -1,0 +1,9 @@
+[package]
+name = "s3-accelerator"
+description = "The storage node and gateway binary."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+s3-accelerator-core.workspace = true

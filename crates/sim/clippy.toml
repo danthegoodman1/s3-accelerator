@@ -1,0 +1,10 @@
+# A seed must replay the same run.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is random; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order is random; use BTreeSet" },
+    { path = "std::time::Instant", reason = "the simulator keeps its own time" },
+    { path = "std::time::SystemTime", reason = "the simulator keeps its own time" },
+]
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "a run executes on one thread" },
+]

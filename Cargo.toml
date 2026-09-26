@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/server", "crates/sim", "tests"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+s3-accelerator-core = { path = "crates/core" }
+aws-sdk-s3 = "1.150.0"
+libm = "0.2.16"
+tokio = "1.53.1"
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }

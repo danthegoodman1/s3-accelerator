@@ -1,0 +1,28 @@
+# s3-accelerator
+
+`spec.md` is the design contract. Read it before changing behavior, and when code and spec disagree, fix one of them in the same change.
+
+## Core rules
+
+- `crates/core` does no I/O, reads no clocks and starts no threads. It takes requests, responses and the current time as inputs and returns actions. The server carries them out over sockets and disks; the simulator carries them out over its models.
+- The core handles block locations and response heads. The server moves the bytes with `sendfile` and `splice`.
+- One thread owns each node's core state. Worker threads only move bytes.
+- Randomness reaches the core as a seeded RNG passed in.
+- `clippy.toml` in `crates/core` and `crates/sim` forbids unordered collections, clocks and threads.
+
+## Testing
+
+- Every behavior the spec names needs a simulator property or a scripted simulator scenario.
+- The simulator checks responses against its model of S3, never against the core's own state.
+- A seed replays its run exactly. The simulator draws from its own PRNG; give each new source of randomness its own `Prng::stream`, so it leaves existing draws unchanged.
+- A bug the simulator finds becomes a regression test in `crates/sim/tests` that runs its seed. The commit message records the seed and the commit that failed.
+- Every S3 behavior the cache serves needs a conformance test in `tests/`. The suite passes against s3proxy, and must pass through the accelerator too.
+
+## Commands
+
+```console
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+scripts/s3proxy start && cargo test --workspace -- --include-ignored
+cargo run --release -p s3-accelerator-sim [-- SEED]
+```
