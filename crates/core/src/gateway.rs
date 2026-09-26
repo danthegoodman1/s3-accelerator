@@ -18,7 +18,7 @@ use crate::Time;
 use crate::layout::Layout;
 use crate::node::{BucketPolicy, Freshness, ObjectMeta, RangeRead, Read};
 use crate::placement::{NodeId, Placement, PlacementHash, Ring};
-use crate::s3::{Answer, ETag, Method, ObjectKey, Request, ResponseHead, answer};
+use crate::s3::{Answer, ContentRange, ETag, Method, ObjectKey, Request, ResponseHead, answer};
 use std::collections::{BTreeMap, VecDeque};
 
 /// Stale retries after which a read goes to S3 directly, through the home,
@@ -104,8 +104,6 @@ struct ClientRead {
     request: Request,
     arrived: Time,
     stage: Stage,
-    /// An ETag a node found out of date, which the home is told about.
-    stale: Option<ETag>,
     /// Times a node found the object changed during this read.
     retries: u32,
 }
@@ -119,12 +117,14 @@ enum Stage {
     /// have answered.
     Parts {
         head: ResponseHead,
-        parts: Vec<NodeRequestId>,
+        parts: VecDeque<NodeRequestId>,
     },
     /// The response started, and `parts` hold the rest of its body in
     /// order. The first is forwarded once it has answered.
     Streaming {
         parts: VecDeque<NodeRequestId>,
+        /// Body bytes not yet forwarded.
+        remaining: u64,
         forwarding: bool,
         /// The response ends early once the forward in progress finishes.
         aborted: bool,
@@ -162,6 +162,26 @@ enum What {
 }
 
 impl What {
+    /// Whether a 206 carries exactly the bytes this part asked for.
+    fn answered_by(&self, head: &ResponseHead) -> bool {
+        match self {
+            What::Object(..) => true,
+            What::Range {
+                etag, size, runs, ..
+            } => {
+                let (first, last) = (runs[0].1, runs[runs.len() - 1].2);
+                let range = ContentRange {
+                    first,
+                    last,
+                    size: *size,
+                };
+                head.etag.as_ref() == Some(etag)
+                    && head.content_range == Some(range)
+                    && head.content_length == last - first + 1
+            }
+        }
+    }
+
     fn read(&self) -> Read {
         match self {
             What::Object(read, _) => read.clone(),
@@ -214,7 +234,6 @@ impl Gateway {
             request,
             arrived: now,
             stage: Stage::Planning,
-            stale: None,
             retries: 0,
         };
         self.reads.insert(id, read);
@@ -256,10 +275,19 @@ impl Gateway {
         let Some(part) = self.parts.get_mut(&from) else {
             return self.actions.push(Action::Discard { id: from });
         };
+        // A driver delivers one answer per request; a repeat is ignored.
+        if part.answer.is_some() {
+            return;
+        }
         if head.status >= 500 {
             // The node could not serve it; the next candidate may.
             self.actions.push(Action::Discard { id: from });
             return self.fail_over(now, from, Some(head));
+        }
+        if head.status == 206 && !part.what.answered_by(&head) {
+            // The node sent other bytes than those asked for.
+            self.actions.push(Action::Discard { id: from });
+            return self.fail_over(now, from, Some(ResponseHead::status(502)));
         }
         part.answer = Some(head.clone());
         let id = part.read;
@@ -271,12 +299,12 @@ impl Gateway {
                     self.cache
                         .insert(key, CachedMeta::new(meta, sent, now), sent);
                 }
-                self.start(id, head, vec![from]);
+                self.start(id, head, VecDeque::from([from]));
             }
             Stage::Parts { .. } if head.status != 206 => {
                 // S3 refused the part: the client gets its answer.
                 self.abandon_parts_except(id, from);
-                self.start(id, head, vec![from]);
+                self.start(id, head, VecDeque::from([from]));
             }
             Stage::Parts { head, parts } => {
                 if parts.iter().all(|part| self.parts[part].answer.is_some()) {
@@ -304,6 +332,7 @@ impl Gateway {
         let read = self.reads.get_mut(&id).expect("a part's read exists");
         let Stage::Streaming {
             parts,
+            remaining,
             forwarding,
             aborted,
         } = &mut read.stage
@@ -312,6 +341,7 @@ impl Gateway {
         };
         assert_eq!(parts.pop_front(), Some(from), "forwarded out of order");
         *forwarding = false;
+        *remaining = remaining.saturating_sub(copied);
         if *aborted {
             return self.abort(id);
         }
@@ -352,20 +382,20 @@ impl Gateway {
             return;
         };
         let id = part.read;
+        // The next read of the key through the home reports the ETag, so
+        // the home revalidates it.
+        let key = self.reads[&id].request.key.clone();
+        match part.what {
+            What::Range { etag, .. } => self.cache.stale(&key, etag),
+            What::Object(..) => self.cache.remove(&key),
+        }
         if matches!(self.reads[&id].stage, Stage::Streaming { .. }) {
-            let key = self.reads[&id].request.key.clone();
-            self.cache.remove(&key);
             return self.abort(id);
         }
         self.abandon_parts_except(id, from);
         let read = self.reads.get_mut(&id).expect("a part's read exists");
-        if let Stage::Parts { head, .. } = &read.stage {
-            read.stale = head.etag.clone();
-        }
         read.retries += 1;
         read.stage = Stage::Planning;
-        let key = read.request.key.clone();
-        self.cache.remove(&key);
         self.plan(now, id);
     }
 
@@ -379,8 +409,9 @@ impl Gateway {
             let meta = cached.meta.clone();
             return self.plan_with(id, &meta);
         }
+        let stale = self.cache.take_stale(&key);
         let read = self.reads.get_mut(&id).expect("planned read exists");
-        let (request, stale) = (read.request.clone(), read.stale.take());
+        let request = read.request.clone();
         read.stage = Stage::Home { sent: now };
         let read = Read::Object {
             request,
@@ -405,19 +436,24 @@ impl Gateway {
             Answer::Head(head) => return self.respond(id, head),
             Answer::Body { head, first, last } => (head, first, last),
         };
-        let runs: Vec<Run> = self
-            .config
-            .layout
-            .runs(&request.key, meta.size, first, last)
-            .into_iter()
-            .map(|(placement, start, end)| (placement.hash(), start, end))
-            .collect();
+        let runs = self.runs(&request.key, meta.size, first, last);
         let Some(parts) = self.dispatch_runs(id, &request.key, &meta.etag, meta.size, runs, &[])
         else {
             return self.respond(id, ResponseHead::status(503));
         };
         let read = self.reads.get_mut(&id).expect("planned read exists");
         read.stage = Stage::Parts { head, parts };
+    }
+
+    /// Bytes `first..=last` of an object of `size` bytes, as runs that
+    /// share a placement.
+    fn runs(&self, key: &ObjectKey, size: u64, first: u64, last: u64) -> Vec<Run> {
+        self.config
+            .layout
+            .runs(key, size, first, last)
+            .into_iter()
+            .map(|(placement, start, end)| (placement.hash(), start, end))
+            .collect()
     }
 
     /// Sends runs of a version's bytes to their targets, one part per run
@@ -430,7 +466,7 @@ impl Gateway {
         size: u64,
         runs: Vec<Run>,
         tried: &[NodeId],
-    ) -> Option<Vec<NodeRequestId>> {
+    ) -> Option<VecDeque<NodeRequestId>> {
         let mut groups: Vec<(NodeId, Vec<Run>)> = Vec::new();
         for run in runs {
             let node = self.target(run.0, tried)?;
@@ -518,7 +554,12 @@ impl Gateway {
         tried.push(part.node);
         let replacements = match part.what {
             What::Object(read, placement) => self.target(placement, &tried).map(|node| {
-                vec![self.dispatch(part.read, What::Object(read, placement), node, tried)]
+                VecDeque::from([self.dispatch(
+                    part.read,
+                    What::Object(read, placement),
+                    node,
+                    tried,
+                )])
             }),
             What::Range {
                 key,
@@ -539,21 +580,13 @@ impl Gateway {
             .reads
             .get_mut(&part.read)
             .expect("a part's read exists");
-        match &mut read.stage {
-            Stage::Parts { parts, .. } => {
-                if let Some(position) = parts.iter().position(|slot| *slot == id) {
-                    parts.splice(position..=position, replacements);
-                }
-            }
-            Stage::Streaming { parts, .. } => {
-                if let Some(position) = parts.iter().position(|slot| *slot == id) {
-                    parts.remove(position);
-                    for (offset, replacement) in replacements.into_iter().enumerate() {
-                        parts.insert(position + offset, replacement);
-                    }
-                }
-            }
-            Stage::Planning | Stage::Home { .. } => {}
+        if let Stage::Parts { parts, .. } | Stage::Streaming { parts, .. } = &mut read.stage
+            && let Some(position) = parts.iter().position(|slot| *slot == id)
+        {
+            let mut after = parts.split_off(position);
+            after.pop_front();
+            parts.extend(replacements);
+            parts.extend(after);
         }
     }
 
@@ -565,16 +598,18 @@ impl Gateway {
 
     /// Starts the client's response with `head`, and a body from `parts`
     /// unless it has none.
-    fn start(&mut self, id: ClientRequestId, head: ResponseHead, parts: Vec<NodeRequestId>) {
+    fn start(&mut self, id: ClientRequestId, head: ResponseHead, parts: VecDeque<NodeRequestId>) {
         let head_only = self.reads[&id].request.method == Method::Head;
         if head_only || head.content_length == 0 {
-            self.abandon_parts(&parts);
+            self.abandon_parts(parts);
             return self.respond(id, head);
         }
+        let remaining = head.content_length;
         self.actions.push(Action::Start { request: id, head });
         let read = self.reads.get_mut(&id).expect("a started read exists");
         read.stage = Stage::Streaming {
-            parts: parts.into(),
+            parts,
+            remaining,
             forwarding: false,
             aborted: false,
         };
@@ -582,11 +617,14 @@ impl Gateway {
     }
 
     /// Forwards the next part's body once it has answered, and ends the
-    /// read after the last.
+    /// read after the last: early, if the parts fell short of the head.
     fn forward_next(&mut self, id: ClientRequestId) {
         let read = self.reads.get_mut(&id).expect("a streaming read exists");
         let Stage::Streaming {
-            parts, forwarding, ..
+            parts,
+            remaining,
+            forwarding,
+            ..
         } = &mut read.stage
         else {
             unreachable!("only a started response forwards");
@@ -595,6 +633,9 @@ impl Gateway {
             return;
         }
         let Some(&next) = parts.front() else {
+            if *remaining > 0 {
+                return self.abort(id);
+            }
             self.reads.remove(&id);
             return;
         };
@@ -645,13 +686,7 @@ impl Gateway {
                 answer.etag.clone().zip(span).map(|(etag, (start, size))| {
                     let first = start + copied;
                     let last = start + answer.content_length - 1;
-                    let runs = self
-                        .config
-                        .layout
-                        .runs(&request.key, size, first, last)
-                        .into_iter()
-                        .map(|(placement, start, end)| (placement.hash(), start, end))
-                        .collect();
+                    let runs = self.runs(&request.key, size, first, last);
                     (request.key, etag, size, runs)
                 })
             }
@@ -680,17 +715,18 @@ impl Gateway {
             parts,
             forwarding,
             aborted,
+            ..
         } = &mut read.stage
         else {
             unreachable!("only a started response ends early");
         };
         let in_progress = if *forwarding { parts.pop_front() } else { None };
-        let rest: Vec<NodeRequestId> = parts.drain(..).collect();
+        let rest = std::mem::take(parts);
         if let Some(part) = in_progress {
             parts.push_back(part);
             *aborted = true;
         }
-        self.abandon_parts(&rest);
+        self.abandon_parts(rest);
         if in_progress.is_none() {
             self.reads.remove(&id);
             self.actions.push(Action::Abort { request: id });
@@ -708,15 +744,15 @@ impl Gateway {
         };
         let others: Vec<NodeRequestId> =
             parts.iter().copied().filter(|&part| part != keep).collect();
-        self.abandon_parts(&others);
+        self.abandon_parts(others);
     }
 
-    fn abandon_parts(&mut self, parts: &[NodeRequestId]) {
+    fn abandon_parts(&mut self, parts: impl IntoIterator<Item = NodeRequestId>) {
         for part in parts {
-            if let Some(part_state) = self.parts.remove(part)
+            if let Some(part_state) = self.parts.remove(&part)
                 && part_state.answer.is_some()
             {
-                self.actions.push(Action::Discard { id: *part });
+                self.actions.push(Action::Discard { id: part });
             }
         }
     }
@@ -764,6 +800,9 @@ struct Entry {
     /// Answers to reads sent before this were answered before the last
     /// write, and are ignored.
     written: Time,
+    /// An ETag a node found out of date, which the next read through the
+    /// home reports.
+    stale: Option<ETag>,
     used: u64,
 }
 
@@ -825,9 +864,28 @@ impl MetadataCache {
         }
     }
 
+    /// Forgets the key's metadata, whose version `etag` a node found out
+    /// of date.
+    fn stale(&mut self, key: &ObjectKey, etag: ETag) {
+        let written = self
+            .entries
+            .get(key)
+            .map_or(Time::default(), |entry| entry.written);
+        self.put(key.clone(), None, written);
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.stale = Some(etag);
+        }
+    }
+
+    fn take_stale(&mut self, key: &ObjectKey) -> Option<ETag> {
+        self.entries.get_mut(key)?.stale.take()
+    }
+
     fn put(&mut self, key: ObjectKey, meta: Option<CachedMeta>, written: Time) {
+        let mut stale = None;
         if let Some(entry) = self.entries.remove(&key) {
             self.recency.remove(&entry.used);
+            stale = entry.stale;
         }
         let used = self.next_use;
         self.next_use += 1;
@@ -837,6 +895,7 @@ impl MetadataCache {
             Entry {
                 meta,
                 written,
+                stale,
                 used,
             },
         );
@@ -862,7 +921,6 @@ mod tests {
     use super::*;
     use crate::node::Freshness;
     use crate::placement::Member;
-    use crate::s3::ContentRange;
     use std::num::NonZeroU32;
 
     fn gateway() -> Gateway {
@@ -898,61 +956,91 @@ mod tests {
             .collect()
     }
 
-    /// A later part of a resumed body goes stale while an earlier one is
-    /// being forwarded: the response ends only once that forward finishes,
-    /// and the body it reads is never discarded under it.
+    /// A node answers the same request twice while the gateway forwards
+    /// the first answer's body: the repeat changes nothing.
     #[test]
-    fn an_early_end_waits_for_the_forward_in_progress() {
+    fn a_repeated_answer_is_ignored() {
+        let mut gateway = gateway();
+        let key = ObjectKey {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        let client = ClientRequestId(1);
+        gateway.on_request(Time(0), client, Request::get(key));
+        let home = sends(&gateway.drain())[0];
+        let head = ResponseHead {
+            status: 200,
+            etag: Some(ETag("\"v1\"".into())),
+            content_range: None,
+            content_length: 256,
+            headers: Vec::new(),
+        };
+        gateway.on_node_response(Time(1), home, head.clone(), None);
+        let forward = Action::Forward {
+            request: client,
+            from: home,
+            len: 256,
+        };
+        assert_eq!(
+            gateway.drain(),
+            vec![
+                Action::Start {
+                    request: client,
+                    head
+                },
+                forward
+            ]
+        );
+        for status in [200, 503] {
+            gateway.on_node_response(Time(2), home, ResponseHead::status(status), None);
+            assert_eq!(gateway.drain(), Vec::new());
+        }
+        gateway.on_forwarded(Time(3), home, 256);
+        assert_eq!(gateway.drain(), Vec::new());
+        assert!(gateway.is_idle());
+    }
+
+    /// A node answers a part with other bytes than it asked for, as a node
+    /// on another layout might. The gateway reads the part from the next
+    /// candidate instead of forwarding a body of the wrong length.
+    #[test]
+    fn a_part_answered_with_other_bytes_goes_to_the_next_candidate() {
         let mut gateway = gateway();
         let key = ObjectKey {
             bucket: "b".into(),
             key: "k".into(),
         };
         let etag = ETag("\"v1\"".into());
-        let client = ClientRequestId(1);
-        gateway.on_request(Time(0), client, Request::get(key));
+        gateway.on_request(Time(0), ClientRequestId(1), Request::head(key.clone()));
         let home = sends(&gateway.drain())[0];
-        let head = ResponseHead {
-            status: 200,
-            etag: Some(etag.clone()),
-            content_range: None,
-            content_length: 256,
-            headers: Vec::new(),
-        };
         let meta = ObjectMeta {
             etag: etag.clone(),
             size: 256,
             headers: Vec::new(),
             age: 0,
         };
-        gateway.on_node_response(Time(1), home, head, Some(meta));
+        gateway.on_node_metadata(Time(1), home, meta);
         gateway.drain();
-        // The home's body ends after 10 bytes; the rest goes to several nodes.
-        gateway.on_forwarded(Time(2), home, 10);
-        let rest = sends(&gateway.drain());
-        assert!(rest.len() >= 2, "the rest spans {} parts", rest.len());
-        let first = ResponseHead {
+        let request = Request {
+            range: Some(crate::s3::ByteRange::Inclusive { first: 0, last: 9 }),
+            ..Request::get(key)
+        };
+        gateway.on_request(Time(2), ClientRequestId(2), request);
+        let part = sends(&gateway.drain())[0];
+        let wrong = ResponseHead {
             status: 206,
             etag: Some(etag),
             content_range: Some(ContentRange {
-                first: 10,
-                last: 63,
+                first: 0,
+                last: 4,
                 size: 256,
             }),
-            content_length: 54,
+            content_length: 5,
             headers: Vec::new(),
         };
-        gateway.on_node_response(Time(3), rest[0], first, None);
-        let forward = Action::Forward {
-            request: client,
-            from: rest[0],
-            len: 54,
-        };
-        assert_eq!(gateway.drain(), vec![forward]);
-        gateway.on_node_stale(Time(4), rest[1]);
-        assert_eq!(gateway.drain(), Vec::new());
-        gateway.on_forwarded(Time(5), rest[0], 54);
-        assert_eq!(gateway.drain(), vec![Action::Abort { request: client }]);
-        assert!(gateway.is_idle());
+        gateway.on_node_response(Time(3), part, wrong, None);
+        let actions = gateway.drain();
+        assert_eq!(actions[0], Action::Discard { id: part });
+        assert!(matches!(actions[1], Action::Send { id, .. } if id != part));
     }
 }

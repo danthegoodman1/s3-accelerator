@@ -487,6 +487,9 @@ pub struct Simulator {
     /// is longer than the given length ends there.
     cut_responses: BTreeMap<usize, u64>,
     cut_origin_responses: BTreeMap<usize, u64>,
+    /// Scripted: forwards finish only once released.
+    holding_forwards: bool,
+    held_forwards: Vec<Event>,
     /// Client responses a gateway started, and the body so far.
     client_responses: BTreeMap<(usize, ClientRequestId), (ResponseHead, Vec<u8>)>,
     writes: BTreeMap<(usize, Location), Write>,
@@ -584,6 +587,8 @@ impl Simulator {
             client_responses: BTreeMap::new(),
             cut_responses: BTreeMap::new(),
             cut_origin_responses: BTreeMap::new(),
+            holding_forwards: false,
+            held_forwards: Vec::new(),
             writes: BTreeMap::new(),
             sending: BTreeMap::new(),
             cancelled: BTreeSet::new(),
@@ -780,6 +785,32 @@ impl Simulator {
         self.cut_origin_responses.insert(node, at);
     }
 
+    /// Holds every forward that starts from now on until
+    /// `release_forwards`.
+    pub fn hold_forwards(&mut self) {
+        self.holding_forwards = true;
+    }
+
+    /// Lets held forwards finish, and later ones run as usual.
+    pub fn release_forwards(&mut self) {
+        self.holding_forwards = false;
+        for event in std::mem::take(&mut self.held_forwards) {
+            self.queue.push(self.now, event);
+        }
+    }
+
+    /// Forwards held since `hold_forwards`.
+    pub fn held_forwards(&self) -> usize {
+        self.held_forwards.len()
+    }
+
+    /// The node that owns block `index` of `key`, an object of `size` bytes.
+    pub fn owner(&self, key: &ObjectKey, size: u64, index: u64) -> usize {
+        let layout = Layout::new(self.options.block_size, self.options.chunk_blocks);
+        let placement = layout.placement(key, size, index).hash();
+        self.ring.owner(placement).expect("a node").0 as usize
+    }
+
     /// Writes `node` has in progress.
     pub fn writes_in_progress(&self, node: usize) -> usize {
         self.writes
@@ -817,15 +848,16 @@ impl Simulator {
         let mut summary = self.summary.clone();
         summary.ticks = self.now;
         summary.origin_requests = self.origin.requests();
-        for (node, retired) in self.nodes.iter().zip(&self.retired) {
-            let stats = node.as_ref().map(Node::stats).unwrap_or_default();
-            summary.hit_bytes += retired.hit_bytes + stats.hit_bytes;
-            summary.miss_bytes += retired.miss_bytes + stats.miss_bytes;
-            summary.written_bytes += retired.written_bytes + stats.written_bytes;
-            summary.evicted_blocks += retired.evicted_blocks + stats.evicted_blocks;
-            summary.verified_blocks += retired.verified_blocks + stats.verified_blocks;
-            summary.corrupt_blocks += retired.corrupt_blocks + stats.corrupt_blocks;
-            summary.node_reads.push(retired.reads + stats.reads);
+        for (node, &retired) in self.nodes.iter().zip(&self.retired) {
+            let mut stats = node.as_ref().map(Node::stats).unwrap_or_default();
+            stats += retired;
+            summary.hit_bytes += stats.hit_bytes;
+            summary.miss_bytes += stats.miss_bytes;
+            summary.written_bytes += stats.written_bytes;
+            summary.evicted_blocks += stats.evicted_blocks;
+            summary.verified_blocks += stats.verified_blocks;
+            summary.corrupt_blocks += stats.corrupt_blocks;
+            summary.node_reads.push(stats.reads);
         }
         summary
     }
@@ -977,14 +1009,7 @@ impl Simulator {
             }
             self.summary.crashes += 1;
         }
-        let retired = &mut self.retired[node];
-        retired.hit_bytes += stats.hit_bytes;
-        retired.miss_bytes += stats.miss_bytes;
-        retired.written_bytes += stats.written_bytes;
-        retired.evicted_blocks += stats.evicted_blocks;
-        retired.verified_blocks += stats.verified_blocks;
-        retired.corrupt_blocks += stats.corrupt_blocks;
-        retired.reads += stats.reads;
+        self.retired[node] += stats;
         self.nodes[node] = None;
         self.runs[node] += 1;
         self.down.insert(node, until);
@@ -1014,6 +1039,7 @@ impl Simulator {
             + self.gateway_bodies.len()
             + self.origin_bodies.len()
             + self.client_responses.len()
+            + self.held_forwards.len()
             + self.writes.len()
             + self.sending.len();
         let busy = self.busy();
@@ -1360,7 +1386,11 @@ impl Simulator {
                         from,
                         bytes: body.bytes,
                     };
-                    self.queue.push(self.now + delay, forwarded);
+                    if self.holding_forwards {
+                        self.held_forwards.push(forwarded);
+                    } else {
+                        self.queue.push(self.now + delay, forwarded);
+                    }
                 }
                 gateway::Action::Abort { request } => {
                     let Some((head, body)) = self.client_responses.remove(&(gateway, request))

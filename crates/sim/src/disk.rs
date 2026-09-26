@@ -14,8 +14,11 @@ pub struct Disk {
     pub records: BTreeMap<Location, (SlotRecord, u64, u64)>,
     /// The node's current run; each start begins a new one.
     run: u64,
-    /// A run that ended with a clean shutdown, until the next start.
-    clean_run: Option<u64>,
+    /// The table's clean mark: after a clean shutdown, the earliest run
+    /// whose records are all sound. A start takes it.
+    trusted_from: Option<u64>,
+    /// The mark the current run started from.
+    started_from: Option<u64>,
     /// Recorded slots whose bytes a fault damaged after they were durable.
     pub damaged: BTreeSet<Location>,
 }
@@ -30,7 +33,8 @@ impl Disk {
                 .collect(),
             records: BTreeMap::new(),
             run: 0,
-            clean_run: None,
+            trusted_from: None,
+            started_from: None,
             damaged: BTreeSet::new(),
         }
     }
@@ -56,15 +60,17 @@ impl Disk {
         self.damaged.remove(&location);
     }
 
-    /// Marks the table after a clean shutdown: its run's records are sound.
+    /// Marks the table after a clean shutdown. This run's records are
+    /// sound, and so are those the run trusted when it started.
     pub fn shut_down(&mut self) {
-        self.clean_run = Some(self.run);
+        self.trusted_from = Some(self.started_from.unwrap_or(self.run));
     }
 
     /// Starts a new run of the node and reads back the table, trusting the
-    /// records of a run that shut down cleanly.
+    /// records the clean mark vouches for.
     pub fn start(&mut self) -> Vec<Recovered> {
-        let clean = self.clean_run.take();
+        let trusted_from = self.trusted_from.take();
+        self.started_from = trusted_from;
         self.run += 1;
         self.records
             .iter()
@@ -72,7 +78,7 @@ impl Disk {
                 location,
                 record: record.clone(),
                 checksum: *checksum,
-                trusted: clean == Some(*run),
+                trusted: trusted_from.is_some_and(|from| *run >= from),
             })
             .collect()
     }

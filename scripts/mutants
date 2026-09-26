@@ -125,7 +125,8 @@ MUTANTS = [
     ),
     (
         "a stale gateway entry is kept",
-        [(GATEWAY, "self.cache.remove(&key);\n        self.plan(now, id);", "self.plan(now, id);")],
+        [(GATEWAY, "What::Range { etag, .. } => self.cache.stale(&key, etag),\n            What::Object(..) => self.cache.remove(&key),",
+          "What::Range { .. } | What::Object(..) => {}")],
     ),
     (
         "nodes store blocks they do not own",
@@ -221,7 +222,18 @@ MUTANTS = [
     ),
     (
         "a restarted home fetches whole objects it holds blocks of",
-        [(NODE, "None if holds_blocks => {", "None if holds_blocks && false => {")],
+        [(NODE, "if self.recovered.remove(&key) && self.holds_blocks_of(&key) {",
+          "if self.recovered.remove(&key) && self.holds_blocks_of(&key) && false {")],
+    ),
+    (
+        "a home that holds old blocks fetches a HEAD before every first read",
+        [(NODE, "if self.recovered.remove(&key) && self.holds_blocks_of(&key) {",
+          "if self.holds_blocks_of(&key) {")],
+    ),
+    (
+        "an early end forgets the stale ETag",
+        [(GATEWAY, "What::Range { etag, .. } => self.cache.stale(&key, etag),",
+          "What::Range { .. } => self.cache.remove(&key),")],
     ),    (
         "a cut body is never resumed",
         [(GATEWAY, "return self.resume(id, part, copied);", "return self.abort(id);")],
@@ -240,7 +252,7 @@ MUTANTS = [
     ),
     (
         "a changed object restarts a response that already started",
-        [(GATEWAY, "let key = self.reads[&id].request.key.clone();\n            self.cache.remove(&key);\n            return self.abort(id);", "let _ = id;")],
+        [(GATEWAY, "if matches!(self.reads[&id].stage, Stage::Streaming { .. }) {\n            return self.abort(id);\n        }", "")],
     ),
     (
         "a write from a cut S3 body is kept",

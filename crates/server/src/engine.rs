@@ -36,7 +36,7 @@ pub struct Engine {
     node_requests: BTreeMap<GatewayRequestId, NodeRequestId>,
     relayed: BTreeMap<NodeRequestId, Bytes>,
     /// Client responses the gateway started, and their bodies so far.
-    responses: BTreeMap<ClientRequestId, (ResponseHead, Vec<u8>)>,
+    responses: BTreeMap<ClientRequestId, (ResponseHead, Vec<Bytes>)>,
     fetches: Vec<(OriginRequestId, Request)>,
     /// S3 requests in flight, which a cancellation aborts.
     tasks: BTreeMap<OriginRequestId, tokio::task::AbortHandle>,
@@ -140,24 +140,32 @@ impl Engine {
                 self.responses.insert(request, (head, Vec::new()));
             }
             gateway::Action::Forward { request, from, len } => {
-                let bytes = self.relayed.remove(&from).unwrap_or_default();
-                let copied = bytes.len().min(len as usize);
-                let (head, body) = self
-                    .responses
-                    .get_mut(&request)
-                    .expect("a forward follows its start");
-                body.extend_from_slice(&bytes[..copied]);
-                if body.len() as u64 == head.content_length {
-                    let (head, body) = self.responses.remove(&request).expect("started");
-                    self.answer(request, head, Bytes::from(body));
-                }
                 let now = self.now();
-                self.gateway.on_forwarded(now, from, copied as u64);
+                // Every node's body is here before the gateway forwards it;
+                // a missing one is a bug, and the client gets an error, not
+                // a body from elsewhere.
+                let Some(bytes) = self.relayed.remove(&from) else {
+                    self.responses.remove(&request);
+                    self.answer(request, ResponseHead::status(500), Bytes::new());
+                    return self.gateway.on_forwarded(now, from, len);
+                };
+                let bytes = bytes.slice(..bytes.len().min(len as usize));
+                let copied = bytes.len() as u64;
+                if let Some((head, parts)) = self.responses.get_mut(&request) {
+                    parts.push(bytes);
+                    let sent: usize = parts.iter().map(Bytes::len).sum();
+                    if sent as u64 == head.content_length {
+                        let (head, parts) = self.responses.remove(&request).expect("started");
+                        self.answer(request, head, concat(parts));
+                    }
+                }
+                self.gateway.on_forwarded(now, from, copied);
             }
             // The client gets the body so far, and the connection closes.
             gateway::Action::Abort { request } => {
-                let (head, body) = self.responses.remove(&request).expect("an aborted start");
-                self.answer(request, head, Bytes::from(body));
+                if let Some((head, parts)) = self.responses.remove(&request) {
+                    self.answer(request, head, concat(parts));
+                }
             }
             gateway::Action::Respond { request, head } => self.answer(request, head, Bytes::new()),
             gateway::Action::Discard { id } => {
@@ -300,5 +308,13 @@ fn start_fetches(engine: &Shared, fetches: Vec<(OriginRequestId, Request)>) {
             .borrow_mut()
             .tasks
             .insert(origin, task.abort_handle());
+    }
+}
+
+/// One body from its pieces, copying only when there are several.
+fn concat(mut parts: Vec<Bytes>) -> Bytes {
+    match parts.len() {
+        1 => parts.pop().expect("one part"),
+        _ => Bytes::from(parts.concat()),
     }
 }

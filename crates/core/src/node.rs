@@ -218,6 +218,19 @@ pub struct Stats {
     pub corrupt_blocks: u64,
 }
 
+impl std::ops::AddAssign for Stats {
+    fn add_assign(&mut self, other: Stats) {
+        self.hit_bytes += other.hit_bytes;
+        self.miss_bytes += other.miss_bytes;
+        self.origin_requests += other.origin_requests;
+        self.written_bytes += other.written_bytes;
+        self.reads += other.reads;
+        self.evicted_blocks += other.evicted_blocks;
+        self.verified_blocks += other.verified_blocks;
+        self.corrupt_blocks += other.corrupt_blocks;
+    }
+}
+
 /// A stored block, as the node's index describes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredBlock<'a> {
@@ -249,6 +262,9 @@ pub struct Node {
     in_flight: BTreeMap<BlockKey, OriginRequestId>,
     /// Slots being written, and the response bodies they copy from.
     writes: BTreeMap<Location, OriginRequestId>,
+    /// Keys whose blocks the node recovered at startup and whose metadata
+    /// it has not fetched since.
+    recovered: BTreeSet<ObjectKey>,
     /// Recovered blocks being verified, and the requests that wait for them.
     verifying: BTreeMap<Location, (BlockKey, Vec<GatewayRequestId>)>,
     /// Bytes of stored blocks that are filling.
@@ -387,6 +403,7 @@ impl Node {
             next_origin: 0,
             in_flight: BTreeMap::new(),
             writes: BTreeMap::new(),
+            recovered: BTreeSet::new(),
             verifying: BTreeMap::new(),
             filling_bytes: 0,
             waiting: BTreeMap::new(),
@@ -428,6 +445,7 @@ impl Node {
                     .restore(block, location, record.len, hash, record.placement, verify);
             if restored {
                 node.refer(version);
+                node.recovered.insert(record.key);
             } else {
                 node.forget_if_unused(version);
                 node.actions.push(Action::Clear { location });
@@ -800,13 +818,14 @@ impl Node {
         let key = self.object_request(id).key.clone();
         let arrived = self.waiting[&id].arrived;
         let freshness = self.policy(&key.bucket).freshness;
-        let holds_blocks = self.holds_blocks_of(&key);
-        match self.objects.get_mut(&key) {
-            // A home that holds blocks of the object, as after a restart,
-            // fetches only its metadata, then serves the blocks.
-            None if holds_blocks => {
-                self.first_fetch(now, id, Request::head(key), Vec::new(), false);
+        if !self.objects.contains_key(&key) {
+            // After a restart, a home that still holds blocks of the
+            // object fetches only its metadata, then serves the blocks.
+            if self.recovered.remove(&key) && self.holds_blocks_of(&key) {
+                return self.first_fetch(now, id, Request::head(key), Vec::new(), false);
             }
+        }
+        match self.objects.get_mut(&key) {
             None => {
                 let client = self.object_request(id);
                 let request = Request {

@@ -186,10 +186,14 @@ fn a_write_through_the_home_drops_its_metadata() {
     sim.put(&key, 100);
     sim.read(Request::get(key.clone())).unwrap();
     sim.write_through(&key, 120).unwrap();
+    let before = sim.summary().origin_requests;
     let (head, body) = sim.read(Request::get(key.clone())).unwrap();
     let current = sim.origin().current(&key).unwrap();
     assert_eq!(head.etag.as_ref(), Some(&current.etag));
     assert_eq!(body.len(), 120);
+    // The old version's blocks remain, but the first fetch still relays
+    // the read: one S3 request, not a HEAD and then fills.
+    assert_eq!(sim.summary().origin_requests - before, 1);
 }
 
 /// A read that races a write may see the old version, but the home must
@@ -540,17 +544,19 @@ fn a_clean_shutdown_vouches_only_for_blocks_it_verified() {
 }
 
 #[test]
-fn verified_blocks_stay_trusted_across_a_clean_restart() {
+fn verified_blocks_stay_trusted_across_clean_restarts() {
     let (mut sim, key) = restarted(true);
     sim.read(Request::get(key.clone())).unwrap();
     assert_eq!(sim.summary().verified_blocks, 4);
-    sim.shut_down(0).unwrap();
-    sim.restart(0).unwrap();
-    let before = sim.summary();
-    sim.read(Request::get(key)).unwrap();
-    let after = sim.summary();
-    assert_eq!(after.hit_bytes - before.hit_bytes, 200);
-    assert_eq!(after.verified_blocks, 4);
+    for _ in 0..2 {
+        sim.shut_down(0).unwrap();
+        sim.restart(0).unwrap();
+        let before = sim.summary();
+        sim.read(Request::get(key.clone())).unwrap();
+        let after = sim.summary();
+        assert_eq!(after.hit_bytes - before.hit_bytes, 200);
+        assert_eq!(after.verified_blocks, 4);
+    }
 }
 
 #[test]
@@ -594,7 +600,9 @@ fn a_body_cut_partway_resumes_from_the_next_candidate() {
 
 /// The object changes behind the cache, and the home's body ends partway
 /// through a response of the old version. The rest of the old version is
-/// gone from S3, so the response ends early and the client retries.
+/// gone from S3, so the response ends early. The gateway tells the home the
+/// old ETag is stale, so the client's retry reads the new version though
+/// the home's metadata is still within its TTL.
 #[test]
 fn a_response_whose_object_changed_after_it_started_ends_early() {
     let mut options = cluster();
@@ -606,11 +614,59 @@ fn a_response_whose_object_changed_after_it_started_ends_early() {
     sim.read(Request::get(key.clone())).unwrap();
     sim.put(&key, 2_048);
     sim.cut_response(sim.home(&key), 10);
-    let (head, body) = sim.read(Request::get(key)).unwrap();
+    let (head, body) = sim.read(Request::get(key.clone())).unwrap();
     assert_eq!((head.status, body.len()), (200, 2_048));
+    let current = sim.origin().current(&key).unwrap();
+    assert_eq!(head.etag.as_ref(), Some(&current.etag));
     let summary = sim.summary();
     assert_eq!(summary.cut_bodies, 1);
     assert_eq!((summary.early_ends, summary.client_retries), (1, 1));
+}
+
+/// A cold read's body from the home ends partway, and its rest goes to
+/// several nodes. The first of them is forwarding when a later one finds
+/// the object changed. The response ends early only after that forward
+/// finishes, since the driver is still copying its body.
+#[test]
+fn an_early_end_waits_for_the_forward_in_progress() {
+    let mut options = cluster();
+    options.gateway_metadata_ttl = 0;
+    options.suspect_ttl = 0;
+    let sim = Simulator::new(1, options.clone());
+    // A key whose second chunk has an owner other than the home and the
+    // home's next candidate, which stand in for the first chunk.
+    let (key, cut_off) = (0..)
+        .map(|index| key(TTL_BUCKET, &format!("k{index}")))
+        .find_map(|key| {
+            let candidates = sim.home_candidates(&key);
+            let owner = sim.owner(&key, 2_048, 2);
+            (owner != candidates[0] && owner != candidates[1]).then_some((key, owner))
+        })
+        .unwrap();
+    let mut sim = Simulator::new(1, options);
+    sim.put(&key, 2_048);
+    sim.partition(cut_off, 1_000_000);
+    sim.cut_response(sim.home(&key), 10);
+    let request = sim.start(Request::get(key.clone()));
+    while sim.summary().cut_bodies == 0 {
+        sim.step().unwrap();
+    }
+    sim.hold_forwards();
+    while sim.held_forwards() == 0 {
+        sim.step().unwrap();
+    }
+    // The part sent to the cut-off owner times out; its next candidate
+    // finds the object changed.
+    sim.put(&key, 2_048);
+    for _ in 0..2_000 {
+        sim.step().unwrap();
+    }
+    assert_eq!(sim.summary().early_ends, 0);
+    sim.release_forwards();
+    sim.partition(cut_off, 0);
+    let (head, body) = sim.finish(request).unwrap();
+    assert_eq!((head.status, body.len()), (200, 2_048));
+    assert_eq!(sim.summary().early_ends, 1);
 }
 
 /// S3's body ends partway through the home's first fetch. The home stores
