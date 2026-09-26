@@ -467,3 +467,109 @@ fn a_candidate_standing_in_for_the_home_keeps_no_metadata() {
     assert_eq!(head.etag.as_ref(), Some(&current.etag));
     assert_eq!(head.content_length, 120);
 }
+
+/// A node that stored a 200-byte object in four blocks, then stopped and
+/// started again over its slot table. The gateway keeps no metadata, so
+/// every read goes through the home.
+fn restarted(crash: bool) -> (Simulator, ObjectKey) {
+    let mut options = Options::scenario();
+    options.ttl_admit_on_first_read = true;
+    options.gateway_metadata_ttl = 0;
+    let mut sim = Simulator::new(1, options);
+    let key = key(TTL_BUCKET, "k");
+    sim.put(&key, 200);
+    sim.read(Request::get(key.clone())).unwrap();
+    assert_eq!(sim.summary().written_bytes, 200);
+    match crash {
+        true => sim.crash(0).unwrap(),
+        false => sim.shut_down(0).unwrap(),
+    }
+    sim.restart(0).unwrap();
+    (sim, key)
+}
+
+#[test]
+fn a_clean_restart_keeps_the_cache_warm() {
+    let (mut sim, key) = restarted(false);
+    let before = sim.summary();
+    let (_, body) = sim.read(Request::get(key)).unwrap();
+    let after = sim.summary();
+    assert_eq!(body.len(), 200);
+    assert_eq!(after.hit_bytes - before.hit_bytes, 200);
+    // A HEAD for the metadata the restart lost.
+    assert_eq!(after.origin_requests - before.origin_requests, 1);
+    assert_eq!(after.verified_blocks, 0);
+}
+
+#[test]
+fn after_a_crash_each_block_is_verified_before_it_is_served() {
+    let (mut sim, key) = restarted(true);
+    let before = sim.summary();
+    sim.read(Request::get(key.clone())).unwrap();
+    let after = sim.summary();
+    assert_eq!(after.hit_bytes - before.hit_bytes, 200);
+    assert_eq!(after.origin_requests - before.origin_requests, 1);
+    assert_eq!((after.verified_blocks, after.corrupt_blocks), (4, 0));
+    sim.read(Request::get(key)).unwrap();
+    assert_eq!(sim.summary().verified_blocks, 4);
+}
+
+#[test]
+fn a_damaged_block_is_read_again_from_s3() {
+    let (mut sim, key) = restarted(true);
+    assert!(sim.damage(0, &key, 1));
+    let before = sim.summary();
+    let (_, body) = sim.read(Request::get(key)).unwrap();
+    let after = sim.summary();
+    assert_eq!(body.len(), 200);
+    assert_eq!(after.corrupt_blocks, 1);
+    assert_eq!(after.hit_bytes - before.hit_bytes, 200 - 64);
+    // The HEAD, and a fill of the damaged block.
+    assert_eq!(after.origin_requests - before.origin_requests, 2);
+}
+
+#[test]
+fn a_clean_shutdown_vouches_only_for_blocks_it_verified() {
+    let (mut sim, key) = restarted(true);
+    assert!(sim.damage(0, &key, 1));
+    sim.shut_down(0).unwrap();
+    sim.restart(0).unwrap();
+    let (_, body) = sim.read(Request::get(key)).unwrap();
+    assert_eq!(body.len(), 200);
+    assert_eq!(sim.summary().corrupt_blocks, 1);
+}
+
+#[test]
+fn verified_blocks_stay_trusted_across_a_clean_restart() {
+    let (mut sim, key) = restarted(true);
+    sim.read(Request::get(key.clone())).unwrap();
+    assert_eq!(sim.summary().verified_blocks, 4);
+    sim.shut_down(0).unwrap();
+    sim.restart(0).unwrap();
+    let before = sim.summary();
+    sim.read(Request::get(key)).unwrap();
+    let after = sim.summary();
+    assert_eq!(after.hit_bytes - before.hit_bytes, 200);
+    assert_eq!(after.verified_blocks, 4);
+}
+
+#[test]
+fn a_crash_during_a_fill_leaves_no_record_of_it() {
+    let mut options = Options::scenario();
+    options.immutable_admit_on_first_read = true;
+    options.disk_delay_max = 50;
+    let mut sim = Simulator::new(1, options);
+    let key = key(IMMUTABLE_BUCKET, "k");
+    sim.put(&key, 200);
+    let request = sim.start(Request::get(key.clone()));
+    while sim.writes_in_progress(0) < 4 {
+        sim.step().unwrap();
+    }
+    sim.crash(0).unwrap();
+    sim.restart(0).unwrap();
+    assert_eq!(sim.finish(request).unwrap().1.len(), 200);
+    // The torn blocks were never recorded, so none needs verifying.
+    let (_, body) = sim.read(Request::get(key)).unwrap();
+    assert_eq!(body.len(), 200);
+    assert_eq!(sim.summary().verified_blocks, 0);
+}

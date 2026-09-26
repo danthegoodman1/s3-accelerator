@@ -5,11 +5,16 @@
 //! carries `If-Match` with that ETag, so every stored block belongs to the
 //! version it is keyed by. A fill that fails `If-Match` drops the metadata,
 //! and the requests waiting on it go back to the gateway to retry.
+//!
+//! The slot table on disk records each stored block once its bytes are
+//! durable, so a restarted node rebuilds its index. After a crash, each
+//! recovered block's first read checks its bytes against the recorded
+//! checksum; a block that fails is dropped and read again from S3.
 
 use crate::Time;
 use crate::doorkeeper::Doorkeeper;
 use crate::layout::Layout;
-use crate::placement::{NodeId, Placement, Ring};
+use crate::placement::{NodeId, Placement, PlacementHash, Ring};
 use crate::s3::{
     Answer, ByteRange, ContentRange, ETag, Method, ObjectKey, Request, ResponseHead, answer,
     preconditions,
@@ -99,6 +104,28 @@ pub struct Config {
     pub buckets: BTreeMap<String, BucketPolicy>,
 }
 
+/// What the slot table records about a stored block: enough to put it back
+/// in the index after a restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotRecord {
+    pub key: ObjectKey,
+    pub etag: ETag,
+    pub index: u64,
+    pub len: u64,
+    pub placement: PlacementHash,
+}
+
+/// A slot-table record read back when the node starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Recovered {
+    pub location: Location,
+    pub record: SlotRecord,
+    pub checksum: u64,
+    /// Written or verified in a run that ended with a clean shutdown, so
+    /// the bytes need no check.
+    pub trusted: bool,
+}
+
 /// A piece of a response body. A body is a list of pieces, sent in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Segment {
@@ -148,6 +175,24 @@ pub enum Action {
         offset: u64,
         len: u64,
     },
+    /// Record in the slot table that the slot at `location` holds
+    /// `record`'s block, with a checksum of its bytes. The node asks once
+    /// the bytes are durable, and again once it verifies a recovered block,
+    /// so a later clean shutdown vouches for it.
+    Record {
+        location: Location,
+        record: SlotRecord,
+    },
+    /// Erase the slot table's record for `location`. The erasure must be
+    /// durable before a later `Write` over any of the slot's bytes begins.
+    Clear { location: Location },
+    /// Check the `len` bytes of the block at `location` against the
+    /// checksum its record held, then call `on_verified`.
+    Verify {
+        location: Location,
+        len: u64,
+        checksum: u64,
+    },
     /// The node needs no more of S3's response body to `origin`.
     Release { origin: OriginRequestId },
     /// The node gave up on S3 request `origin`: drop its response if it
@@ -166,6 +211,10 @@ pub struct Stats {
     /// Requests from gateways.
     pub reads: u64,
     pub evicted_blocks: u64,
+    /// Recovered blocks checked against their checksums, and those that
+    /// failed.
+    pub verified_blocks: u64,
+    pub corrupt_blocks: u64,
 }
 
 /// A stored block, as the node's index describes it.
@@ -199,6 +248,8 @@ pub struct Node {
     in_flight: BTreeMap<BlockKey, OriginRequestId>,
     /// Slots being written, and the response bodies they copy from.
     writes: BTreeMap<Location, OriginRequestId>,
+    /// Recovered blocks being verified, and the requests that wait for them.
+    verifying: BTreeMap<Location, (BlockKey, Vec<GatewayRequestId>)>,
     /// Bytes of stored blocks that are filling.
     filling_bytes: u64,
     waiting: BTreeMap<GatewayRequestId, Waiting>,
@@ -293,8 +344,14 @@ struct Plan {
     meta: Option<ObjectMeta>,
     body: Vec<Segment>,
     holds: Holds,
-    /// Fills that must answer before the response starts.
-    awaiting: BTreeSet<OriginRequestId>,
+    /// Fills and verifications that must finish before the response starts.
+    awaiting: BTreeSet<Await>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Await {
+    Fill(OriginRequestId),
+    Verify(Location),
 }
 
 /// What a response keeps in place until its body is sent.
@@ -329,6 +386,7 @@ impl Node {
             next_origin: 0,
             in_flight: BTreeMap::new(),
             writes: BTreeMap::new(),
+            verifying: BTreeMap::new(),
             filling_bytes: 0,
             waiting: BTreeMap::new(),
             sending: BTreeMap::new(),
@@ -337,15 +395,55 @@ impl Node {
         }
     }
 
+    /// A node restarting over the slot table's records. It serves trusted
+    /// blocks as they are and verifies each other block on its first read.
+    /// Records that no slot of this store can hold, or that clash with
+    /// others, are cleared.
+    pub fn recover(
+        id: NodeId,
+        ring: Ring,
+        config: Config,
+        records: impl IntoIterator<Item = Recovered>,
+    ) -> Node {
+        let mut node = Node::new(id, ring, config);
+        let block_size = node.config.layout.block_size();
+        for recovered in records {
+            let Recovered {
+                location,
+                record,
+                checksum,
+                trusted,
+            } = recovered;
+            let version = node.version(&record.key, &record.etag);
+            let block = BlockKey {
+                version,
+                index: record.index,
+            };
+            let hash = block_hash(&record.key, &record.etag, block_size, record.index);
+            let verify = (!trusted).then_some(checksum);
+            let restored = record.len <= block_size
+                && node
+                    .store
+                    .restore(block, location, record.len, hash, record.placement, verify);
+            if restored {
+                node.refer(version);
+            } else {
+                node.forget_if_unused(version);
+                node.actions.push(Action::Clear { location });
+            }
+        }
+        node
+    }
+
     pub fn stats(&self) -> Stats {
         self.stats
     }
 
-    /// Every readable stored block.
+    /// Every stored block the node would serve without verifying it first.
     pub fn stored_blocks(&self) -> impl Iterator<Item = StoredBlock<'_>> {
         self.store
             .blocks()
-            .filter(|(_, entry)| entry.state == BlockState::Ready)
+            .filter(|(_, entry)| entry.state == BlockState::Ready && entry.verify.is_none())
             .map(|(block, entry)| {
                 let (key, etag) = &self.version_names[&block.version];
                 StoredBlock {
@@ -358,11 +456,12 @@ impl Node {
             })
     }
 
-    /// The readable block stored at `location`.
+    /// The block stored at `location`, if the node would serve it without
+    /// verifying it first.
     pub fn stored_block_at(&self, location: Location) -> Option<StoredBlock<'_>> {
         let block = self.store.block_at(location)?;
         let entry = self.store.get(&block)?;
-        if entry.state != BlockState::Ready {
+        if entry.state != BlockState::Ready || entry.verify.is_some() {
             return None;
         }
         let (key, etag) = &self.version_names[&block.version];
@@ -421,13 +520,15 @@ impl Node {
         )
     }
 
-    /// True when no request, response, fill or write is in progress.
+    /// True when no request, response, fill, write or verification is in
+    /// progress.
     pub fn is_idle(&self) -> bool {
         self.waiting.is_empty()
             && self.sending.is_empty()
             && self.origins.is_empty()
             && self.in_flight.is_empty()
             && self.writes.is_empty()
+            && self.verifying.is_empty()
     }
 
     /// The actions since the last drain, in the order the node took them.
@@ -503,6 +604,25 @@ impl Node {
             last: range.last,
         };
         self.plan_body(id, &range.key, &range.etag, range.size, body);
+    }
+
+    fn slot_record(&self, block: BlockKey) -> SlotRecord {
+        let entry = self.store.get(&block).expect("recorded block exists");
+        let (key, etag) = self.version_names[&block.version].clone();
+        SlotRecord {
+            key,
+            etag,
+            index: block.index,
+            len: entry.len,
+            placement: entry.placement,
+        }
+    }
+
+    fn holds_blocks_of(&self, key: &ObjectKey) -> bool {
+        self.versions
+            .range((key.clone(), ETag(String::new()))..)
+            .next()
+            .is_some_and(|((held, _), _)| held == key)
     }
 
     fn is_home(&self, key: &ObjectKey) -> bool {
@@ -599,14 +719,48 @@ impl Node {
             .block_at(location)
             .expect("a written slot holds a block");
         self.store.filled(block);
-        let len = self.store.get(&block).expect("written block exists").len;
-        self.filling_bytes -= len;
-        self.stats.written_bytes += len;
+        let record = self.slot_record(block);
+        self.filling_bytes -= record.len;
+        self.stats.written_bytes += record.len;
+        self.actions.push(Action::Record { location, record });
         if self.in_flight.get(&block) == Some(&origin) {
             self.in_flight.remove(&block);
             self.unref(block.version);
         }
         self.stop_reading(origin);
+    }
+
+    /// The block at `location` was checked against its checksum. An intact
+    /// block serves the requests waiting for it; a corrupt one is dropped,
+    /// and they plan again as misses.
+    pub fn on_verified(&mut self, now: Time, location: Location, intact: bool) {
+        self.now = self.now.max(now);
+        let (block, waiters) = self
+            .verifying
+            .remove(&location)
+            .expect("a verification was in progress");
+        self.store.unpin(block);
+        self.stats.verified_blocks += 1;
+        if intact {
+            self.store.verified(block);
+            let record = self.slot_record(block);
+            self.actions.push(Action::Record { location, record });
+            for waiter in waiters {
+                self.arrived(waiter, Await::Verify(location));
+            }
+            return;
+        }
+        self.stats.corrupt_blocks += 1;
+        let waiters: Vec<GatewayRequestId> = waiters
+            .into_iter()
+            .filter(|&waiter| self.abandon_plan(waiter))
+            .collect();
+        self.store.remove(block);
+        self.actions.push(Action::Clear { location });
+        self.unref(block.version);
+        for waiter in waiters {
+            self.replan(now, waiter);
+        }
     }
 
     /// The response to `request` is sent: its blocks and bodies are free.
@@ -622,7 +776,13 @@ impl Node {
         let key = self.object_request(id).key.clone();
         let arrived = self.waiting[&id].arrived;
         let freshness = self.policy(&key.bucket).freshness;
+        let holds_blocks = self.holds_blocks_of(&key);
         match self.objects.get_mut(&key) {
+            // A home that holds blocks of the object, as after a restart,
+            // fetches only its metadata, then serves the blocks.
+            None if holds_blocks => {
+                self.first_fetch(now, id, Request::head(key), Vec::new(), false);
+            }
             None => {
                 let client = self.object_request(id);
                 let request = Request {
@@ -994,8 +1154,8 @@ impl Node {
                 .store
                 .get(&block)
                 .filter(|entry| entry.state == BlockState::Ready)
-                .map(|entry| entry.location);
-            if let Some(location) = ready {
+                .map(|entry| (entry.location, entry.verify.is_some()));
+            if let Some((location, unverified)) = ready {
                 self.store.hit(block);
                 self.store.pin(block);
                 holds.pins.push(block);
@@ -1005,6 +1165,9 @@ impl Node {
                     offset,
                     len,
                 });
+                if unverified {
+                    awaiting.insert(Await::Verify(location));
+                }
                 next += 1;
                 continue;
             }
@@ -1031,7 +1194,7 @@ impl Node {
             });
             self.read(origin, &mut holds);
             if !self.origins[&origin].answered {
-                awaiting.insert(origin);
+                awaiting.insert(Await::Fill(origin));
             }
             next += 1;
         }
@@ -1040,9 +1203,14 @@ impl Node {
             self.waiting.remove(&id);
             return self.respond(id, head, body, holds, meta);
         }
-        for origin in &awaiting {
-            let request = self.origins.get_mut(origin).expect("awaited fill exists");
-            request.waiters.push(id);
+        for &awaited in &awaiting {
+            match awaited {
+                Await::Fill(origin) => {
+                    let request = self.origins.get_mut(&origin).expect("awaited fill exists");
+                    request.waiters.push(id);
+                }
+                Await::Verify(location) => self.verify(location, id),
+            }
         }
         let waiting = self
             .waiting
@@ -1127,7 +1295,7 @@ impl Node {
                 self.write(location, origin, offset, entry.len);
             }
             for waiter in waiters {
-                self.fill_arrived(waiter, origin);
+                self.arrived(waiter, Await::Fill(origin));
             }
             return;
         }
@@ -1163,16 +1331,16 @@ impl Node {
         }
     }
 
-    fn fill_arrived(&mut self, id: GatewayRequestId, origin: OriginRequestId) {
-        let Some(waiting) = self.waiting.get_mut(&id) else {
+    /// A fill or verification a request awaited has finished.
+    fn arrived(&mut self, id: GatewayRequestId, awaited: Await) {
+        let Some(plan) = self
+            .waiting
+            .get_mut(&id)
+            .and_then(|waiting| waiting.plan.as_mut())
+        else {
             return;
         };
-        let plan = waiting
-            .plan
-            .as_mut()
-            .expect("a request awaiting a fill has a plan");
-        plan.awaiting.remove(&origin);
-        if plan.awaiting.is_empty() {
+        if plan.awaiting.remove(&awaited) && plan.awaiting.is_empty() {
             let plan = self
                 .waiting
                 .remove(&id)
@@ -1180,6 +1348,70 @@ impl Node {
                 .plan
                 .expect("plan");
             self.respond(id, plan.head, plan.body, plan.holds, plan.meta);
+        }
+    }
+
+    /// Starts verifying the recovered block at `location` for request `id`,
+    /// or adds `id` to a verification in progress.
+    fn verify(&mut self, location: Location, id: GatewayRequestId) {
+        if let Some((_, waiters)) = self.verifying.get_mut(&location) {
+            waiters.push(id);
+            return;
+        }
+        let block = self
+            .store
+            .block_at(location)
+            .expect("a verified slot holds a block");
+        let entry = self.store.get(&block).expect("verified block exists");
+        let (len, checksum) = (entry.len, entry.verify.expect("an unverified block"));
+        // The verification holds the slot until it answers, so the slot
+        // is never reused under it.
+        self.store.pin(block);
+        self.verifying.insert(location, (block, vec![id]));
+        self.actions.push(Action::Verify {
+            location,
+            len,
+            checksum,
+        });
+    }
+
+    /// Drops a waiting request's plan, releasing what it held and leaving
+    /// the fills and verifications it awaited. Returns false if the
+    /// request no longer waits on a plan.
+    fn abandon_plan(&mut self, id: GatewayRequestId) -> bool {
+        let Some(plan) = self
+            .waiting
+            .get_mut(&id)
+            .and_then(|waiting| waiting.plan.take())
+        else {
+            return false;
+        };
+        for awaited in plan.awaiting {
+            match awaited {
+                Await::Fill(origin) => {
+                    if let Some(request) = self.origins.get_mut(&origin) {
+                        request.waiters.retain(|&waiter| waiter != id);
+                    }
+                }
+                Await::Verify(location) => {
+                    if let Some((_, waiters)) = self.verifying.get_mut(&location) {
+                        waiters.retain(|&waiter| waiter != id);
+                    }
+                }
+            }
+        }
+        self.release(plan.holds);
+        true
+    }
+
+    /// Plans a waiting request again from the start.
+    fn replan(&mut self, now: Time, id: GatewayRequestId) {
+        match self.waiting[&id].read.clone() {
+            Read::Object { .. } => self.serve(now, id),
+            Read::Range(range) => {
+                self.waiting.remove(&id);
+                self.read_range(now, id, range);
+            }
         }
     }
 
@@ -1336,8 +1568,9 @@ impl Node {
             return None;
         }
         let location = self.store.reserve(block, len, hash, placement);
-        for evicted in self.store.drain_evicted() {
+        for (evicted, location) in self.store.drain_evicted() {
             self.stats.evicted_blocks += 1;
+            self.actions.push(Action::Clear { location });
             self.unref(evicted.version);
         }
         let location = location?;

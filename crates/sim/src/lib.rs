@@ -5,7 +5,8 @@
 //! response bodies take time, writers change objects behind the cache's back,
 //! and every response is checked against what S3 held while the request was
 //! in flight, give or take the bucket's staleness bound. Every stored block
-//! is checked against the version it is keyed by. The seed determines the
+//! is checked against the version it is keyed by, and so is every record in
+//! a node's slot table, through crashes and restarts. The seed determines the
 //! whole run, from the cluster's size to each delay, so a seed replays its
 //! run exactly.
 
@@ -24,7 +25,7 @@ use s3_accelerator_core::gateway::{self, ClientRequestId, Gateway, NodeRequestId
 use s3_accelerator_core::layout::Layout;
 use s3_accelerator_core::node::{
     self, BucketPolicy, Freshness, GatewayRequestId, Node, ObjectMeta, OriginRequestId, Read,
-    Segment,
+    Segment, StoredBlock,
 };
 use s3_accelerator_core::placement::{Member, NodeId, Placement, Ring};
 use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
@@ -80,6 +81,15 @@ pub struct Options {
     pub partition_percent: u64,
     pub partition_max: u64,
     pub origin_error_percent: u64,
+    /// Chance per thousand ticks, while faults happen, that a node stops
+    /// for up to `down_max` ticks. It shuts down cleanly, finishing its
+    /// writes, `clean_percent` of the time; otherwise it crashes, tearing
+    /// the writes in progress, and `damage_percent` of crashes also damage
+    /// recorded slots, as a drive that loses acknowledged writes would.
+    pub crash_permille: u64,
+    pub clean_percent: u64,
+    pub damage_percent: u64,
+    pub down_max: u64,
     /// Freshness of the TTL bucket's metadata, in ticks.
     pub ttl: u64,
     pub immutable_admit_on_first_read: bool,
@@ -151,6 +161,10 @@ impl Options {
             partition_percent: 0,
             partition_max: 0,
             origin_error_percent: 0,
+            crash_permille: 0,
+            clean_percent: 0,
+            damage_percent: 0,
+            down_max: 0,
         };
         // Timeouts outlast every exchange of a fault-free run, so only
         // faults make them fire: S3 answers within two hops, and a node
@@ -170,6 +184,14 @@ impl Options {
         options.partition_percent = prng.range(0..=2);
         options.partition_max = prng.range(1..=200);
         options.origin_error_percent = prng.range(0..=5);
+        options.crash_permille = if prng.percent(50) {
+            0
+        } else {
+            prng.range(1..=10)
+        };
+        options.clean_percent = prng.range(0..=100);
+        options.damage_percent = prng.range(0..=50);
+        options.down_max = prng.range(1..=300);
         options
     }
 
@@ -200,6 +222,10 @@ impl Options {
             partition_percent: 0,
             partition_max: 0,
             origin_error_percent: 0,
+            crash_permille: 0,
+            clean_percent: 0,
+            damage_percent: 0,
+            down_max: 0,
             ttl: 1_000,
             immutable_admit_on_first_read: false,
             ttl_admit_on_first_read: false,
@@ -288,6 +314,7 @@ enum Message {
     },
     OriginRequest {
         node: usize,
+        run: u64,
         origin: OriginRequestId,
         read: Request,
     },
@@ -310,12 +337,15 @@ enum Message {
         id: NodeRequestId,
     },
     OriginResponse {
+        run: u64,
         origin: OriginRequestId,
         head: ResponseHead,
         body: Vec<u8>,
     },
 }
 
+/// Events for a node carry the run that caused them, and a node that
+/// restarted since ignores them.
 enum Event {
     Deliver {
         to: Address,
@@ -324,12 +354,22 @@ enum Event {
     /// A node's write reached its disk.
     Written {
         node: usize,
+        run: u64,
         location: Location,
     },
     /// A node finished sending a response body.
     Sent {
         node: usize,
+        run: u64,
         id: GatewayRequestId,
+    },
+    /// A node read a recovered block back to check its checksum.
+    Verified {
+        node: usize,
+        run: u64,
+        location: Location,
+        len: u64,
+        checksum: u64,
     },
 }
 
@@ -370,10 +410,18 @@ pub struct Simulator {
     partitions: Prng,
     origin_errors: Prng,
     retries: Prng,
+    crashes: Prng,
+    tears: Prng,
     /// Whether faults happen: while clients are still issuing requests.
     faulty: bool,
     /// Nodes cut off from everyone, until the tick given.
     partitioned: BTreeMap<usize, u64>,
+    /// Nodes that are down, until the tick given.
+    down: BTreeMap<usize, u64>,
+    /// Each node's run: how many times it has stopped.
+    runs: Vec<u64>,
+    /// Stats of each node's runs that ended.
+    retired: Vec<node::Stats>,
     disk_delays: Prng,
     send_delays: Prng,
     now: u64,
@@ -382,7 +430,8 @@ pub struct Simulator {
     keys: Vec<ObjectKey>,
     ring: Ring,
     gateways: Vec<Gateway>,
-    nodes: Vec<Node>,
+    /// Each node, while it is up.
+    nodes: Vec<Option<Node>>,
     disks: Vec<Disk>,
     in_flight: Vec<usize>,
     requests: BTreeMap<u64, Pending>,
@@ -451,8 +500,13 @@ impl Simulator {
             partitions: Prng::stream(seed, "partitions"),
             origin_errors: Prng::stream(seed, "origin errors"),
             retries: Prng::stream(seed, "retries"),
+            crashes: Prng::stream(seed, "crashes"),
+            tears: Prng::stream(seed, "tears"),
             faulty: true,
             partitioned: BTreeMap::new(),
+            down: BTreeMap::new(),
+            runs: vec![0; options.nodes],
+            retired: vec![node::Stats::default(); options.nodes],
             disk_delays: Prng::stream(seed, "disk delays"),
             send_delays: Prng::stream(seed, "send delays"),
             now: 0,
@@ -464,7 +518,13 @@ impl Simulator {
                 .map(|_| Gateway::new(ring.clone(), options.gateway_config()))
                 .collect(),
             nodes: (0..options.nodes)
-                .map(|index| Node::new(NodeId(index as u64), ring.clone(), config.clone()))
+                .map(|index| {
+                    Some(Node::new(
+                        NodeId(index as u64),
+                        ring.clone(),
+                        config.clone(),
+                    ))
+                })
                 .collect(),
             disks: (0..options.nodes)
                 .map(|_| Disk::new(config.store.extents, config.store.extent_size))
@@ -509,26 +569,32 @@ impl Simulator {
     pub fn run(mut self) -> Result<Summary, Failure> {
         let per_hop =
             self.options.delay_max + self.options.disk_delay_max + self.options.send_delay_max;
-        // A runaway guard: with faults, requests wait out client timeouts.
-        let issue_limit =
+        // Faults last until clients have issued every request, or until
+        // this budget runs out: faults heavy enough to stall a small
+        // cluster would otherwise hold the run in its faulty phase forever.
+        // The budget also bounds issuing without faults.
+        let budget =
             20_000 + self.options.requests * ((per_hop + 1) * 20 + 2 * self.options.client_timeout);
         let mut deadline = None;
         while self.issued < self.options.requests || !self.requests.is_empty() {
+            if self.faulty && (self.issued == self.options.requests || self.now > budget) {
+                self.stop_faults()?;
+            }
             if self.issued == self.options.requests && deadline.is_none() {
-                self.faulty = false;
-                self.quiet_since = Some(self.now);
-                self.partitioned.clear();
                 deadline = Some(self.now + 20 * self.options.client_timeout + 10_000);
             }
-            if self.now > deadline.unwrap_or(issue_limit) {
+            let quiet = self.quiet_since.unwrap_or(self.now);
+            if self.now > deadline.unwrap_or(quiet + budget) {
                 let unanswered = self.requests.len();
                 let phase = match deadline {
-                    Some(_) => "after faults stopped",
+                    Some(_) => "after every request was issued and faults stopped",
                     None => "while clients were issuing",
                 };
                 if self.trace {
                     for (index, node) in self.nodes.iter().enumerate() {
-                        eprintln!("node {index}: {}", node.describe());
+                        if let Some(node) = node {
+                            eprintln!("node {index}: {}", node.describe());
+                        }
                     }
                 }
                 return Err(self.failure(format!("{unanswered} requests unanswered {phase}")));
@@ -537,6 +603,20 @@ impl Simulator {
         }
         self.settle()?;
         Ok(self.summary())
+    }
+
+    /// Ends the faulty phase: partitions heal and stopped nodes restart.
+    fn stop_faults(&mut self) -> Result<(), Failure> {
+        if self.trace {
+            eprintln!("{} faults stop", self.now);
+        }
+        self.faulty = false;
+        self.quiet_since = Some(self.now);
+        self.partitioned.clear();
+        for node in std::mem::take(&mut self.down).into_keys() {
+            self.restart(node)?;
+        }
+        Ok(())
     }
 
     /// Writes an object to the model of S3 now.
@@ -557,8 +637,12 @@ impl Simulator {
             .owner(Placement::Home(key).hash())
             .expect("a node")
             .0 as usize;
-        self.nodes[home].on_write(Time(self.now), key);
         self.gateways[0].on_write(Time(self.now), key);
+        // A home that is down lost its metadata with its memory.
+        let Some(node) = self.nodes[home].as_mut() else {
+            return Ok(());
+        };
+        node.on_write(Time(self.now), key);
         self.drain_node(home)
     }
 
@@ -619,6 +703,51 @@ impl Simulator {
         self.partitioned.insert(node, self.now + ticks);
     }
 
+    /// Crashes `node`: its memory is lost and its writes in progress tear.
+    /// It stays down until `restart`.
+    pub fn crash(&mut self, node: usize) -> Result<(), Failure> {
+        self.stop(node, false, false, u64::MAX)
+    }
+
+    /// Shuts `node` down cleanly: it finishes its writes and marks its slot
+    /// table. It stays down until `restart`.
+    pub fn shut_down(&mut self, node: usize) -> Result<(), Failure> {
+        self.stop(node, true, false, u64::MAX)
+    }
+
+    /// Starts a node that is down, over its slot table.
+    pub fn restart(&mut self, node: usize) -> Result<(), Failure> {
+        self.down.remove(&node);
+        let records = self.disks[node].start();
+        let config = self.options.node_config();
+        let id = NodeId(node as u64);
+        self.nodes[node] = Some(Node::recover(id, self.ring.clone(), config, records));
+        self.drain_node(node)
+    }
+
+    /// Writes `node` has in progress.
+    pub fn writes_in_progress(&self, node: usize) -> usize {
+        self.writes
+            .keys()
+            .filter(|(owner, _)| *owner == node)
+            .count()
+    }
+
+    /// Damages the slot `node` recorded for block `index` of `key`, as a
+    /// lost write would. Returns false if no record names that block.
+    pub fn damage(&mut self, node: usize, key: &ObjectKey, index: u64) -> bool {
+        let disk = &mut self.disks[node];
+        let found = disk
+            .records
+            .iter()
+            .find(|(_, (record, _, _))| record.key == *key && record.index == index)
+            .map(|(&location, _)| location);
+        if let Some(location) = found {
+            disk.damage(location, 0);
+        }
+        found.is_some()
+    }
+
     /// The answer to a started request, once it has arrived.
     pub fn take_answer(&mut self, request: u64) -> Option<(ResponseHead, Vec<u8>)> {
         self.watched.get_mut(&request)?.take()
@@ -633,19 +762,21 @@ impl Simulator {
         let mut summary = self.summary.clone();
         summary.ticks = self.now;
         summary.origin_requests = self.origin.requests();
-        for node in &self.nodes {
-            let stats = node.stats();
-            summary.hit_bytes += stats.hit_bytes;
-            summary.miss_bytes += stats.miss_bytes;
-            summary.written_bytes += stats.written_bytes;
-            summary.evicted_blocks += stats.evicted_blocks;
-            summary.node_reads.push(stats.reads);
+        for (node, retired) in self.nodes.iter().zip(&self.retired) {
+            let stats = node.as_ref().map(Node::stats).unwrap_or_default();
+            summary.hit_bytes += retired.hit_bytes + stats.hit_bytes;
+            summary.miss_bytes += retired.miss_bytes + stats.miss_bytes;
+            summary.written_bytes += retired.written_bytes + stats.written_bytes;
+            summary.evicted_blocks += retired.evicted_blocks + stats.evicted_blocks;
+            summary.verified_blocks += retired.verified_blocks + stats.verified_blocks;
+            summary.corrupt_blocks += retired.corrupt_blocks + stats.corrupt_blocks;
+            summary.node_reads.push(retired.reads + stats.reads);
         }
         summary
     }
 
     fn tick(&mut self) -> Result<(), Failure> {
-        self.tick_faults();
+        self.tick_faults()?;
         self.tick_writes();
         self.tick_clients();
         let mut events = 0;
@@ -658,8 +789,10 @@ impl Simulator {
         }
         let now = Time(self.now);
         for node in 0..self.nodes.len() {
-            self.nodes[node].on_tick(now);
-            self.drain_node(node)?;
+            if let Some(up) = self.nodes[node].as_mut() {
+                up.on_tick(now);
+                self.drain_node(node)?;
+            }
         }
         for gateway in 0..self.gateways.len() {
             self.gateways[gateway].on_tick(now);
@@ -672,8 +805,9 @@ impl Simulator {
         Ok(())
     }
 
-    /// Heals partitions that ran their course and starts new ones.
-    fn tick_faults(&mut self) {
+    /// Heals partitions and restarts nodes whose time is up, and starts new
+    /// partitions and stops.
+    fn tick_faults(&mut self) -> Result<(), Failure> {
         let now = self.now;
         self.partitioned.retain(|_, until| *until > now);
         if self.faulty && self.partitions.percent(self.options.partition_percent) {
@@ -684,6 +818,96 @@ impl Simulator {
                 eprintln!("{now} node {node} partitioned for {ticks} ticks");
             }
         }
+        let due: Vec<usize> = self
+            .down
+            .iter()
+            .filter(|&(_, &until)| until <= now)
+            .map(|(&node, _)| node)
+            .collect();
+        for node in due {
+            if self.trace {
+                eprintln!("{now} node {node} restarts");
+            }
+            self.restart(node)?;
+        }
+        if self.faulty && self.crashes.below(1_000) < self.options.crash_permille {
+            let node = self.crashes.index(self.nodes.len());
+            let clean = self.crashes.percent(self.options.clean_percent);
+            let ticks = self.crashes.range(1..=self.options.down_max);
+            if self.nodes[node].is_some() {
+                if self.trace {
+                    let how = if clean { "shuts down" } else { "crashes" };
+                    eprintln!("{now} node {node} {how} for {ticks} ticks");
+                }
+                self.stop(node, clean, true, now + ticks)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes `node` down until tick `until`, losing its memory. A clean
+    /// shutdown first finishes the node's writes and marks its slot table;
+    /// a crash tears the writes in progress, and if `damage` allows, may
+    /// also damage recorded slots.
+    fn stop(&mut self, node: usize, clean: bool, damage: bool, until: u64) -> Result<(), Failure> {
+        let Some(stopped) = self.nodes[node].as_ref() else {
+            return Err(self.failure(format!("node {node} stopped while down")));
+        };
+        let stats = stopped.stats();
+        let writes: Vec<Location> = self
+            .writes
+            .keys()
+            .filter(|(owner, _)| *owner == node)
+            .map(|&(_, location)| location)
+            .collect();
+        if clean {
+            for location in writes {
+                self.written(node, location)?;
+            }
+            self.disks[node].shut_down();
+            self.summary.clean_shutdowns += 1;
+        } else {
+            for location in writes {
+                let write = &self.writes[&(node, location)];
+                let body = &self.origin_bodies[&(node, write.origin)];
+                let bytes = &body[write.offset as usize..(write.offset + write.len) as usize];
+                let torn = self.tears.range(0..=write.len) as usize;
+                self.disks[node].write(location, &bytes[..torn]);
+            }
+            if damage && self.tears.percent(self.options.damage_percent) {
+                for _ in 0..self.tears.range(1..=3) {
+                    let disk = &self.disks[node];
+                    if disk.records.is_empty() {
+                        break;
+                    }
+                    let (&location, (record, _, _)) = disk
+                        .records
+                        .iter()
+                        .nth(self.tears.index(disk.records.len()))
+                        .expect("a record");
+                    let offset = self.tears.below(record.len);
+                    self.disks[node].damage(location, offset);
+                }
+            }
+            self.summary.crashes += 1;
+        }
+        let retired = &mut self.retired[node];
+        retired.hit_bytes += stats.hit_bytes;
+        retired.miss_bytes += stats.miss_bytes;
+        retired.written_bytes += stats.written_bytes;
+        retired.evicted_blocks += stats.evicted_blocks;
+        retired.verified_blocks += stats.verified_blocks;
+        retired.corrupt_blocks += stats.corrupt_blocks;
+        retired.reads += stats.reads;
+        self.nodes[node] = None;
+        self.runs[node] += 1;
+        self.down.insert(node, until);
+        self.writes.retain(|&(owner, _), _| owner != node);
+        self.sending.retain(|&(owner, _), _| owner != node);
+        self.origin_bodies.retain(|&(owner, _), _| owner != node);
+        self.cancelled.retain(|&(owner, _)| owner != node);
+        self.node_requests.retain(|&(owner, _), _| owner != node);
+        self.check_table(node)
     }
 
     /// Runs until nothing is in flight, then checks that nothing is left
@@ -720,7 +944,11 @@ impl Simulator {
 
     /// Nodes and gateways with work in progress.
     fn busy(&self) -> usize {
-        self.nodes.iter().filter(|node| !node.is_idle()).count()
+        self.nodes
+            .iter()
+            .flatten()
+            .filter(|node| !node.is_idle())
+            .count()
             + self
                 .gateways
                 .iter()
@@ -865,13 +1093,40 @@ impl Simulator {
     fn handle(&mut self, event: Event) -> Result<(), Failure> {
         match event {
             Event::Deliver { to, message } => self.deliver(to, message),
-            Event::Written { node, location } => self.written(node, location),
-            Event::Sent { node, id } => self.sent(node, id),
+            Event::Written { node, run, .. }
+            | Event::Sent { node, run, .. }
+            | Event::Verified { node, run, .. }
+                if run != self.runs[node] =>
+            {
+                Ok(())
+            }
+            Event::Written { node, location, .. } => self.written(node, location),
+            Event::Sent { node, id, .. } => self.sent(node, id),
+            Event::Verified {
+                node,
+                location,
+                len,
+                checksum,
+                ..
+            } => {
+                let intact = self.disks[node].checksum(location, len) == checksum;
+                let now = Time(self.now);
+                self.node(node).on_verified(now, location, intact);
+                self.drain_node(node)
+            }
         }
     }
 
     fn deliver(&mut self, to: Address, message: Message) -> Result<(), Failure> {
         let now = Time(self.now);
+        if let Address::Node(node) = to {
+            let stale =
+                matches!(&message, Message::OriginResponse { run, .. } if *run != self.runs[node]);
+            if self.nodes[node].is_none() || stale {
+                self.summary.lost += 1;
+                return Ok(());
+            }
+        }
         match (to, message) {
             (Address::Gateway(gateway), Message::ClientRequest { request, read }) => {
                 let id = ClientRequestId(self.next_id());
@@ -904,18 +1159,31 @@ impl Simulator {
             (Address::Node(node), Message::NodeRequest { gateway, id, read }) => {
                 let local = GatewayRequestId(self.next_id());
                 self.node_requests.insert((node, local), (gateway, id));
-                self.nodes[node].on_request(now, local, read);
+                self.node(node).on_request(now, local, read);
                 self.drain_node(node)
             }
-            (Address::Node(node), Message::OriginResponse { origin, head, body }) => {
+            (
+                Address::Node(node),
+                Message::OriginResponse {
+                    origin, head, body, ..
+                },
+            ) => {
                 if self.cancelled.remove(&(node, origin)) {
                     return Ok(());
                 }
                 self.origin_bodies.insert((node, origin), body);
-                self.nodes[node].on_origin_response(now, origin, head);
+                self.node(node).on_origin_response(now, origin, head);
                 self.drain_node(node)
             }
-            (Address::Origin, Message::OriginRequest { node, origin, read }) => {
+            (
+                Address::Origin,
+                Message::OriginRequest {
+                    node,
+                    run,
+                    origin,
+                    read,
+                },
+            ) => {
                 let (head, body) = match self.faulty
                     && self
                         .origin_errors
@@ -924,7 +1192,12 @@ impl Simulator {
                     true => (ResponseHead::status(503), Vec::new()),
                     false => self.origin.respond_now(&read),
                 };
-                let response = Message::OriginResponse { origin, head, body };
+                let response = Message::OriginResponse {
+                    run,
+                    origin,
+                    head,
+                    body,
+                };
                 self.send(Address::Origin, Address::Node(node), response);
                 Ok(())
             }
@@ -1010,12 +1283,18 @@ impl Simulator {
         Ok(())
     }
 
+    fn node(&mut self, node: usize) -> &mut Node {
+        self.nodes[node].as_mut().expect("the node is up")
+    }
+
     fn drain_node(&mut self, node: usize) -> Result<(), Failure> {
-        for action in self.nodes[node].drain() {
+        let run = self.runs[node];
+        for action in self.node(node).drain() {
             match action {
                 node::Action::Fetch { origin, request } => {
                     let message = Message::OriginRequest {
                         node,
+                        run,
                         origin,
                         read: request,
                     };
@@ -1030,8 +1309,12 @@ impl Simulator {
                     let delay = self.send_delays.range(0..=self.options.send_delay_max);
                     self.sending
                         .insert((node, request), Sending { head, body, meta });
-                    self.queue
-                        .push(self.now + delay, Event::Sent { node, id: request });
+                    let sent = Event::Sent {
+                        node,
+                        run,
+                        id: request,
+                    };
+                    self.queue.push(self.now + delay, sent);
                 }
                 node::Action::Metadata { request, meta } => {
                     let Some((gateway, id)) = self.node_requests.remove(&(node, request)) else {
@@ -1070,8 +1353,31 @@ impl Simulator {
                         );
                     }
                     let delay = self.disk_delays.range(0..=self.options.disk_delay_max);
-                    self.queue
-                        .push(self.now + delay, Event::Written { node, location });
+                    let written = Event::Written {
+                        node,
+                        run,
+                        location,
+                    };
+                    self.queue.push(self.now + delay, written);
+                }
+                node::Action::Record { location, record } => {
+                    self.disks[node].record(location, record);
+                }
+                node::Action::Clear { location } => self.disks[node].clear(location),
+                node::Action::Verify {
+                    location,
+                    len,
+                    checksum,
+                } => {
+                    let delay = self.disk_delays.range(0..=self.options.disk_delay_max);
+                    let verified = Event::Verified {
+                        node,
+                        run,
+                        location,
+                        len,
+                        checksum,
+                    };
+                    self.queue.push(self.now + delay, verified);
                 }
                 node::Action::Cancel { origin } => {
                     if self.trace {
@@ -1111,7 +1417,7 @@ impl Simulator {
         };
         let bytes = bytes.to_vec();
         self.disks[node].write(location, &bytes);
-        self.nodes[node].on_written(location);
+        self.node(node).on_written(location);
         self.check_disk(node, Some(location))?;
         self.check_owned(node, location)?;
         self.drain_node(node)
@@ -1161,7 +1467,7 @@ impl Simulator {
             meta,
         };
         self.send(Address::Node(node), Address::Gateway(gateway), response);
-        self.nodes[node].on_sent(id);
+        self.node(node).on_sent(id);
         self.drain_node(node)
     }
 
@@ -1221,17 +1527,22 @@ impl Simulator {
     }
 
     fn check_disks(&self) -> Result<(), Failure> {
-        (0..self.nodes.len()).try_for_each(|node| self.check_disk(node, None))
+        for node in 0..self.nodes.len() {
+            self.check_disk(node, None)?;
+            self.check_table(node)?;
+        }
+        Ok(())
     }
 
-    /// Checks a node's stored blocks, or only the one at `only`.
+    /// Checks the stored blocks a node would serve as they are, or only the
+    /// one at `only`.
     fn check_disk(&self, node: usize, only: Option<Location>) -> Result<(), Failure> {
+        let Some(up) = &self.nodes[node] else {
+            return Ok(());
+        };
         let blocks: Vec<_> = match only {
-            Some(location) => self.nodes[node]
-                .stored_block_at(location)
-                .into_iter()
-                .collect(),
-            None => self.nodes[node].stored_blocks().collect(),
+            Some(location) => up.stored_block_at(location).into_iter().collect(),
+            None => up.stored_blocks().collect(),
         };
         for block in blocks {
             let bytes = self.disks[node].read(block.location, 0, block.len);
@@ -1241,9 +1552,34 @@ impl Simulator {
         Ok(())
     }
 
+    /// Every record in a node's slot table describes the bytes its slot
+    /// holds, unless a fault damaged them after they were durable.
+    fn check_table(&self, node: usize) -> Result<(), Failure> {
+        let disk = &self.disks[node];
+        for (&location, (record, _, _)) in &disk.records {
+            if disk.damaged.contains(&location) {
+                continue;
+            }
+            let block = StoredBlock {
+                key: &record.key,
+                etag: &record.etag,
+                index: record.index,
+                location,
+                len: record.len,
+            };
+            let bytes = disk.read(location, 0, record.len);
+            properties::check_block(&self.origin, self.options.block_size, &block, bytes)
+                .map_err(|message| self.failure(format!("node {node}'s slot table: {message}")))?;
+        }
+        Ok(())
+    }
+
     /// A node stores only blocks it owns.
     fn check_owned(&self, node: usize, location: Location) -> Result<(), Failure> {
-        let Some(block) = self.nodes[node].stored_block_at(location) else {
+        let Some(up) = &self.nodes[node] else {
+            return Ok(());
+        };
+        let Some(block) = up.stored_block_at(location) else {
             return Ok(());
         };
         let Some(object) = self.origin.version(block.etag) else {
@@ -1320,6 +1656,12 @@ pub struct Summary {
     pub lost: u64,
     pub server_errors: u64,
     pub client_retries: u64,
+    /// Nodes that crashed and that shut down cleanly; recovered blocks
+    /// checked against their checksums, and those that failed.
+    pub crashes: u64,
+    pub clean_shutdowns: u64,
+    pub verified_blocks: u64,
+    pub corrupt_blocks: u64,
     /// A digest of every response: its request, tick, status and body.
     pub fingerprint: u64,
 }
@@ -1344,7 +1686,8 @@ impl fmt::Display for Summary {
             "seed {} passed: {} ticks, {} writes, {} retries, responses {}, \
              {}% of body bytes from disk, {} S3 requests, {} bytes written, \
              {} blocks evicted, node reads {:?}, {} messages lost, {} server errors, \
-             {} client retries, fingerprint {:016x}",
+             {} client retries, {} crashes, {} clean shutdowns, {} blocks verified, \
+             {} corrupt, fingerprint {:016x}",
             self.seed,
             self.ticks,
             self.writes,
@@ -1358,6 +1701,10 @@ impl fmt::Display for Summary {
             self.lost,
             self.server_errors,
             self.client_retries,
+            self.crashes,
+            self.clean_shutdowns,
+            self.verified_blocks,
+            self.corrupt_blocks,
             self.fingerprint
         )
     }

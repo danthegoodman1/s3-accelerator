@@ -54,8 +54,8 @@ MUTANTS = [
         "write leaves its body unheld",
         [
             (NODE, 'self.origins.get_mut(&origin).expect("written body exists").readers += 1;', ""),
-            (NODE, "self.stats.written_bytes += len;\n        if self.in_flight.get(&block) == Some(&origin) {\n            self.in_flight.remove(&block);\n            self.unref(block.version);\n        }\n        self.stop_reading(origin);",
-             "self.stats.written_bytes += len;\n        if self.in_flight.get(&block) == Some(&origin) {\n            self.in_flight.remove(&block);\n            self.unref(block.version);\n        }"),
+            (NODE, "self.unref(block.version);\n        }\n        self.stop_reading(origin);\n    }\n\n    /// The block at `location` was checked",
+             "self.unref(block.version);\n        }\n    }\n\n    /// The block at `location` was checked"),
         ],
     ),
     (
@@ -192,6 +192,36 @@ MUTANTS = [
         "metadata never forgotten",
         [(NODE, "while self.recency.len() > self.config.metadata_capacity && kept < self.recency.len() {",
           "while false {")],
+    ),
+    (
+        "a block is recorded before its bytes are durable",
+        [
+            (NODE, "self.actions.push(Action::Record { location, record });\n        if self.in_flight", "if self.in_flight"),
+            (NODE, "self.writes.insert(location, origin);",
+             "self.writes.insert(location, origin);\n        let block = self.store.block_at(location).expect(\"reserved\");\n        let record = self.slot_record(block);\n        self.actions.push(Action::Record { location, record });"),
+        ],
+    ),
+    (
+        "eviction leaves the slot's record",
+        [(NODE, "self.stats.evicted_blocks += 1;\n            self.actions.push(Action::Clear { location });",
+          "self.stats.evicted_blocks += 1;\n            let _ = location;")],
+    ),
+    (
+        "a restart after a crash trusts its blocks",
+        [(NODE, "let verify = (!trusted).then_some(checksum);", "let verify = None.filter(|_: &u64| trusted || checksum > 0);")],
+    ),
+    (
+        "a corrupt block is served anyway",
+        [(NODE, "if intact {\n            self.store.verified(block);", "if intact || !intact {\n            self.store.verified(block);")],
+    ),
+    (
+        "a verified block is not recorded again",
+        [(NODE, "let record = self.slot_record(block);\n            self.actions.push(Action::Record { location, record });\n            for waiter in waiters {",
+          "for waiter in waiters {")],
+    ),
+    (
+        "a restarted home fetches whole objects it holds blocks of",
+        [(NODE, "None if holds_blocks => {", "None if holds_blocks && false => {")],
     ),
 ]
 

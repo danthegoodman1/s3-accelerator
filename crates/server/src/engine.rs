@@ -204,6 +204,10 @@ impl Engine {
                     .copy_from_slice(source);
                 self.node.on_written(location);
             }
+            // Blocks live in memory and leave with the process, so there is
+            // no slot table to keep and nothing recovered to verify.
+            node::Action::Record { .. } | node::Action::Clear { .. } => {}
+            node::Action::Verify { .. } => unreachable!("a node started empty verifies nothing"),
             node::Action::Release { origin } => {
                 self.bodies.remove(&origin);
             }

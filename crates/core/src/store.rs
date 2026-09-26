@@ -54,6 +54,9 @@ pub struct Entry {
     /// the ghost queue remembers.
     pub hash: u64,
     pub placement: PlacementHash,
+    /// For a recovered block not yet verified, the checksum its bytes
+    /// must match before it is served.
+    pub verify: Option<u64>,
     pins: u32,
     freq: u8,
     queue: Queue,
@@ -86,7 +89,7 @@ pub struct Store {
     ghost: VecDeque<u64>,
     ghosts: BTreeMap<u64, u32>,
     next_seq: u64,
-    evicted: Vec<BlockKey>,
+    evicted: Vec<(BlockKey, Location)>,
 }
 
 struct Extent {
@@ -196,6 +199,7 @@ impl Store {
                 state: BlockState::Filling,
                 hash,
                 placement,
+                verify: None,
                 pins: 0,
                 freq: 0,
                 queue: Queue::None,
@@ -203,6 +207,77 @@ impl Store {
             },
         );
         Some(location)
+    }
+
+    /// Puts back a block the slot table recorded at `location`, readable,
+    /// and unverified if `verify` holds a checksum. Returns false for a
+    /// record that cannot describe this store.
+    pub fn restore(
+        &mut self,
+        key: BlockKey,
+        location: Location,
+        len: u64,
+        hash: u64,
+        placement: PlacementHash,
+        verify: Option<u64>,
+    ) -> bool {
+        if len == 0 || len > self.config.max_slot || self.blocks.contains_key(&key) {
+            return false;
+        }
+        let class = self.class_of(len);
+        let size = self.classes[class].size;
+        let fits = location.offset.is_multiple_of(size)
+            && location.offset + size <= self.config.extent_size;
+        let Some(extent) = self.extents.get(location.extent as usize) else {
+            return false;
+        };
+        if !fits || extent.class.is_some_and(|assigned| assigned != class) {
+            return false;
+        }
+        if extent.class.is_none() {
+            self.free_extents.retain(|&free| free != location.extent);
+            self.assign(location.extent, class);
+        }
+        let state = &mut self.extents[location.extent as usize];
+        let Some(position) = state
+            .free
+            .iter()
+            .position(|&offset| offset == location.offset)
+        else {
+            return false;
+        };
+        state.free.swap_remove(position);
+        if state.free.is_empty() {
+            self.classes[class].with_space.remove(&location.extent);
+        }
+        state.blocks.insert(location.offset, key);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.small.push_back((key, seq));
+        self.small_bytes += size;
+        self.blocks.insert(
+            key,
+            Entry {
+                location,
+                len,
+                state: BlockState::Ready,
+                hash,
+                placement,
+                verify,
+                pins: 0,
+                freq: 0,
+                queue: Queue::Small,
+                seq,
+            },
+        );
+        true
+    }
+
+    /// A recovered block's bytes matched its checksum.
+    pub fn verified(&mut self, key: BlockKey) {
+        if let Some(entry) = self.blocks.get_mut(&key) {
+            entry.verify = None;
+        }
     }
 
     /// The block's bytes are on disk: it becomes readable and joins the
@@ -262,8 +337,8 @@ impl Store {
         }
     }
 
-    /// Blocks evicted since the last drain.
-    pub fn drain_evicted(&mut self) -> Vec<BlockKey> {
+    /// Blocks evicted since the last drain, and the slots they held.
+    pub fn drain_evicted(&mut self) -> Vec<(BlockKey, Location)> {
         std::mem::take(&mut self.evicted)
     }
 
@@ -398,7 +473,7 @@ impl Store {
     fn evict(&mut self, key: BlockKey) {
         let entry = self.detach(key);
         self.free_slot(entry.location);
-        self.evicted.push(key);
+        self.evicted.push((key, entry.location));
     }
 
     /// Empties the extent with the fewest blocks, among those whose blocks
@@ -447,6 +522,14 @@ mod tests {
         }
     }
 
+    fn evicted(store: &mut Store) -> Vec<BlockKey> {
+        store
+            .drain_evicted()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    }
+
     fn fill(store: &mut Store, index: u64, len: u64) -> Option<Location> {
         let location = store.reserve(key(index), len, index, PlacementHash(0))?;
         store.filled(key(index));
@@ -463,7 +546,7 @@ mod tests {
             assert!(location.offset < 64);
             assert!(seen.insert(location));
         }
-        assert!(store.drain_evicted().is_empty());
+        assert!(evicted(&mut store).is_empty());
     }
 
     #[test]
@@ -485,7 +568,7 @@ mod tests {
         }
         store.hit(key(0));
         fill(&mut store, 8, 16).unwrap();
-        assert_eq!(store.drain_evicted(), [key(1)]);
+        assert_eq!(evicted(&mut store), [key(1)]);
         assert!(store.get(&key(0)).is_some());
     }
 
@@ -495,9 +578,9 @@ mod tests {
         for index in 0..9 {
             fill(&mut store, index, 16);
         }
-        assert_eq!(store.drain_evicted(), [key(0)]);
+        assert_eq!(evicted(&mut store), [key(0)]);
         fill(&mut store, 100, 16);
-        let evicted = store.drain_evicted();
+        let evicted = evicted(&mut store);
         // Block 0 comes back under a new key with the same hash.
         let location = store.reserve(key(200), 16, 0, PlacementHash(0)).unwrap();
         store.filled(key(200));
@@ -516,7 +599,7 @@ mod tests {
         assert_eq!(store.reserve(key(8), 16, 8, PlacementHash(0)), None);
         store.unpin(key(3));
         assert!(store.reserve(key(8), 16, 8, PlacementHash(0)).is_some());
-        assert_eq!(store.drain_evicted(), [key(3)]);
+        assert_eq!(evicted(&mut store), [key(3)]);
         // Block 8 is filling, so nothing else can make room.
         assert_eq!(store.reserve(key(9), 16, 9, PlacementHash(0)), None);
     }
@@ -535,12 +618,12 @@ mod tests {
         // evicts 0, leaving the small queue with block 19: 4 bytes, under
         // its 12-byte target.
         store.reserve(key(100), 16, 100, PlacementHash(0)).unwrap();
-        assert_eq!(store.drain_evicted(), [key(0)]);
+        assert_eq!(evicted(&mut store), [key(0)]);
         for index in 1..19 {
             store.pin(key(index));
         }
         assert!(store.reserve(key(201), 4, 201, PlacementHash(0)).is_some());
-        assert_eq!(store.drain_evicted(), [key(19)]);
+        assert_eq!(evicted(&mut store), [key(19)]);
     }
 
     #[test]
@@ -568,7 +651,28 @@ mod tests {
         let location = fill(&mut store, 100, 4).unwrap();
         let extent = &store.extents[location.extent as usize];
         assert_eq!(extent.class, Some(0));
-        assert_eq!(store.drain_evicted().len(), 4);
+        assert_eq!(evicted(&mut store).len(), 4);
+    }
+
+    #[test]
+    fn restored_blocks_take_their_recorded_slots() {
+        let mut store = store();
+        let at = |extent, offset| Location { extent, offset };
+        assert!(store.restore(key(0), at(1, 16), 16, 0, PlacementHash(0), Some(7)));
+        assert!(store.restore(key(1), at(0, 8), 5, 1, PlacementHash(0), None));
+        // Wrong class for extent 1, misaligned, taken, and out of bounds.
+        assert!(!store.restore(key(2), at(1, 32), 4, 2, PlacementHash(0), None));
+        assert!(!store.restore(key(3), at(0, 4), 8, 3, PlacementHash(0), None));
+        assert!(!store.restore(key(4), at(1, 16), 16, 4, PlacementHash(0), None));
+        assert!(!store.restore(key(5), at(9, 0), 16, 5, PlacementHash(0), None));
+        assert_eq!(store.get(&key(0)).unwrap().verify, Some(7));
+        store.verified(key(0));
+        assert_eq!(store.get(&key(0)).unwrap().verify, None);
+        // New blocks take the free slots around the restored ones.
+        for index in 10..13 {
+            let location = fill(&mut store, index, 16).unwrap();
+            assert_ne!(location, at(1, 16));
+        }
     }
 
     #[test]
