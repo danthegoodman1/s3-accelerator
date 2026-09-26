@@ -172,3 +172,50 @@ async fn head_object_reports_size_and_etag() {
     assert_eq!(output.e_tag(), Some(etag.as_str()));
     assert_eq!(output.content_length(), Some(321));
 }
+
+#[tokio::test]
+#[ignore = "needs an S3 endpoint: scripts/s3proxy start"]
+async fn object_headers_come_back_with_every_read() {
+    let client = client();
+    let bucket = bucket(&client, "object-headers").await;
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("k")
+        .content_type("application/x-parquet")
+        .metadata("writer", "conformance")
+        .body(pattern(1_000, 11).into())
+        .send()
+        .await
+        .unwrap();
+    for range in [None, Some("bytes=10-19")] {
+        let output = client
+            .get_object()
+            .bucket(&bucket)
+            .key("k")
+            .set_range(range.map(String::from))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            output.content_type(),
+            Some("application/x-parquet"),
+            "{range:?}"
+        );
+        assert_eq!(
+            output.metadata().unwrap()["writer"],
+            "conformance",
+            "{range:?}"
+        );
+        assert!(output.last_modified().is_some(), "{range:?}");
+    }
+    let output = client
+        .head_object()
+        .bucket(&bucket)
+        .key("k")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(output.content_type(), Some("application/x-parquet"));
+    assert_eq!(output.metadata().unwrap()["writer"], "conformance");
+}

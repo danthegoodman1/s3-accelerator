@@ -89,6 +89,9 @@ pub struct ResponseHead {
     pub etag: Option<ETag>,
     pub content_range: Option<ContentRange>,
     pub content_length: u64,
+    /// The headers S3 returns with the object, such as `Content-Type`,
+    /// `Last-Modified` and `x-amz-meta-*`, which the cache replays.
+    pub headers: Vec<(String, String)>,
 }
 
 impl ResponseHead {
@@ -99,6 +102,7 @@ impl ResponseHead {
             etag: None,
             content_range: None,
             content_length: 0,
+            headers: Vec::new(),
         }
     }
 }

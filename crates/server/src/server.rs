@@ -209,6 +209,7 @@ async fn read(request: Request, context: &Context) -> Response {
         return error(500, "InternalError", "the request was dropped");
     };
     let mut headers = vec![("Accept-Ranges".to_string(), "bytes".to_string())];
+    headers.extend(head.headers.iter().cloned());
     if let Some(etag) = &head.etag {
         headers.push(("ETag".to_string(), etag.0.clone()));
     }

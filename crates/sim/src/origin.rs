@@ -16,6 +16,7 @@ pub struct Object {
     pub key: ObjectKey,
     pub etag: ETag,
     pub size: u64,
+    pub headers: Vec<(String, String)>,
     seed: u64,
 }
 
@@ -47,10 +48,22 @@ impl Origin {
     pub fn put(&mut self, now: u64, key: &ObjectKey, size: u64, prng: &mut Prng) {
         let seed = prng.next_u64();
         let etag = ETag(format!("\"{:016x}{seed:016x}\"", self.versions.len()));
+        let headers = vec![
+            (
+                "content-type".to_string(),
+                format!("application/x-seed-{:x}", seed % 97),
+            ),
+            ("last-modified".to_string(), format!("tick {now}")),
+            (
+                "x-amz-meta-version".to_string(),
+                self.versions.len().to_string(),
+            ),
+        ];
         let object = Object {
             key: key.clone(),
             etag: etag.clone(),
             size,
+            headers,
             seed,
         };
         self.versions.insert(etag.clone(), object);
@@ -122,8 +135,7 @@ pub fn respond(object: Option<&Object>, request: &Request) -> (ResponseHead, Vec
         let head = ResponseHead {
             status: 304,
             etag: Some(object.etag.clone()),
-            content_range: None,
-            content_length: 0,
+            ..ResponseHead::status(304)
         };
         return (head, Vec::new());
     }
@@ -153,6 +165,7 @@ pub fn respond(object: Option<&Object>, request: &Request) -> (ResponseHead, Vec
         etag: Some(object.etag.clone()),
         content_range,
         content_length: span.end - span.start,
+        headers: object.headers.clone(),
     };
     let body = match request.method {
         Method::Get => object.bytes(span),

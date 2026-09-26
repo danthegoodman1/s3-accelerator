@@ -169,6 +169,7 @@ enum Object {
 struct Meta {
     etag: ETag,
     size: u64,
+    headers: Vec<(String, String)>,
 }
 
 struct Version {
@@ -698,6 +699,7 @@ impl Node {
                 size: meta.size,
             }),
             content_length: span.map_or(0, |(first, last)| last - first + 1),
+            headers: meta.headers.clone(),
         };
         let (Method::Get, Some((first, last))) = (request.method, span) else {
             self.waiting.remove(&id);
@@ -1157,7 +1159,12 @@ fn metadata(head: &ResponseHead) -> Option<Meta> {
         _ => return None,
     };
     let etag = head.etag.clone()?;
-    Some(Meta { etag, size })
+    let headers = head.headers.clone();
+    Some(Meta {
+        etag,
+        size,
+        headers,
+    })
 }
 
 /// The answer to a request whose preconditions fail against `meta`.

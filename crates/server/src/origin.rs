@@ -200,7 +200,41 @@ fn response_head(response: &Forwarded, method: Method) -> ResponseHead {
         etag: header("etag").map(|etag| ETag(etag.to_string())),
         content_range: header("content-range").and_then(parse_content_range),
         content_length,
+        headers: response
+            .headers
+            .iter()
+            .filter(|(name, _)| is_object_header(name))
+            .cloned()
+            .collect(),
     }
+}
+
+/// Headers that describe the object rather than the response, which the
+/// cache stores and replays.
+fn is_object_header(name: &str) -> bool {
+    const OBJECT_HEADERS: [&str; 19] = [
+        "cache-control",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "content-type",
+        "expires",
+        "last-modified",
+        "x-amz-object-lock-legal-hold",
+        "x-amz-object-lock-mode",
+        "x-amz-object-lock-retain-until-date",
+        "x-amz-replication-status",
+        "x-amz-restore",
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-amz-server-side-encryption-bucket-key-enabled",
+        "x-amz-storage-class",
+        "x-amz-tagging-count",
+        "x-amz-version-id",
+        "x-amz-website-redirect-location",
+    ];
+    let name = name.to_ascii_lowercase();
+    name.starts_with("x-amz-meta-") || OBJECT_HEADERS.contains(&name.as_str())
 }
 
 /// `bytes first-last/size`.
