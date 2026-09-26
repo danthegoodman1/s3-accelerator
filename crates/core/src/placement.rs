@@ -6,7 +6,7 @@
 
 use crate::s3::ObjectKey;
 use std::num::NonZeroU32;
-use xxhash_rust::xxh3::xxh3_64_with_seed;
+use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
 /// A storage node's stable identity. It survives restarts, so a restarted
 /// node keeps the blocks it owns.
@@ -28,6 +28,30 @@ pub enum Placement<'a> {
     /// One of the object's other chunks.
     Chunk(&'a ObjectKey, u64),
 }
+
+impl Placement<'_> {
+    pub fn hash(self) -> PlacementHash {
+        let (key, chunk) = match self {
+            Placement::Home(key) => (key, None),
+            Placement::Chunk(key, index) => (key, Some(index)),
+        };
+        // Bucket and key are length-prefixed, so no two placements encode alike.
+        let mut point = Vec::with_capacity(key.bucket.len() + key.key.len() + 16);
+        for part in [&key.bucket, &key.key] {
+            point.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            point.extend_from_slice(part.as_bytes());
+        }
+        if let Some(index) = chunk {
+            point.extend_from_slice(&index.to_le_bytes());
+        }
+        PlacementHash(xxh3_64(&point))
+    }
+}
+
+/// The hash nodes are ranked by. A node stores it with each block, so it can
+/// recheck the block's owner after a ring change without the object's key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlacementHash(pub u64);
 
 /// An immutable, versioned snapshot of the storage nodes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,50 +76,31 @@ impl Ring {
     }
 
     /// The node that owns `placement`, or `None` for an empty ring.
-    pub fn owner(&self, placement: Placement) -> Option<NodeId> {
-        let point = point(placement);
+    pub fn owner(&self, placement: PlacementHash) -> Option<NodeId> {
         self.members
             .iter()
-            .map(|member| (score(&point, member), member.id))
+            .map(|member| (score(placement, member), member.id))
             .max_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
             .map(|(_, id)| id)
     }
 
     /// Every node, best candidate first. The first owns `placement`; the next
     /// ones take over when it fails and hold its hot-key replicas.
-    pub fn candidates(&self, placement: Placement) -> Vec<NodeId> {
-        let point = point(placement);
+    pub fn candidates(&self, placement: PlacementHash) -> Vec<NodeId> {
         let mut scored: Vec<_> = self
             .members
             .iter()
-            .map(|member| (score(&point, member), member.id))
+            .map(|member| (score(placement, member), member.id))
             .collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1.cmp(&a.1)));
         scored.into_iter().map(|(_, id)| id).collect()
     }
 }
 
-/// An unambiguous encoding of `placement`: bucket and key are length-prefixed.
-fn point(placement: Placement) -> Vec<u8> {
-    let (key, chunk) = match placement {
-        Placement::Home(key) => (key, None),
-        Placement::Chunk(key, index) => (key, Some(index)),
-    };
-    let mut point = Vec::with_capacity(key.bucket.len() + key.key.len() + 17);
-    for part in [&key.bucket, &key.key] {
-        point.extend_from_slice(&(part.len() as u32).to_le_bytes());
-        point.extend_from_slice(part.as_bytes());
-    }
-    if let Some(index) = chunk {
-        point.extend_from_slice(&index.to_le_bytes());
-    }
-    point
-}
-
 /// The logarithmic method: each node wins with probability proportional to
-/// its weight, and a membership change moves only the points it must.
-fn score(point: &[u8], member: &Member) -> f64 {
-    let hash = xxh3_64_with_seed(point, member.id.0);
+/// its weight, and a membership change moves only the placements it must.
+fn score(placement: PlacementHash, member: &Member) -> f64 {
+    let hash = xxh3_64_with_seed(&placement.0.to_le_bytes(), member.id.0);
     let unit = ((hash >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
     // libm computes the same logarithm on every platform.
     f64::from(member.weight.get()) / -libm::log(unit)
@@ -126,7 +131,7 @@ mod tests {
 
     fn owners(ring: &Ring, keys: usize) -> Vec<NodeId> {
         (0..keys)
-            .map(|index| ring.owner(Placement::Home(&key(index))).unwrap())
+            .map(|index| ring.owner(Placement::Home(&key(index)).hash()).unwrap())
             .collect()
     }
 
@@ -135,17 +140,21 @@ mod tests {
         let ring = ring(&[(1, 1), (2, 1), (3, 2), (4, 1)]);
         let homes: Vec<u64> = owners(&ring, 8).iter().map(|id| id.0).collect();
         let chunks: Vec<u64> = (0..8)
-            .map(|index| ring.owner(Placement::Chunk(&key(0), index)).unwrap().0)
+            .map(|index| {
+                ring.owner(Placement::Chunk(&key(0), index).hash())
+                    .unwrap()
+                    .0
+            })
             .collect();
-        assert_eq!(homes, [4, 3, 3, 3, 4, 4, 1, 3]);
-        assert_eq!(chunks, [1, 3, 1, 3, 3, 3, 2, 4]);
+        assert_eq!(homes, [1, 3, 2, 3, 1, 1, 3, 3]);
+        assert_eq!(chunks, [4, 3, 1, 4, 4, 3, 4, 2]);
     }
 
     #[test]
     fn empty_ring_has_no_owner() {
         let ring = Ring::new(1, Vec::new());
-        assert_eq!(ring.owner(Placement::Home(&key(0))), None);
-        assert!(ring.candidates(Placement::Home(&key(0))).is_empty());
+        assert_eq!(ring.owner(Placement::Home(&key(0)).hash()), None);
+        assert!(ring.candidates(Placement::Home(&key(0)).hash()).is_empty());
     }
 
     #[test]
@@ -153,7 +162,10 @@ mod tests {
         let ring = ring(&[(1, 1), (2, 3), (3, 1), (4, 2), (5, 1)]);
         for index in 0..1_000 {
             let key = key(index);
-            for placement in [Placement::Home(&key), Placement::Chunk(&key, 3)] {
+            for placement in [
+                Placement::Home(&key).hash(),
+                Placement::Chunk(&key, 3).hash(),
+            ] {
                 let candidates = ring.candidates(placement);
                 assert_eq!(candidates.len(), 5);
                 assert_eq!(Some(candidates[0]), ring.owner(placement));
@@ -166,7 +178,7 @@ mod tests {
         let ring = ring(&[(1, 1), (2, 1), (3, 1), (4, 1)]);
         let key = key(0);
         let owners: std::collections::BTreeSet<_> = (0..64)
-            .map(|index| ring.owner(Placement::Chunk(&key, index)).unwrap())
+            .map(|index| ring.owner(Placement::Chunk(&key, index).hash()).unwrap())
             .collect();
         assert_eq!(owners.len(), 4);
     }

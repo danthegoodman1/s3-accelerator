@@ -60,7 +60,7 @@ A distributed NVMe read cache in front of S3. S3 remains the source of truth, an
 
 - **Membership** runs SWIM gossip among storage nodes only and publishes an immutable, versioned ring snapshot. Nodes also keep the previous snapshot for the grace window.
 - **Gateways fetch the ring** over HTTP from any storage node. Every storage response carries the ring version, and a gateway refetches when it sees a newer one. Only storage nodes gossip, so adding gateways adds no membership traffic.
-- **Placement** uses weighted rendezvous hashing over stable node IDs. It moves few keys when membership changes, weights nodes by disk size, and gives each key an ordered candidate list that doubles as its replica set.
+- **Placement** uses weighted rendezvous hashing over stable node IDs. It moves few keys when membership changes, weights nodes by disk size, and gives each key an ordered candidate list that doubles as its replica set. Each home or chunk reduces to a 64-bit placement hash, and a node's score mixes that hash with the node's ID.
 - **Blocks and chunks:**
   - A **block** (1 MiB) is the unit of fill, storage and eviction.
   - A **chunk** (16 MiB) is the unit of placement.
@@ -93,17 +93,29 @@ A distributed NVMe read cache in front of S3. S3 remains the source of truth, an
   - `ttl`: revalidate metadata with `If-None-Match` after a set age.
   - `events`: S3 Event Notifications invalidate metadata.
 - **Gateway metadata cache.** Gateways keep object metadata in a bounded LRU. Entries for `immutable` objects last until evicted; others expire after a short TTL. A stale entry is safe: an owner serves the old version consistently, or its fill fails `If-Match` and the Gateway drops the entry and retries.
-- **Writes go through the object's home.** The home drops the metadata once the write succeeds and discards any first fetch that started before then, so a read racing the write can't pin the old version. It forwards the invalidation to replica holders. The Gateway that proxied the write drops its own cached entry; other gateways catch up when their entries expire. Clusters in other zones see the change through their freshness mode.
+- **Writes go through the object's home.** Once the write succeeds, the home drops the metadata, or replaces it when warming on write. It discards any first fetch that started before then, so a read racing the write can't pin the old version. It forwards the invalidation to replica holders. The Gateway that proxied the write drops its own cached entry; other gateways catch up when their entries expire. Clusters in other zones see the change through their freshness mode.
 - **Versioned reads.** Requests with a `versionId` are immutable and are cached without revalidation.
 - **No negative caching.** Misses (404s) aren't cached, which preserves S3's read-after-write guarantee for new keys.
 
 ### Storage
 
-- **Admission:** owners and hot-key replicas admit blocks to disk. A doorkeeper filter admits a block on its second read within a window. Blocks fetched from a previous owner skip the filter.
-- **Eviction:** S3-FIFO or W-TinyLFU over blocks. Blocks a node no longer owns are evicted first.
-- **Layout:** blocks live in preallocated segment files, so each block is a `(file, offset, length)` that `sendfile` can serve directly.
-- **Memory:** the OS page cache holds hot blocks, and `sendfile` serves them from it.
-- **Restarts and crashes:** the block index persists across restarts, so rolling deploys keep the cache warm. Every block carries a checksum, a block enters the index only after its data is on disk, and a checksum failure counts as a miss.
+The core decides what a node admits and evicts and which slot each block fills. The server writes blocks and serves them with `sendfile`. The simulator therefore tests the cache policy and measures its hit rates.
+
+- **Layout:** preallocated files divided into 64 MiB extents. Each extent holds fixed-size slots of one size class, in powers of two from 4 KiB to 1 MiB. A block fills one slot, so it is a `(file, offset, length)` that `sendfile` serves directly. Freeing a block frees its slot, and the store never compacts or rewrites data. Rounding costs space: a 2 KiB manifest fills a 4 KiB slot.
+- **Size classes share the disk.** Extents move between classes as demand shifts. To give a class more room, the store empties an extent from another class by evicting its blocks.
+- **Object metadata** (size, ETag and headers) lives in small slots, keyed by bucket and key.
+- **Index:** an in-memory map from block to slot, at about 100 bytes per block, so 4 TB of 1 MiB blocks needs about 400 MB. A slot table on disk, with one fixed-size record per slot, persists it. The store writes a block, syncs it, then writes its record, and it clears a slot's record before reusing the slot.
+- **Restarts and crashes:** the index survives restarts, so rolling deploys keep the cache warm. After a crash, a block's first hit reads it and verifies its checksum before `sendfile` serves it, and a mismatch counts as a miss. A clean shutdown marks the table, so the next start skips those checks.
+- **Memory:** the OS page cache holds hot blocks, and `sendfile` serves them from it. The kernel ranks pages read twice above pages read once, which shields hot blocks from scans.
+- **Admission:** owners and hot-key replicas admit blocks to disk.
+  - **Doorkeeper** (default): a Bloom filter whose entries age out each window. A block's first read streams to the reader without touching disk and marks the filter. A second read within the window admits the block. Each admitted block costs a second S3 GET, and blocks read once stay off the drive.
+  - **Admit on first read** (per bucket or prefix): new blocks go straight to disk. Use it when nearly everything is reread.
+  - Blocks fetched from a previous owner, warmed on write or prefetched skip the doorkeeper.
+  - **Fill budget:** a node caps the bytes it fills at once. Past the cap, misses stream from S3 without admission.
+- **Warming on write** (per bucket or prefix): a `PutObject` passes through the object's home, which keeps chunk 0 and the final 16 MiB as it forwards the body. After S3 accepts the write, the home reads the object's metadata with a HEAD. If the HEAD's ETag matches the write's, the home indexes the blocks under it, so the first read hits; otherwise it discards them.
+- **Metadata prefetch:** some formats state their metadata's length at a fixed spot: Parquet and ORC in their trailers, safetensors in its first 8 bytes. When a read touches that spot, the home fills every block the metadata spans with one range GET, before the reader asks for it.
+- **Eviction:** S3-FIFO over blocks: a small FIFO holding about 10% of capacity, a main FIFO, and a ghost queue of recently evicted keys. A hit bumps a 2-bit counter and moves nothing. Once a ring change's grace window ends, blocks the node no longer owns go first. Each block stores its placement hash, so the node rechecks ownership without the object's key.
+- **Blocks need no TTL.** They are keyed by ETag, so they never go stale: a changed object gets new blocks, and the old ones stop being read and age out. Freshness applies to metadata only. To meet a retention rule, such as removing deleted data within a set time, a purge drops an object's blocks. The home knows the object's size and ETag, so it can reach every chunk owner.
 
 ### Hot keys
 
@@ -137,7 +149,7 @@ The system is written in Rust.
 - **TLS:** rustls runs the handshake, and the `ktls` crate moves the session into the kernel, so zero-copy works under TLS. A peer's TLS 1.3 KeyUpdate ends the connection, and the client reconnects.
 - **Membership:** a Rust gossip library, such as foca (SWIM) or chitchat.
 - **Peer links** run on a private network: plaintext with signed request tokens, or mTLS over kTLS where policy requires encryption.
-- **Reference designs:** TAG and ocache (Go) implement versioned block caching, request coalescing and SigV4 validation. Read them before building those parts.
+- **Reference designs:** TAG and ocache (Go) implement versioned block caching, request coalescing, SigV4 validation, warming on write and Parquet footer prefetch. Read them before building those parts.
 
 ## Open questions
 

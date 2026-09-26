@@ -52,7 +52,7 @@ impl Gateway {
     }
 
     pub fn on_get(&mut self, request: ClientRequestId, get: GetObject) {
-        let Some(node) = self.ring.owner(Placement::Home(&get.key)) else {
+        let Some(node) = self.ring.owner(Placement::Home(&get.key).hash()) else {
             let head = ResponseHead::status(503);
             self.actions.push(Action::Respond { request, head });
             return;
