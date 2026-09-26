@@ -172,8 +172,8 @@ MUTANTS = [
     ),
     (
         "gateways never fail over",
-        [(GATEWAY, ".filter(|(_, part)| !part.answered && part.sent.0 + timeout <= now.0)",
-          ".filter(|(_, part)| !part.answered && part.sent.0 + timeout <= now.0 && false)")],
+        [(GATEWAY, ".filter(|(_, part)| part.answer.is_none() && part.sent.0 + timeout <= now.0)",
+          ".filter(|(_, part)| part.answer.is_none() && part.sent.0 + timeout <= now.0 && false)")],
     ),
     (
         "failover retries the node that timed out",
@@ -222,6 +222,29 @@ MUTANTS = [
     (
         "a restarted home fetches whole objects it holds blocks of",
         [(NODE, "None if holds_blocks => {", "None if holds_blocks && false => {")],
+    ),    (
+        "a cut body is never resumed",
+        [(GATEWAY, "return self.resume(id, part, copied);", "return self.abort(id);")],
+    ),
+    (
+        "a cut body resumes from its start",
+        [(GATEWAY, "let first = runs[0].1 + copied;", "let first = runs[0].1;")],
+    ),
+    (
+        "a home's cut body resumes from its start",
+        [(GATEWAY, "let first = start + copied;", "let first = start;")],
+    ),
+    (
+        "an early end cuts off the forward in progress",
+        [(GATEWAY, "let in_progress = if *forwarding { parts.pop_front() } else { None };", "let in_progress = None;")],
+    ),
+    (
+        "a changed object restarts a response that already started",
+        [(GATEWAY, "let key = self.reads[&id].request.key.clone();\n            self.cache.remove(&key);\n            return self.abort(id);", "let _ = id;")],
+    ),
+    (
+        "a write from a cut S3 body is kept",
+        [(NODE, "pub fn on_write_failed(&mut self, location: Location) {", "pub fn on_write_failed(&mut self, location: Location) {\n        if location.offset < u64::MAX { return self.on_written(location); }")],
     ),
 ]
 

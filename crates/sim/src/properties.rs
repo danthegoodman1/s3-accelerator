@@ -39,6 +39,33 @@ pub fn check_response(
     ))
 }
 
+/// A response that ended early must be S3's response to the same request,
+/// cut short, while its key held some state between `from` and `to`.
+pub fn check_early_end(
+    origin: &Origin,
+    request: &Request,
+    from: u64,
+    to: u64,
+    head: &ResponseHead,
+    body: &[u8],
+) -> Result<(), String> {
+    let states = origin.states_during(&request.key, from, to);
+    let matches = |state| {
+        let (expected_head, expected_body) = respond(state, request);
+        expected_head == *head && expected_body.starts_with(body)
+    };
+    if states.into_iter().any(matches) {
+        return Ok(());
+    }
+    Err(format!(
+        "{} {:?} {:?} cut at {} bytes for {request:?} begins no state of the key in ticks {from}..={to}",
+        head.status,
+        head.etag,
+        head.content_range,
+        body.len(),
+    ))
+}
+
 /// A stored block must hold exactly the bytes of the version it is keyed
 /// by, at its index.
 pub fn check_block(

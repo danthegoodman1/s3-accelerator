@@ -35,6 +35,8 @@ pub struct Engine {
     clients: BTreeMap<ClientRequestId, oneshot::Sender<Answer>>,
     node_requests: BTreeMap<GatewayRequestId, NodeRequestId>,
     relayed: BTreeMap<NodeRequestId, Bytes>,
+    /// Client responses the gateway started, and their bodies so far.
+    responses: BTreeMap<ClientRequestId, (ResponseHead, Vec<u8>)>,
     fetches: Vec<(OriginRequestId, Request)>,
     /// S3 requests in flight, which a cancellation aborts.
     tasks: BTreeMap<OriginRequestId, tokio::task::AbortHandle>,
@@ -61,6 +63,7 @@ impl Engine {
             clients: BTreeMap::new(),
             node_requests: BTreeMap::new(),
             relayed: BTreeMap::new(),
+            responses: BTreeMap::new(),
             fetches: Vec::new(),
             tasks: BTreeMap::new(),
         }))
@@ -133,24 +136,28 @@ impl Engine {
                 let now = self.now();
                 self.node.on_request(now, local, read);
             }
-            gateway::Action::Relay {
-                request,
-                head,
-                from,
-            } => {
-                let parts: Option<Vec<Bytes>> =
-                    from.iter().map(|part| self.relayed.remove(part)).collect();
-                match parts {
-                    Some(parts) if parts.len() == 1 => {
-                        let body = parts.into_iter().next().expect("one part");
-                        self.answer(request, head, body);
-                    }
-                    Some(parts) => self.answer(request, head, Bytes::from(parts.concat())),
-                    // Every part's body arrives before its relay; a missing
-                    // one is a bug, and the client gets an error, not a
-                    // short body.
-                    None => self.answer(request, ResponseHead::status(500), Bytes::new()),
+            gateway::Action::Start { request, head } => {
+                self.responses.insert(request, (head, Vec::new()));
+            }
+            gateway::Action::Forward { request, from, len } => {
+                let bytes = self.relayed.remove(&from).unwrap_or_default();
+                let copied = bytes.len().min(len as usize);
+                let (head, body) = self
+                    .responses
+                    .get_mut(&request)
+                    .expect("a forward follows its start");
+                body.extend_from_slice(&bytes[..copied]);
+                if body.len() as u64 == head.content_length {
+                    let (head, body) = self.responses.remove(&request).expect("started");
+                    self.answer(request, head, Bytes::from(body));
                 }
+                let now = self.now();
+                self.gateway.on_forwarded(now, from, copied as u64);
+            }
+            // The client gets the body so far, and the connection closes.
+            gateway::Action::Abort { request } => {
+                let (head, body) = self.responses.remove(&request).expect("an aborted start");
+                self.answer(request, head, Bytes::from(body));
             }
             gateway::Action::Respond { request, head } => self.answer(request, head, Bytes::new()),
             gateway::Action::Discard { id } => {

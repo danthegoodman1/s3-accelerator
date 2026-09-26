@@ -90,6 +90,10 @@ pub struct Options {
     pub clean_percent: u64,
     pub damage_percent: u64,
     pub down_max: u64,
+    /// Chance, while faults happen, that a node's response body or S3's
+    /// ends partway, as when a connection drops.
+    pub cut_percent: u64,
+    pub origin_cut_percent: u64,
     /// Freshness of the TTL bucket's metadata, in ticks.
     pub ttl: u64,
     pub immutable_admit_on_first_read: bool,
@@ -165,6 +169,8 @@ impl Options {
             clean_percent: 0,
             damage_percent: 0,
             down_max: 0,
+            cut_percent: 0,
+            origin_cut_percent: 0,
         };
         // Timeouts outlast every exchange of a fault-free run, so only
         // faults make them fire: S3 answers within two hops, and a node
@@ -192,6 +198,8 @@ impl Options {
         options.clean_percent = prng.range(0..=100);
         options.damage_percent = prng.range(0..=50);
         options.down_max = prng.range(1..=300);
+        options.cut_percent = prng.range(0..=5);
+        options.origin_cut_percent = prng.range(0..=5);
         options
     }
 
@@ -226,6 +234,8 @@ impl Options {
             clean_percent: 0,
             damage_percent: 0,
             down_max: 0,
+            cut_percent: 0,
+            origin_cut_percent: 0,
             ttl: 1_000,
             immutable_admit_on_first_read: false,
             ttl_admit_on_first_read: false,
@@ -326,7 +336,7 @@ enum Message {
     NodeResponse {
         id: NodeRequestId,
         head: ResponseHead,
-        body: Vec<u8>,
+        body: Body,
         meta: Option<ObjectMeta>,
     },
     NodeMetadata {
@@ -340,7 +350,7 @@ enum Message {
         run: u64,
         origin: OriginRequestId,
         head: ResponseHead,
-        body: Vec<u8>,
+        body: Body,
     },
 }
 
@@ -363,6 +373,14 @@ enum Event {
         run: u64,
         id: GatewayRequestId,
     },
+    /// A gateway finished copying a node's response body into a client's
+    /// response.
+    Forwarded {
+        gateway: usize,
+        request: ClientRequestId,
+        from: NodeRequestId,
+        bytes: Vec<u8>,
+    },
     /// A node read a recovered block back to check its checksum.
     Verified {
         node: usize,
@@ -380,6 +398,20 @@ struct Pending {
     issued: u64,
     /// When the latest attempt went out.
     sent: u64,
+}
+
+/// A response body as it arrived: `len` bytes long, unless it ended early.
+#[derive(Debug)]
+struct Body {
+    bytes: Vec<u8>,
+    len: u64,
+}
+
+impl Body {
+    fn whole(bytes: Vec<u8>) -> Body {
+        let len = bytes.len() as u64;
+        Body { bytes, len }
+    }
 }
 
 /// A node write in progress: the bytes of an S3 response body to copy.
@@ -412,6 +444,7 @@ pub struct Simulator {
     retries: Prng,
     crashes: Prng,
     tears: Prng,
+    cuts: Prng,
     /// Whether faults happen: while clients are still issuing requests.
     faulty: bool,
     /// Nodes cut off from everyone, until the tick given.
@@ -448,8 +481,14 @@ pub struct Simulator {
     next_id: u64,
     gateway_requests: BTreeMap<(usize, ClientRequestId), u64>,
     node_requests: BTreeMap<(usize, GatewayRequestId), (usize, NodeRequestId)>,
-    gateway_bodies: BTreeMap<(usize, NodeRequestId), Vec<u8>>,
-    origin_bodies: BTreeMap<(usize, OriginRequestId), Vec<u8>>,
+    gateway_bodies: BTreeMap<(usize, NodeRequestId), Body>,
+    origin_bodies: BTreeMap<(usize, OriginRequestId), Body>,
+    /// Scripted cuts: the next body a node sends, or S3 sends a node, that
+    /// is longer than the given length ends there.
+    cut_responses: BTreeMap<usize, u64>,
+    cut_origin_responses: BTreeMap<usize, u64>,
+    /// Client responses a gateway started, and the body so far.
+    client_responses: BTreeMap<(usize, ClientRequestId), (ResponseHead, Vec<u8>)>,
     writes: BTreeMap<(usize, Location), Write>,
     sending: BTreeMap<(usize, GatewayRequestId), Sending>,
     /// S3 requests a node gave up on, whose responses it drops.
@@ -502,6 +541,7 @@ impl Simulator {
             retries: Prng::stream(seed, "retries"),
             crashes: Prng::stream(seed, "crashes"),
             tears: Prng::stream(seed, "tears"),
+            cuts: Prng::stream(seed, "cuts"),
             faulty: true,
             partitioned: BTreeMap::new(),
             down: BTreeMap::new(),
@@ -541,6 +581,9 @@ impl Simulator {
             node_requests: BTreeMap::new(),
             gateway_bodies: BTreeMap::new(),
             origin_bodies: BTreeMap::new(),
+            client_responses: BTreeMap::new(),
+            cut_responses: BTreeMap::new(),
+            cut_origin_responses: BTreeMap::new(),
             writes: BTreeMap::new(),
             sending: BTreeMap::new(),
             cancelled: BTreeSet::new(),
@@ -725,6 +768,18 @@ impl Simulator {
         self.drain_node(node)
     }
 
+    /// Ends the next response body `node` sends that is longer than `at`
+    /// bytes after `at` bytes.
+    pub fn cut_response(&mut self, node: usize, at: u64) {
+        self.cut_responses.insert(node, at);
+    }
+
+    /// Ends the next response body S3 sends `node` that is longer than
+    /// `at` bytes after `at` bytes.
+    pub fn cut_origin_response(&mut self, node: usize, at: u64) {
+        self.cut_origin_responses.insert(node, at);
+    }
+
     /// Writes `node` has in progress.
     pub fn writes_in_progress(&self, node: usize) -> usize {
         self.writes
@@ -854,6 +909,36 @@ impl Simulator {
             return Err(self.failure(format!("node {node} stopped while down")));
         };
         let stats = stopped.stats();
+        // Responses in progress finish on a clean shutdown. A crash cuts
+        // them short or loses them, and they read the disk as it was.
+        let sending: Vec<GatewayRequestId> = self
+            .sending
+            .keys()
+            .filter(|(owner, _)| *owner == node)
+            .map(|&(_, id)| id)
+            .collect();
+        for id in sending {
+            let Sending { head, body, meta } = self
+                .sending
+                .remove(&(node, id))
+                .expect("a send in progress");
+            let mut body = self.assemble(node, &body)?;
+            let (gateway, gateway_id) = self.node_requests[&(node, id)];
+            if !clean {
+                if self.cuts.percent(50) {
+                    continue;
+                }
+                body.bytes
+                    .truncate(self.cuts.below(body.len.max(1)) as usize);
+            }
+            let response = Message::NodeResponse {
+                id: gateway_id,
+                head,
+                body,
+                meta,
+            };
+            self.send(Address::Node(node), Address::Gateway(gateway), response);
+        }
         let writes: Vec<Location> = self
             .writes
             .keys()
@@ -869,10 +954,11 @@ impl Simulator {
         } else {
             for location in writes {
                 let write = &self.writes[&(node, location)];
-                let body = &self.origin_bodies[&(node, write.origin)];
-                let bytes = &body[write.offset as usize..(write.offset + write.len) as usize];
-                let torn = self.tears.range(0..=write.len) as usize;
-                self.disks[node].write(location, &bytes[..torn]);
+                let body = &self.origin_bodies[&(node, write.origin)].bytes;
+                let start = (write.offset as usize).min(body.len());
+                let end = ((write.offset + write.len) as usize).min(body.len());
+                let torn = self.tears.range(0..=(end - start) as u64) as usize;
+                self.disks[node].write(location, &body[start..start + torn]);
             }
             if damage && self.tears.percent(self.options.damage_percent) {
                 for _ in 0..self.tears.range(1..=3) {
@@ -927,6 +1013,7 @@ impl Simulator {
             + self.node_requests.len()
             + self.gateway_bodies.len()
             + self.origin_bodies.len()
+            + self.client_responses.len()
             + self.writes.len()
             + self.sending.len();
         let busy = self.busy();
@@ -1101,6 +1188,12 @@ impl Simulator {
                 Ok(())
             }
             Event::Written { node, location, .. } => self.written(node, location),
+            Event::Forwarded {
+                gateway,
+                request,
+                from,
+                bytes,
+            } => self.forwarded(gateway, request, from, bytes),
             Event::Sent { node, id, .. } => self.sent(node, id),
             Event::Verified {
                 node,
@@ -1192,6 +1285,18 @@ impl Simulator {
                     true => (ResponseHead::status(503), Vec::new()),
                     false => self.origin.respond_now(&read),
                 };
+                let mut body = Body::whole(body);
+                if let Some(&at) = self.cut_origin_responses.get(&node)
+                    && body.len > at
+                {
+                    self.cut_origin_responses.remove(&node);
+                    body.bytes.truncate(at as usize);
+                } else if self.faulty
+                    && body.len > 0
+                    && self.cuts.percent(self.options.origin_cut_percent)
+                {
+                    body.bytes.truncate(self.cuts.below(body.len) as usize);
+                }
                 let response = Message::OriginResponse {
                     run,
                     origin,
@@ -1221,20 +1326,48 @@ impl Simulator {
                     let message = Message::NodeRequest { gateway, id, read };
                     self.send(Address::Gateway(gateway), Address::Node(node), message);
                 }
-                gateway::Action::Relay {
-                    request,
-                    head,
-                    from,
-                } => {
-                    let mut body = Vec::new();
-                    for part in from {
-                        let Some(bytes) = self.gateway_bodies.remove(&(gateway, part)) else {
-                            return Err(
-                                self.failure(format!("gateway {gateway} relayed {part:?} twice"))
-                            );
-                        };
-                        body.extend_from_slice(&bytes);
+                gateway::Action::Start { request, head } => {
+                    let started = (head, Vec::new());
+                    if self
+                        .client_responses
+                        .insert((gateway, request), started)
+                        .is_some()
+                    {
+                        return Err(
+                            self.failure(format!("gateway {gateway} started {request:?} twice"))
+                        );
                     }
+                }
+                gateway::Action::Forward { request, from, len } => {
+                    let Some(body) = self.gateway_bodies.remove(&(gateway, from)) else {
+                        return Err(self.failure(format!(
+                            "gateway {gateway} forwarded {from:?}, which it no longer holds"
+                        )));
+                    };
+                    if body.len != len {
+                        return Err(self.failure(format!(
+                            "gateway {gateway} forwarded {len} bytes of a {}-byte body",
+                            body.len
+                        )));
+                    }
+                    if (body.bytes.len() as u64) < len {
+                        self.summary.cut_bodies += 1;
+                    }
+                    let delay = self.send_delays.range(0..=self.options.send_delay_max);
+                    let forwarded = Event::Forwarded {
+                        gateway,
+                        request,
+                        from,
+                        bytes: body.bytes,
+                    };
+                    self.queue.push(self.now + delay, forwarded);
+                }
+                gateway::Action::Abort { request } => {
+                    let Some((head, body)) = self.client_responses.remove(&(gateway, request))
+                    else {
+                        return Err(self
+                            .failure(format!("gateway {gateway} aborted {request:?} unstarted")));
+                    };
                     self.respond_to_client(gateway, request, head, body)?;
                 }
                 gateway::Action::Respond { request, head } => {
@@ -1281,6 +1414,38 @@ impl Simulator {
         };
         self.send(Address::Gateway(gateway), Address::Client(client), response);
         Ok(())
+    }
+
+    /// A gateway copied `bytes` of a node's body into a client's response,
+    /// which goes to the client once complete.
+    fn forwarded(
+        &mut self,
+        gateway: usize,
+        request: ClientRequestId,
+        from: NodeRequestId,
+        bytes: Vec<u8>,
+    ) -> Result<(), Failure> {
+        let Some((head, body)) = self.client_responses.get_mut(&(gateway, request)) else {
+            return Err(self.failure(format!(
+                "gateway {gateway} forwarded into {request:?} unstarted"
+            )));
+        };
+        body.extend_from_slice(&bytes);
+        let (sent, expected) = (body.len() as u64, head.content_length);
+        if sent > expected {
+            return Err(self.failure(format!(
+                "gateway {gateway} sent {sent} bytes of a {expected}-byte response"
+            )));
+        }
+        if sent == expected {
+            let (head, body) = self
+                .client_responses
+                .remove(&(gateway, request))
+                .expect("a started response");
+            self.respond_to_client(gateway, request, head, body)?;
+        }
+        self.gateways[gateway].on_forwarded(Time(self.now), from, bytes.len() as u64);
+        self.drain_gateway(gateway)
     }
 
     fn node(&mut self, node: usize) -> &mut Node {
@@ -1408,12 +1573,18 @@ impl Simulator {
                 write.origin
             )));
         };
-        let Some(bytes) = body.get(write.offset as usize..(write.offset + write.len) as usize)
-        else {
+        if write.offset + write.len > body.len {
             return Err(self.failure(format!(
                 "node {node} wrote past the end of {:?}",
                 write.origin
             )));
+        }
+        let Some(bytes) = body
+            .bytes
+            .get(write.offset as usize..(write.offset + write.len) as usize)
+        else {
+            self.node(node).on_write_failed(location);
+            return self.drain_node(node);
         };
         let bytes = bytes.to_vec();
         self.disks[node].write(location, &bytes);
@@ -1424,38 +1595,21 @@ impl Simulator {
     }
 
     /// Reads a response body as `sendfile` and `splice` would, at the moment
-    /// it is sent, and forwards it.
+    /// it is sent, and forwards it. While faults happen, the connection may
+    /// drop partway.
     fn sent(&mut self, node: usize, id: GatewayRequestId) -> Result<(), Failure> {
         let Sending { head, body, meta } = self
             .sending
             .remove(&(node, id))
             .expect("a send was scheduled");
-        let mut bytes = Vec::new();
-        for segment in body {
-            match segment {
-                Segment::Slot {
-                    location,
-                    offset,
-                    len,
-                } => bytes.extend_from_slice(self.disks[node].read(location, offset, len)),
-                Segment::Origin {
-                    origin,
-                    offset,
-                    len,
-                } => {
-                    let Some(source) = self.origin_bodies.get(&(node, origin)) else {
-                        return Err(
-                            self.failure(format!("node {node} sent {origin:?} after releasing it"))
-                        );
-                    };
-                    let Some(piece) = source.get(offset as usize..(offset + len) as usize) else {
-                        return Err(
-                            self.failure(format!("node {node} sent past the end of {origin:?}"))
-                        );
-                    };
-                    bytes.extend_from_slice(piece);
-                }
-            }
+        let mut body = self.assemble(node, &body)?;
+        if let Some(&at) = self.cut_responses.get(&node)
+            && body.len > at
+        {
+            self.cut_responses.remove(&node);
+            body.bytes.truncate(at as usize);
+        } else if self.faulty && body.len > 0 && self.cuts.percent(self.options.cut_percent) {
+            body.bytes.truncate(self.cuts.below(body.len) as usize);
         }
         let Some((gateway, gateway_id)) = self.node_requests.remove(&(node, id)) else {
             return Err(self.failure(format!("node {node} answered {id:?} twice")));
@@ -1463,12 +1617,59 @@ impl Simulator {
         let response = Message::NodeResponse {
             id: gateway_id,
             head,
-            body: bytes,
+            body,
             meta,
         };
         self.send(Address::Node(node), Address::Gateway(gateway), response);
         self.node(node).on_sent(id);
         self.drain_node(node)
+    }
+
+    /// A node response's body from its segments. It ends early where an S3
+    /// body it reads ended early.
+    fn assemble(&self, node: usize, segments: &[Segment]) -> Result<Body, Failure> {
+        let mut bytes = Vec::new();
+        let mut cut = false;
+        let mut len = 0;
+        for &segment in segments {
+            match segment {
+                Segment::Slot {
+                    location,
+                    offset,
+                    len: piece,
+                } => {
+                    len += piece;
+                    if !cut {
+                        bytes.extend_from_slice(self.disks[node].read(location, offset, piece));
+                    }
+                }
+                Segment::Origin {
+                    origin,
+                    offset,
+                    len: piece,
+                } => {
+                    len += piece;
+                    let Some(source) = self.origin_bodies.get(&(node, origin)) else {
+                        return Err(
+                            self.failure(format!("node {node} sent {origin:?} after releasing it"))
+                        );
+                    };
+                    if offset + piece > source.len {
+                        return Err(
+                            self.failure(format!("node {node} sent past the end of {origin:?}"))
+                        );
+                    }
+                    if cut {
+                        continue;
+                    }
+                    let start = (offset as usize).min(source.bytes.len());
+                    let end = ((offset + piece) as usize).min(source.bytes.len());
+                    bytes.extend_from_slice(&source.bytes[start..end]);
+                    cut = end < (offset + piece) as usize;
+                }
+            }
+        }
+        Ok(Body { bytes, len })
     }
 
     fn answer(&mut self, attempt: u64, head: ResponseHead, body: Vec<u8>) -> Result<(), Failure> {
@@ -1487,19 +1688,39 @@ impl Simulator {
             // An earlier attempt already answered it.
             return Ok(());
         }
+        // Faults explain a 5xx or a body that ended early until their
+        // effects have run their course: S3 and node timeouts, and messages
+        // held back by a spike.
+        let grace = 2 * (self.options.origin_timeout + self.options.node_timeout)
+            + 10 * self.options.delay_max
+            + 10;
+        let unexplained = self.quiet_since.is_some_and(|quiet| sent >= quiet + grace);
         if head.status >= 500 {
-            // Faults explain a 5xx until their effects have run their course:
-            // S3 and node timeouts, and messages held back by a spike.
-            let grace = 2 * (self.options.origin_timeout + self.options.node_timeout)
-                + 10 * self.options.delay_max
-                + 10;
-            if self.quiet_since.is_some_and(|quiet| sent >= quiet + grace) {
+            if unexplained {
                 return Err(self.failure(format!(
                     "{} for {request:?} with no fault to explain it",
                     head.status
                 )));
             }
             self.summary.server_errors += 1;
+            self.summary.client_retries += 1;
+            self.attempt(request);
+            return Ok(());
+        }
+        let pending = &self.requests[&request];
+        if pending.read.method == Method::Get && (body.len() as u64) < head.content_length {
+            // The client sees the connection close early, and retries.
+            let from = pending
+                .issued
+                .saturating_sub(self.options.staleness(&pending.read.key));
+            properties::check_early_end(&self.origin, &pending.read, from, self.now, &head, &body)
+                .map_err(|message| self.failure(message))?;
+            if unexplained {
+                return Err(self.failure(format!(
+                    "{request:?} ended early with no fault to explain it"
+                )));
+            }
+            self.summary.early_ends += 1;
             self.summary.client_retries += 1;
             self.attempt(request);
             return Ok(());
@@ -1660,6 +1881,10 @@ pub struct Summary {
     /// checked against their checksums, and those that failed.
     pub crashes: u64,
     pub clean_shutdowns: u64,
+    /// Node response bodies a gateway forwarded that had ended early, and
+    /// client responses that ended early.
+    pub cut_bodies: u64,
+    pub early_ends: u64,
     pub verified_blocks: u64,
     pub corrupt_blocks: u64,
     /// A digest of every response: its request, tick, status and body.
@@ -1687,7 +1912,7 @@ impl fmt::Display for Summary {
              {}% of body bytes from disk, {} S3 requests, {} bytes written, \
              {} blocks evicted, node reads {:?}, {} messages lost, {} server errors, \
              {} client retries, {} crashes, {} clean shutdowns, {} blocks verified, \
-             {} corrupt, fingerprint {:016x}",
+             {} corrupt, {} cut bodies, {} early ends, fingerprint {:016x}",
             self.seed,
             self.ticks,
             self.writes,
@@ -1705,6 +1930,8 @@ impl fmt::Display for Summary {
             self.clean_shutdowns,
             self.verified_blocks,
             self.corrupt_blocks,
+            self.cut_bodies,
+            self.early_ends,
             self.fingerprint
         )
     }

@@ -67,7 +67,7 @@ A distributed NVMe read cache in front of S3. S3 remains the source of truth, an
 - **Object home** = `rendezvous(bucket, key)`. The home holds the object's metadata, chunk 0 and every block overlapping the object's final 16 MiB. Most file formats keep their metadata at the head or tail (Parquet and ORC footers, safetensors headers), so the home serves those reads in one hop. Objects up to 32 MiB live entirely on their home.
 - **Other chunks** belong to `rendezvous(bucket, key, chunk_index)`. Large objects spread across the cluster, and a large read fans out to several owners in parallel.
 - **Ownership costs disk only for blocks readers touch.** Blocks fill on read, so a large tail region reserves no space.
-- **Unresponsive nodes** stay in the ring for a grace period while gateways route around them. A brief failure therefore doesn't reshuffle ownership. A gateway fails over from a node that times out or answers 5xx to the next rendezvous candidate. Only the home keeps an object's metadata, since writes reach only the home, so a candidate standing in for it reads S3 directly and caches nothing.
+- **Unresponsive nodes** stay in the ring for a grace period while gateways route around them. A brief failure therefore doesn't reshuffle ownership. A gateway fails over from a node that times out, answers 5xx or ends a body early to the next rendezvous candidate. Only the home keeps an object's metadata, since writes reach only the home, so a candidate standing in for it reads S3 directly and caches nothing.
 - **Disagreement about the ring** costs duplicate fills, never wrong data. A node asked for a chunk it doesn't own serves its own copy if it has one; otherwise it fetches the data without admitting it to disk.
 
 ### Read path
@@ -82,7 +82,7 @@ A distributed NVMe read cache in front of S3. S3 remains the source of truth, an
    - asks the previous owner first, if the ring changed within the grace window;
    - otherwise fetches from S3 with `If-Match: <etag>`, combining adjacent missing blocks into one range GET.
 5. Readers can stream a block while it is still filling.
-6. If an owner fails or times out, even partway through a response, the Gateway fetches the rest through the next rendezvous candidate, which reads from S3 with `Range` and `If-Match`.
+6. The response starts once every part has answered, and the parts' bodies follow in order. If an owner fails, times out, or its body ends early, even partway through a response, the Gateway fetches the rest through the next rendezvous candidate, which reads from S3 with `Range` and `If-Match`. If S3 no longer holds that version, the response ends early and the client retries. A fill whose S3 body ends early stores nothing.
 
 ### Consistency
 

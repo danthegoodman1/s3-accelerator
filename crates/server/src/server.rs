@@ -105,10 +105,11 @@ async fn connection(stream: TcpStream, context: &Context) -> io::Result<()> {
         }
         let body = connection.read_body(len).await?;
         let response = handle(&head, client, Bytes::from(body), context).await;
-        connection
-            .write_response(&response, head.keep_alive)
-            .await?;
-        if !head.keep_alive {
+        let ended_early =
+            head.method != "HEAD" && (response.body.len() as u64) < response.content_length;
+        let keep_alive = head.keep_alive && !ended_early;
+        connection.write_response(&response, keep_alive).await?;
+        if !keep_alive {
             return Ok(());
         }
     }
@@ -243,10 +244,12 @@ async fn read(request: Request, context: &Context) -> Response {
     if head.status >= 400 {
         headers.push(("Content-Type".to_string(), "application/xml".to_string()));
     }
+    // A body shorter than the head promises ended early; the connection
+    // closes after it.
     Response {
         status: head.status,
         headers,
-        content_length: body.len() as u64,
+        content_length: head.content_length.max(body.len() as u64),
         body,
     }
 }

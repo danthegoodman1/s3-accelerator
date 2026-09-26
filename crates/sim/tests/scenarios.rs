@@ -573,3 +573,61 @@ fn a_crash_during_a_fill_leaves_no_record_of_it() {
     assert_eq!(body.len(), 200);
     assert_eq!(sim.summary().verified_blocks, 0);
 }
+
+/// Each node in turn sends a body that ends partway. The gateway reads the
+/// rest from the next candidate, and the client never notices.
+#[test]
+fn a_body_cut_partway_resumes_from_the_next_candidate() {
+    let mut sim = Simulator::new(1, cluster());
+    let key = key(IMMUTABLE_BUCKET, "k");
+    sim.put(&key, 2_048);
+    sim.read(Request::get(key.clone())).unwrap();
+    for node in 0..4 {
+        sim.cut_response(node, 10);
+        let (head, body) = sim.read(Request::get(key.clone())).unwrap();
+        assert_eq!((head.status, body.len()), (200, 2_048), "node {node} cut");
+    }
+    let summary = sim.summary();
+    assert_eq!(summary.cut_bodies, 4);
+    assert_eq!((summary.early_ends, summary.client_retries), (0, 0));
+}
+
+/// The object changes behind the cache, and the home's body ends partway
+/// through a response of the old version. The rest of the old version is
+/// gone from S3, so the response ends early and the client retries.
+#[test]
+fn a_response_whose_object_changed_after_it_started_ends_early() {
+    let mut options = cluster();
+    options.ttl_admit_on_first_read = true;
+    let mut sim = Simulator::new(1, options);
+    let key = key(TTL_BUCKET, "k");
+    sim.put(&key, 2_048);
+    sim.read(Request::get(key.clone())).unwrap();
+    sim.read(Request::get(key.clone())).unwrap();
+    sim.put(&key, 2_048);
+    sim.cut_response(sim.home(&key), 10);
+    let (head, body) = sim.read(Request::get(key)).unwrap();
+    assert_eq!((head.status, body.len()), (200, 2_048));
+    let summary = sim.summary();
+    assert_eq!(summary.cut_bodies, 1);
+    assert_eq!((summary.early_ends, summary.client_retries), (1, 1));
+}
+
+/// S3's body ends partway through the home's first fetch. The home stores
+/// none of it, and the gateway reads the rest from the next candidate.
+#[test]
+fn a_cut_s3_body_stores_nothing_and_the_read_resumes() {
+    let mut options = cluster();
+    options.immutable_admit_on_first_read = true;
+    let mut sim = Simulator::new(1, options);
+    let key = key(IMMUTABLE_BUCKET, "k");
+    sim.put(&key, 100);
+    sim.cut_origin_response(sim.home(&key), 10);
+    let (head, body) = sim.read(Request::get(key.clone())).unwrap();
+    assert_eq!((head.status, body.len()), (200, 100));
+    let summary = sim.summary();
+    assert_eq!((summary.early_ends, summary.client_retries), (0, 0));
+    assert_eq!(summary.written_bytes, 0);
+    sim.read(Request::get(key)).unwrap();
+    assert_eq!(sim.summary().written_bytes, 100);
+}

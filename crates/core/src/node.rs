@@ -168,7 +168,8 @@ pub enum Action {
     /// retries it.
     Stale { request: GatewayRequestId },
     /// Copy `len` bytes of S3's response body to `origin`, from `offset`,
-    /// into the slot at `location`. Call `on_written` once they are durable.
+    /// into the slot at `location`. Call `on_written` once they are
+    /// durable, or `on_write_failed` if the body ends before them.
     Write {
         location: Location,
         origin: OriginRequestId,
@@ -723,6 +724,29 @@ impl Node {
         self.filling_bytes -= record.len;
         self.stats.written_bytes += record.len;
         self.actions.push(Action::Record { location, record });
+        if self.in_flight.get(&block) == Some(&origin) {
+            self.in_flight.remove(&block);
+            self.unref(block.version);
+        }
+        self.stop_reading(origin);
+    }
+
+    /// S3's response body ended before the bytes for the slot at
+    /// `location` arrived: the block is not stored.
+    pub fn on_write_failed(&mut self, location: Location) {
+        let origin = self
+            .writes
+            .remove(&location)
+            .expect("a write was in progress");
+        let block = self
+            .store
+            .block_at(location)
+            .expect("a written slot holds a block");
+        let len = self.store.get(&block).expect("written block exists").len;
+        self.store.remove(block);
+        self.filling_bytes -= len;
+        self.unref(block.version);
+        // Later reads fill the block again instead of reading this body.
         if self.in_flight.get(&block) == Some(&origin) {
             self.in_flight.remove(&block);
             self.unref(block.version);
