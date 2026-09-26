@@ -7,8 +7,8 @@ sweep catch each one.
 
 A mutant is a list of replacements; each must match exactly once, ignoring
 whitespace, so formatting changes leave the mutants intact. The copy lives
-in target/mutants/src and shares one target directory, so each mutant
-recompiles only what it changed. A step that hangs counts as a catch. Exits
+in target/mutants/src and shares one target directory: dependencies build
+once, and every workspace crate rebuilds for each mutant. A step that hangs counts as a catch. Exits
 non-zero if any mutant goes uncaught or fails to build.
 """
 
@@ -22,6 +22,7 @@ from pathlib import Path
 
 NODE = "crates/core/src/node.rs"
 STORE = "crates/core/src/store.rs"
+SERVER = "crates/server/src/server.rs"
 STEP_TIMEOUT = 600
 
 MUTANTS = [
@@ -92,6 +93,31 @@ MUTANTS = [
         [(STORE, "(false, true) => true,", "(false, true) => self.small_bytes > small_target,")],
     ),
     (
+        "a write leaves the home's metadata in place",
+        [(NODE, "Some(Object::Known { .. }) => {\n                if let Some(Object::Known {", "Some(Object::Known { .. }) => {\n                if false && let Some(Object::Known {")],
+    ),
+    (
+        "a first fetch sent before a write is kept",
+        [(NODE, "Some(Object::Fetching { superseded, .. }) => *superseded = true,", "Some(Object::Fetching { .. }) => {}")],
+    ),
+    (
+        "a copy's source is not checked against the grants",
+        [(SERVER, 'if let Some(source) = header(&head.headers, "x-amz-copy-source") {',
+          "if let Some(source) = None::<&str> {")],
+    ),
+    (
+        "bodies are read whatever their size",
+        [(SERVER, "if len > context.max_body {", "if false {")],
+    ),
+    (
+        "DeleteObjects leaves cached metadata",
+        [(SERVER, "return listed_keys(&String::from_utf8_lossy(body));", "return Vec::new();")],
+    ),
+    (
+        "dot-segment keys reach S3",
+        [(SERVER, 'if key.split(\'/\').any(|segment| segment == "." || segment == "..") {', "if false {")],
+    ),
+    (
         "metadata never forgotten",
         [(NODE, "while self.recency.len() > self.config.metadata_capacity && kept < self.recency.len() {",
           "while false {")],
@@ -116,7 +142,10 @@ def main():
         print(f"== {name}", flush=True)
         if copy.exists():
             shutil.rmtree(copy)
-        shutil.copytree(root, copy, ignore=shutil.ignore_patterns("target", ".git"))
+        # Fresh modification times make cargo rebuild every workspace crate,
+        # so no crate keeps the previous mutant's build.
+        shutil.copytree(root, copy, ignore=shutil.ignore_patterns("target", ".git"),
+                        copy_function=shutil.copy)
         for path, old, new in replacements:
             file = copy / path
             text = file.read_text()
@@ -145,6 +174,7 @@ def catch(copy, target, seeds):
         return "did not build"
     layers = [
         ("core unit tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator-core"]),
+        ("server tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator"]),
         ("scenarios", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator-sim", "--test", "scenarios"]),
         ("seeds", ["cargo", "run", "-q", "--release", "-p", "s3-accelerator-sim", "--", "0",
                    "--seeds", str(seeds)]),
@@ -154,6 +184,8 @@ def catch(copy, target, seeds):
         if result is None:
             return f"caught by {layer} (hung)"
         if result.returncode != 0:
+            if os.environ.get("MUTANTS_VERBOSE"):
+                print(result.stdout[-3000:], result.stderr[-3000:])
             summary = next((line for line in result.stdout.splitlines() if " seeds from " in line), "")
             return f"caught by {layer}" + (f" ({summary})" if summary else "")
     return "MISSED"

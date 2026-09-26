@@ -169,3 +169,47 @@ fn the_home_forgets_its_least_recently_used_metadata() {
     assert_eq!(head(&mut sim, &a), 0);
     assert_eq!(head(&mut sim, &b), 1);
 }
+
+/// A write through the home replaces what it knew, however long the
+/// bucket's metadata would otherwise stay fresh. Blocks are stored on the
+/// first read, so a stale read would be a pure hit that no `If-Match`
+/// fill could catch.
+#[test]
+fn a_write_through_the_home_drops_its_metadata() {
+    let mut options = Options::scenario();
+    options.ttl = 1_000_000;
+    options.ttl_admit_on_first_read = true;
+    let mut sim = Simulator::new(1, options);
+    let key = key(TTL_BUCKET, "k");
+    sim.put(&key, 100);
+    sim.read(Request::get(key.clone())).unwrap();
+    sim.write_through(&key, 120).unwrap();
+    let (head, body) = sim.read(Request::get(key.clone())).unwrap();
+    let current = sim.origin().current(&key).unwrap();
+    assert_eq!(head.etag.as_ref(), Some(&current.etag));
+    assert_eq!(body.len(), 120);
+}
+
+/// A read that races a write may see the old version, but the home must
+/// not keep what its first fetch learned before the write.
+#[test]
+fn a_first_fetch_sent_before_a_write_is_not_kept() {
+    let mut options = Options::scenario();
+    options.ttl = 1_000_000;
+    options.ttl_admit_on_first_read = true;
+    let mut sim = Simulator::new(1, options);
+    let key = key(TTL_BUCKET, "k");
+    sim.put(&key, 100);
+    // The first fetch leaves the node on the third tick and S3 answers it on the fourth.
+    let racing = sim.start(Request::get(key.clone()));
+    for _ in 0..4 {
+        sim.step().unwrap();
+    }
+    sim.write_through(&key, 120).unwrap();
+    let (_, old) = sim.finish(racing).unwrap();
+    assert_eq!(old.len(), 100);
+    let (head, body) = sim.read(Request::get(key.clone())).unwrap();
+    let current = sim.origin().current(&key).unwrap();
+    assert_eq!(head.etag.as_ref(), Some(&current.etag));
+    assert_eq!(body.len(), 120);
+}

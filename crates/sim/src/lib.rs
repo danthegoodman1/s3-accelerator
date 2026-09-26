@@ -25,7 +25,7 @@ use s3_accelerator_core::layout::Layout;
 use s3_accelerator_core::node::{
     self, BucketPolicy, Freshness, GatewayRequestId, Node, OriginRequestId, Segment,
 };
-use s3_accelerator_core::placement::{Member, NodeId, Ring};
+use s3_accelerator_core::placement::{Member, NodeId, Placement, Ring};
 use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
 use s3_accelerator_core::store::{Location, StoreConfig};
 use std::collections::BTreeMap;
@@ -276,6 +276,7 @@ pub struct Simulator {
     queue: Queue<Event>,
     origin: Origin,
     keys: Vec<ObjectKey>,
+    ring: Ring,
     gateways: Vec<Gateway>,
     nodes: Vec<Node>,
     disks: Vec<Disk>,
@@ -337,6 +338,7 @@ impl Simulator {
             queue: Queue::default(),
             origin,
             keys,
+            ring: ring.clone(),
             gateways: (0..options.gateways)
                 .map(|_| Gateway::new(ring.clone()))
                 .collect(),
@@ -392,6 +394,23 @@ impl Simulator {
 
     pub fn delete(&mut self, key: &ObjectKey) {
         self.origin.delete(self.now, key);
+    }
+
+    /// Writes an object through its home: to the model of S3, then to the
+    /// home, which learns the write succeeded.
+    pub fn write_through(&mut self, key: &ObjectKey, size: u64) -> Result<(), Failure> {
+        self.origin.put(self.now, key, size, &mut self.writers);
+        let home = self
+            .ring
+            .owner(Placement::Home(key).hash())
+            .expect("a node")
+            .0 as usize;
+        self.nodes[home].on_write(Time(self.now), key);
+        self.drain_node(home)
+    }
+
+    pub fn origin(&self) -> &Origin {
+        &self.origin
     }
 
     /// Sends one request from client 0 through gateway 0 and runs until it

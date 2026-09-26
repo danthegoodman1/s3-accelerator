@@ -151,6 +151,9 @@ enum Object {
     Fetching {
         origin: OriginRequestId,
         waiting: Vec<GatewayRequestId>,
+        /// A write succeeded after the fetch was sent, so its answer may
+        /// predate the write: it answers its own request and is not kept.
+        superseded: bool,
     },
     Known {
         meta: Meta,
@@ -347,6 +350,26 @@ impl Node {
         self.release_if_unread(origin);
     }
 
+    /// A write to `key` passed through this node and succeeded: its
+    /// metadata no longer holds.
+    pub fn on_write(&mut self, now: Time, key: &ObjectKey) {
+        match self.objects.get_mut(key) {
+            Some(Object::Fetching { superseded, .. }) => *superseded = true,
+            Some(Object::Known { .. }) => {
+                if let Some(Object::Known {
+                    revalidation: Some((_, waiters)),
+                    ..
+                }) = self.forget(key)
+                {
+                    for waiter in waiters {
+                        self.serve(now, waiter);
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
     /// The bytes for the slot at `location` are durable.
     pub fn on_written(&mut self, location: Location) {
         let origin = self
@@ -450,8 +473,12 @@ impl Node {
             relay,
         };
         let origin = self.fetch(purpose, request);
-        self.objects
-            .insert(key, Object::Fetching { origin, waiting });
+        let fetching = Object::Fetching {
+            origin,
+            waiting,
+            superseded: false,
+        };
+        self.objects.insert(key, fetching);
     }
 
     fn fetch(&mut self, purpose: Purpose, request: Request) -> OriginRequestId {
@@ -492,11 +519,12 @@ impl Node {
         relay: bool,
         head: ResponseHead,
     ) {
-        let waiters = match self.objects.remove(&key) {
+        let (waiters, superseded) = match self.objects.remove(&key) {
             Some(Object::Fetching {
                 origin: fetch,
                 waiting,
-            }) if fetch == origin => waiting,
+                superseded,
+            }) if fetch == origin => (waiting, superseded),
             other => unreachable!(
                 "first fetch {origin:?} answered while {:?}",
                 other.is_some()
@@ -512,7 +540,9 @@ impl Node {
         }
         let meta = metadata(&head);
         if !relay {
-            if let Some(meta) = meta {
+            if superseded {
+                self.serve(now, request);
+            } else if let Some(meta) = meta {
                 self.know(key, meta, sent);
                 self.serve(now, request);
             } else {
@@ -525,7 +555,7 @@ impl Node {
             }
             return;
         }
-        if let Some(meta) = &meta {
+        if let Some(meta) = meta.as_ref().filter(|_| !superseded) {
             self.know(key.clone(), meta.clone(), sent);
         }
         let client = self
@@ -557,6 +587,7 @@ impl Node {
             }
         }
         if let Some(meta) = meta
+            && !superseded
             && self.origins[&origin].method == Method::Get
         {
             self.store_first_fetch(origin, &key, &meta, &head);
@@ -848,7 +879,7 @@ impl Node {
             if changed {
                 self.stale(waiter);
             } else {
-                self.fail(waiter, head.status);
+                self.fail(waiter, origin, &head);
             }
         }
         for waiter in revalidating {
@@ -888,16 +919,29 @@ impl Node {
         self.actions.push(Action::Stale { request: id });
     }
 
-    /// Answers a waiting request with S3's error status.
-    fn fail(&mut self, id: GatewayRequestId, status: u16) {
+    /// Answers a waiting request with S3's error response to `origin`.
+    fn fail(&mut self, id: GatewayRequestId, origin: OriginRequestId, error: &ResponseHead) {
         let Some(waiting) = self.waiting.remove(&id) else {
             return;
         };
         if let Some(plan) = waiting.plan {
             self.release(plan.holds);
         }
-        let head = ResponseHead::status(status);
-        self.respond(id, head, Vec::new(), Holds::default());
+        let mut holds = Holds::default();
+        let mut body = Vec::new();
+        if error.content_length > 0 {
+            self.read(origin, &mut holds);
+            body.push(Segment::Origin {
+                origin,
+                offset: 0,
+                len: error.content_length,
+            });
+        }
+        let head = ResponseHead {
+            content_length: error.content_length,
+            ..ResponseHead::status(error.status)
+        };
+        self.respond(id, head, body, holds);
     }
 
     fn respond(

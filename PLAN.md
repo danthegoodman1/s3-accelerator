@@ -93,7 +93,7 @@ Status ledger:
 | Complete | Work | 1F: Simulator disk model, sizes from seed, summary metrics | `crates/sim/src/{disk,queue}.rs`; `Options::swarm` draws block, chunk, extent and slot sizes, capacity, policies and delays; `Summary` reports hit percentage, S3 requests, bytes written and evictions (seeds 1 to 8 range from 5% to 99% of body bytes from disk). |
 | Complete | Test | 1G: Staleness-bounded response property and disk-content property | `properties::check_response` and `check_block` with 5 unit tests; checked on every answer, every write, and every 64 ticks. |
 | Complete | Test | 1H: Scan resistance and doorkeeper scenarios | `crates/sim/tests/scenarios.rs`: `the_doorkeeper_stores_a_block_on_its_second_read`, `a_scan_leaves_the_hot_set_cached` (both admission modes). |
-| Complete | Test | Planted bugs for Phase 1 | `scripts/mutants`: 15 of 15 caught (2 by core unit tests, 8 by scenarios, 5 by 300-seed sweeps). |
+| Complete | Test | Planted bugs for Phase 1 | `scripts/mutants`: 15 of 15 caught (2 by core unit tests, 8 by scenarios, 5 by 300-seed sweeps). Every workspace crate rebuilds for each mutant; before S1 the script could reuse a stale build across crates, which affected no Phase 1 result because every Phase 1 mutant was in one crate. |
 | Complete | Gate | 10,000-seed sweep | `cargo run --release -p s3-accelerator-sim -- 0 --seeds 10000`: 0 of 10,000 failed, after the review fixes. |
 | Complete | Gate | Code review | `/code-review high` found 10 issues, all resolved: mutants now match ignoring whitespace; eviction falls back to the other queue when one is fully pinned (`a_pinned_queue_yields_to_the_other`, `frequent_blocks_still_leave_eventually`); fill errors other than 412 and 404 pass to the client; inverted ranges are ignored, as S3 does; home metadata has an LRU capacity (`the_home_forgets_its_least_recently_used_metadata`); each random source has its own stream; planted bugs for first-fetch merging, the ghost queue and the fill budget; evacuation checks a per-extent busy count; `Node::stored_block_at`; `Node::new` checks block and slot sizes. Wrong-class evictions before an evacuation are recorded under the storage-layout open question in `spec.md`. |
 
@@ -111,7 +111,8 @@ Scope:
 
 Out of scope:
 - Disk storage, `sendfile`, `splice`, kTLS (S2 and S3).
-- Presigned URLs and streaming uploads.
+- Presigned URLs, signed streaming uploads (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, answered 501), chunked transfer encoding, and virtual-hosted-style addressing.
+- Response headers beyond ETag, length and range (2F).
 
 Completion gate:
 The conformance suite passes through the accelerator in CI; `/code-review` findings are resolved.
@@ -124,12 +125,14 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | S1A: HTTP/1.1 parsing and responses | Missing: server module and tests. |
-| Incomplete | Work | S1B: SigV4 validation and grants | Missing: implementation and test vectors. |
-| Incomplete | Work | S1C: Origin signing client | Missing: implementation. |
-| Incomplete | Work | S1D: Core-driven `GetObject` and `HeadObject` | Missing: server wiring. |
-| Incomplete | Test | S1E: Conformance through the accelerator in CI | Missing: CI job and passing run. |
-| Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
+| Complete | Work | S1A: HTTP/1.1 parsing and responses | `crates/server/src/http.rs` (keep-alive, `Content-Length` bodies, `Expect: 100-continue`) with 3 unit tests. |
+| Complete | Work | S1B: SigV4 validation and grants | `crates/server/src/sigv4.rs`: AWS's GET Object and List Objects signing examples, sign-then-verify, tampering, expiry and unknown keys (4 tests); body hashes checked against `x-amz-content-sha256`; grants in `config.rs` (`parses_a_minimal_config`); unsigned requests get 403 without reaching S3 (`a_third_read_comes_from_the_cache`). |
+| Complete | Work | S1C: Origin signing client | `crates/server/src/origin.rs` signs with `sigv4::Signer`; s3proxy accepts its requests in the conformance run through the accelerator. |
+| Complete | Work | S1F: Review fixes | Grants cover `x-amz-copy-source` (`a_copy_needs_a_grant_on_its_source`); heads are authenticated before bodies are read and bodies are capped by `max_body` and read as they arrive (`an_unauthenticated_body_is_never_read`, `an_oversized_body_is_refused_before_it_is_read`); a first fetch sent before a write answers its own request and is not kept (`Node::on_write`, scenario `a_first_fetch_sent_before_a_write_is_not_kept`); `DeleteObjects` drops each listed key's metadata (`delete_objects_drops_cached_metadata`); S3 connect and read timeouts; keys with `.` or `..` segments are refused with 501, because reqwest's URL parser would collapse them after signing (`dot_segment_keys_are_refused`); non-ASCII `x-amz-date` values are rejected; fill errors relay S3's error body; header and clock helpers are shared. S3 bodies are held whole in memory up to `max_body` until S2 streams them. |
+| Complete | Work | S1D: Core-driven `GetObject` and `HeadObject` | `crates/server/src/engine.rs` runs the gateway and node on one thread; `crates/server/tests/cache.rs` `a_third_read_comes_from_the_cache` shows the third read and a range read cost no S3 request; writes passed to S3 drop the home's metadata (`Node::on_write`, scenario `a_write_through_the_home_drops_its_metadata`, mutant "a write leaves the home's metadata in place"). |
+| In Progress | Test | S1E: Conformance through the accelerator in CI | Local run with `config/local.toml`: 8 of 8 pass. Missing: a passing CI run of the new step. |
+| Complete | Test | Planted bugs for S1 | `scripts/mutants`: 23 of 23 caught, 8 of them S1's (server tests catch the copy-source, body-size, `DeleteObjects`, dot-segment and write-invalidation bugs). |
+| Complete | Gate | Code review | `/code-review high` found 10 issues, all resolved in S1F; whole-body buffering moves to S2C and dot-segment keys to S2's origin client. |
 
 ## Phase 2: Chunks Across Nodes
 
@@ -142,6 +145,7 @@ Scope:
 - 2C Gateway metadata cache: bounded LRU, `immutable` entries until evicted, a short TTL for others; a stale entry makes the owner's fill fail `If-Match`, and the gateway drops it and retries.
 - 2D Chunk owners fill with the ETag the gateway sends; a node asked for a chunk it does not own serves its copy or fetches without admitting.
 - 2E Simulator: gateways with independent caches; per-node hit rates and load.
+- 2F Response headers: metadata carries the headers S3 returns with an object (`Content-Type`, `Last-Modified`, `Cache-Control`, `Content-Encoding`, `Content-Disposition`, `x-amz-meta-*`), the model of S3 sets them, and the server writes them.
 
 Out of scope:
 - Ring changes (Phase 4).
@@ -163,6 +167,7 @@ Status ledger:
 | Incomplete | Work | 2C: Gateway metadata cache | Missing: implementation and stale-entry coverage. |
 | Incomplete | Work | 2D: Chunk owner fills and non-owner behavior | Missing: implementation. |
 | Incomplete | Work | 2E: Simulator gateways and per-node metrics | Missing: simulator changes. |
+| Incomplete | Work | 2F: Response headers in metadata | Missing: core, model and server changes, and a conformance test. |
 | Incomplete | Test | Planted bugs for Phase 2 | Missing: `scripts/mutants` entries and report. |
 | Incomplete | Gate | 10,000-seed sweep | Missing: sweep output. |
 | Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
@@ -211,17 +216,18 @@ Storage nodes keep blocks on disk and serve hits with `sendfile`, and gateways r
 Scope:
 - S2A Slab files, extents and the slot table on disk, executing the core's storage actions.
 - S2B `fdatasync` ordering, restart recovery, clean-shutdown marker.
-- S2C `sendfile` for hits and `splice` for relays, on worker threads off the event loop.
+- S2C `sendfile` for hits and `splice` for relays, on worker threads off the event loop. Bodies stream end to end: S3 responses, relays and uploads never sit whole in memory, and `max_body` stops limiting object size. The origin client sends paths as written, so keys with `.` and `..` segments work.
 - S2D Separate gateway and storage-node processes, and a restart test that keeps the cache warm.
 
 Out of scope:
 - kTLS (S3).
 
 Completion gate:
-Conformance passes through a multi-process cluster; a restart test shows hits after restart; `/code-review` findings are resolved.
+Conformance passes through a multi-process cluster; a restart test shows hits after restart; zero-copy is verified from outside the server; `/code-review` findings are resolved.
 
 Testing plan:
 - Conformance through the accelerator; restart integration test; crash test that kills the process during fills.
+- Zero-copy verification: an integration test runs the storage node and gateway under `strace` and asserts that hit bodies leave through `sendfile` (storage node) and `splice` (gateway) system calls covering at least the body's bytes, and that no `write`, `writev` or `sendmsg` carries body bytes. The server's own counters are not evidence. A planted bug that forces the copying path must fail the test. CI installs `strace` and runs it.
 
 Status ledger:
 
@@ -231,6 +237,7 @@ Status ledger:
 | Incomplete | Work | S2B: Sync ordering and recovery | Missing: implementation and crash test. |
 | Incomplete | Work | S2C: `sendfile` and `splice` | Missing: implementation. |
 | Incomplete | Work | S2D: Multi-process cluster and restart test | Missing: test. |
+| Incomplete | Test | S2E: `sendfile` and `splice` verified under `strace` | Missing: integration test, planted copying-path bug, CI job. |
 | Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
 
 ## Phase 4: Membership and Ring Changes
@@ -306,16 +313,18 @@ Scope:
 - S3C Record the storage-layout decision in `spec.md`.
 
 Completion gate:
-TLS conformance passes; benchmark results are recorded; `/code-review` findings are resolved.
+TLS conformance passes; kTLS and zero-copy under TLS are verified from outside the server; benchmark results are recorded; `/code-review` findings are resolved.
 
 Testing plan:
 - Conformance over TLS; benchmark harness with recorded results.
+- kTLS verification: after a TLS handshake, the socket reports the `tls` ULP (`ss -tie` shows it), `/proc/net/tls_stat` transmit counters (`TlsTxSw` or `TlsTxDevice`) rise for each connection, `strace` shows hit bodies leaving through `sendfile` on the TLS socket, and the TLS client decrypts every body byte correctly. A run forced onto userspace TLS must fail the kTLS assertions. CI loads the `tls` kernel module and runs it.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Incomplete | Work | S3A: rustls and kTLS listeners | Missing: implementation. |
+| Incomplete | Test | S3D: kTLS verified through kernel state and `strace` | Missing: integration test, forced userspace-TLS control, CI job. |
 | Incomplete | Test | S3B: NVMe benchmarks | Missing: harness and results. |
 | Incomplete | Doc | S3C: Storage-layout decision | Missing: spec update. |
 | Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |

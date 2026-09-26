@@ -16,7 +16,8 @@
 - The simulator checks responses against its model of S3, never against the core's own state.
 - A seed replays its run exactly. The simulator draws from its own PRNG; give each new source of randomness its own `Prng::stream`, so it leaves existing draws unchanged.
 - A bug the simulator finds becomes a regression test in `crates/sim/tests` that runs its seed. The commit message records the seed and the commit that failed.
-- Every S3 behavior the cache serves needs a conformance test in `tests/`. The suite passes against s3proxy, and must pass through the accelerator too.
+- Every S3 behavior the cache serves needs a conformance test in `tests/`. The suite passes against s3proxy and through the accelerator; CI runs both.
+- Verify zero-copy and kTLS from outside the server (`strace`, `/proc/net/tls_stat`, socket state). The server's own counters are not evidence.
 
 ## Commands
 
@@ -24,6 +25,7 @@
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 scripts/s3proxy start && cargo test --workspace -- --include-ignored
+cargo run -p s3-accelerator -- config/local.toml &   # then CONFORMANCE_ENDPOINT=http://127.0.0.1:9000
 cargo run --release -p s3-accelerator-sim [-- SEED] [--seeds N]
 scripts/mutants
 ```

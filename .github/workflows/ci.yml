@@ -29,6 +29,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: scripts/s3proxy wait
       - run: cargo test --workspace -- --include-ignored
+      - name: Conformance through the accelerator
+        run: |
+          target/debug/s3-accelerator config/local.toml &
+          for _ in $(seq 60); do curl -s -o /dev/null http://127.0.0.1:9000/ && break; sleep 0.5; done
+          CONFORMANCE_ENDPOINT=http://127.0.0.1:9000 cargo test -p s3-accelerator-conformance -- --ignored
 
   simulate:
     runs-on: ubuntu-latest

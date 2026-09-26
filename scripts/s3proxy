@@ -25,6 +25,8 @@ wait_for_s3proxy() {
 
 case "${1:-}" in
   start)
+    # A fresh, empty s3proxy each time.
+    docker rm -f "$name" >/dev/null 2>&1 || true
     docker run -d --rm --name "$name" -p "127.0.0.1:$port:80" \
       -e JCLOUDS_PROVIDER=transient "$image" >/dev/null
     wait_for_s3proxy
