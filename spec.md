@@ -156,3 +156,4 @@ The system is written in Rust.
 - **Workload targets:** object-size mix, request rate, working-set size, and hit-rate and latency goals. These set the chunk size, block size and hot-key thresholds.
 - **Chunk size:** larger chunks mean fewer hops per read; smaller chunks spread load more evenly.
 - **Grace window:** how long to keep previous-owner fallback after a ring change.
+- **Storage layout:** revisit once the simulator and NVMe benchmarks produce numbers. It carries three risks: rebalancing size classes evicts every block in an extent, hot ones included; the kernel decides what stays in memory; and fills land as random writes, which wear flash faster in small slots. A log-structured store is the fallback if these bite.
