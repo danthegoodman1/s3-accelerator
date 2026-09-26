@@ -183,7 +183,7 @@ MUTANTS = [
     (
         "the gateway fails one read in ten",
         [(GATEWAY, "fn plan_with(&mut self, id: ClientRequestId, meta: &ObjectMeta) {",
-          "fn plan_with(&mut self, id: ClientRequestId, meta: &ObjectMeta) {\n        if self.next_node_request % 10 == 0 { self.next_node_request += 1; return self.finish(id, ResponseHead::status(503), Vec::new()); }")],
+          "fn plan_with(&mut self, id: ClientRequestId, meta: &ObjectMeta) {\n        if self.next_node_request % 10 == 0 { self.next_node_request += 1; return self.respond(id, ResponseHead::status(503)); }")],
     ),
     (
         "failover candidates cache metadata the home's writes never reach",
