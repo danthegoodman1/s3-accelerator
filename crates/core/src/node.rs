@@ -9,7 +9,11 @@
 use crate::Time;
 use crate::doorkeeper::Doorkeeper;
 use crate::layout::Layout;
-use crate::s3::{ByteRange, ContentRange, ETag, Method, ObjectKey, Request, ResponseHead};
+use crate::placement::{NodeId, Ring};
+use crate::s3::{
+    Answer, ByteRange, ContentRange, ETag, Method, ObjectKey, Request, ResponseHead, answer,
+    preconditions,
+};
 use crate::store::{BlockKey, BlockState, Location, Store, StoreConfig, VersionId};
 use std::collections::{BTreeMap, BTreeSet};
 use xxhash_rust::xxh3::xxh3_64;
@@ -21,6 +25,45 @@ pub struct GatewayRequestId(pub u64);
 /// A request the node sent to S3, numbered by the node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OriginRequestId(pub u64);
+
+/// What a gateway asks a storage node to read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Read {
+    /// A client's `GetObject` or `HeadObject`, sent to the object's home.
+    /// `stale` is an ETag a chunk owner just found out of date: the home
+    /// revalidates it instead of trusting it until its age runs out.
+    Object {
+        request: Request,
+        stale: Option<ETag>,
+        /// Fetch exactly this request from S3 and relay the answer, leaving
+        /// metadata and blocks alone: the gateway's way out of a read that
+        /// keeps finding the object changed.
+        direct: bool,
+    },
+    /// Bytes of one version, sent to the node that owns them.
+    Range(RangeRead),
+}
+
+/// Bytes `first..=last` of the version `etag` of an object of `size`
+/// bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeRead {
+    pub key: ObjectKey,
+    pub etag: ETag,
+    pub size: u64,
+    pub first: u64,
+    pub last: u64,
+}
+
+/// What a home tells gateways about an object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectMeta {
+    pub etag: ETag,
+    pub size: u64,
+    pub headers: Vec<(String, String)>,
+    /// Milliseconds since the home last confirmed the metadata with S3.
+    pub age: u64,
+}
 
 /// How long a bucket's metadata stays fresh.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,11 +121,18 @@ pub enum Action {
         request: Request,
     },
     /// Answer the gateway with `head`, then `body`. Call `on_sent` once the
-    /// body is sent.
+    /// body is sent. A home that knows the object's metadata includes it.
     Respond {
         request: GatewayRequestId,
         head: ResponseHead,
         body: Vec<Segment>,
+        meta: Option<ObjectMeta>,
+    },
+    /// The request reaches past the blocks the home holds: answer the
+    /// gateway with the metadata, and it reads the blocks from their owners.
+    Metadata {
+        request: GatewayRequestId,
+        meta: ObjectMeta,
     },
     /// The object changed while the node served the request; the gateway
     /// retries it.
@@ -107,6 +157,8 @@ pub struct Stats {
     pub miss_bytes: u64,
     pub origin_requests: u64,
     pub written_bytes: u64,
+    /// Requests from gateways.
+    pub reads: u64,
     pub evicted_blocks: u64,
 }
 
@@ -121,6 +173,8 @@ pub struct StoredBlock<'a> {
 }
 
 pub struct Node {
+    id: NodeId,
+    ring: Ring,
     config: Config,
     objects: BTreeMap<ObjectKey, Object>,
     /// Known objects by when they were last used, oldest first.
@@ -193,6 +247,10 @@ struct OriginRequest {
 }
 
 enum Purpose {
+    /// A direct read: S3's answer is the gateway's.
+    Direct {
+        request: GatewayRequestId,
+    },
     First {
         key: ObjectKey,
         request: GatewayRequestId,
@@ -213,7 +271,7 @@ enum Purpose {
 }
 
 struct Waiting {
-    request: Request,
+    read: Read,
     arrived: Time,
     /// Set once the metadata is known and the body planned.
     plan: Option<Plan>,
@@ -221,6 +279,7 @@ struct Waiting {
 
 struct Plan {
     head: ResponseHead,
+    meta: Option<ObjectMeta>,
     body: Vec<Segment>,
     holds: Holds,
     /// Fills that must answer before the response starts.
@@ -235,7 +294,7 @@ struct Holds {
 }
 
 impl Node {
-    pub fn new(config: Config) -> Node {
+    pub fn new(id: NodeId, ring: Ring, config: Config) -> Node {
         assert!(
             config.layout.block_size() <= config.store.max_slot,
             "blocks of {} bytes exceed the largest slot",
@@ -243,6 +302,8 @@ impl Node {
         );
         assert!(config.metadata_capacity > 0, "no room for metadata");
         Node {
+            id,
+            ring,
             store: Store::new(config.store),
             doorkeeper: Doorkeeper::new(config.doorkeeper_window),
             config,
@@ -316,15 +377,81 @@ impl Node {
         std::mem::take(&mut self.actions)
     }
 
-    pub fn on_request(&mut self, now: Time, id: GatewayRequestId, mut request: Request) {
-        request.range = request.range.filter(|range| range.is_valid());
+    pub fn on_request(&mut self, now: Time, id: GatewayRequestId, read: Read) {
+        self.stats.reads += 1;
+        match read {
+            Read::Object {
+                request,
+                direct: true,
+                ..
+            } => {
+                let purpose = Purpose::Direct { request: id };
+                self.fetch(purpose, request);
+            }
+            Read::Object {
+                mut request, stale, ..
+            } => {
+                request.range = request.range.filter(|range| range.is_valid());
+                let waiting = Waiting {
+                    read: Read::Object {
+                        request,
+                        stale,
+                        direct: false,
+                    },
+                    arrived: now,
+                    plan: None,
+                };
+                self.waiting.insert(id, waiting);
+                self.serve(now, id);
+            }
+            Read::Range(range) => self.read_range(now, id, range),
+        }
+    }
+
+    /// Serves bytes of a version the gateway names. The node fills with
+    /// `If-Match`, so the bytes are that version's or the read goes stale.
+    fn read_range(&mut self, now: Time, id: GatewayRequestId, range: RangeRead) {
+        if range.first > range.last || range.last >= range.size {
+            return self.respond(
+                id,
+                ResponseHead::status(416),
+                Vec::new(),
+                Holds::default(),
+                None,
+            );
+        }
+        let head = ResponseHead {
+            status: 206,
+            etag: Some(range.etag.clone()),
+            content_range: Some(ContentRange {
+                first: range.first,
+                last: range.last,
+                size: range.size,
+            }),
+            content_length: range.last - range.first + 1,
+            headers: Vec::new(),
+        };
         let waiting = Waiting {
-            request,
+            read: Read::Range(range.clone()),
             arrived: now,
             plan: None,
         };
         self.waiting.insert(id, waiting);
-        self.serve(now, id);
+        let body = BodyPlan {
+            head,
+            meta: None,
+            first: range.first,
+            last: range.last,
+        };
+        self.plan_body(id, &range.key, &range.etag, range.size, body);
+    }
+
+    /// The `GetObject` or `HeadObject` a home serves.
+    fn object_request(&self, id: GatewayRequestId) -> &Request {
+        match &self.waiting[&id].read {
+            Read::Object { request, .. } => request,
+            Read::Range(_) => unreachable!("only object reads need metadata"),
+        }
     }
 
     pub fn on_origin_response(&mut self, now: Time, origin: OriginRequestId, head: ResponseHead) {
@@ -347,6 +474,10 @@ impl Node {
                 self.revalidated(now, origin, key, sent, head);
             }
             Purpose::Fill { .. } => self.fill_answered(now, origin, head),
+            Purpose::Direct { request } => {
+                let request = *request;
+                self.relay(request, origin, head);
+            }
         }
         self.release_if_unread(origin);
     }
@@ -402,13 +533,12 @@ impl Node {
     }
 
     fn serve(&mut self, now: Time, id: GatewayRequestId) {
-        let waiting = &self.waiting[&id];
-        let key = waiting.request.key.clone();
-        let arrived = waiting.arrived;
+        let key = self.object_request(id).key.clone();
+        let arrived = self.waiting[&id].arrived;
         let freshness = self.policy(&key.bucket).freshness;
         match self.objects.get_mut(&key) {
             None => {
-                let client = &self.waiting[&id].request;
+                let client = self.object_request(id);
                 let request = Request {
                     method: client.method,
                     key: key.clone(),
@@ -425,14 +555,23 @@ impl Node {
                 revalidation,
                 ..
             }) => {
-                let fresh = match freshness {
-                    Freshness::Immutable => true,
-                    Freshness::Ttl(ttl) => validated.0 + ttl >= arrived.0,
+                let reported_stale = match &mut self.waiting.get_mut(&id).expect("served").read {
+                    // Revalidating answers the report, so it counts once.
+                    Read::Object { stale, .. } => {
+                        stale.take().is_some_and(|stale| stale == meta.etag)
+                    }
+                    Read::Range(_) => false,
                 };
+                let fresh = !reported_stale
+                    && match freshness {
+                        Freshness::Immutable => true,
+                        Freshness::Ttl(ttl) => validated.0 + ttl >= arrived.0,
+                    };
                 if fresh {
                     let meta = meta.clone();
+                    let shared = shared(&meta, *validated, now);
                     self.touch(&key);
-                    self.plan(id, &key, &meta);
+                    self.plan(id, &key, &meta, shared);
                 } else if let Some((_, waiting)) = revalidation {
                     waiting.push(id);
                 } else {
@@ -531,9 +670,9 @@ impl Node {
                 other.is_some()
             ),
         };
-        let client = &self.waiting[&request].request;
-        let preconditions = client.if_match.is_some() || client.if_none_match.is_some();
-        if relay && head.status == 416 && preconditions {
+        let client = self.object_request(request);
+        let conditional = client.if_match.is_some() || client.if_none_match.is_some();
+        if relay && head.status == 416 && conditional {
             // S3 checks preconditions before ranges, so the client's answer
             // may differ: learn the metadata and answer here.
             self.first_fetch(now, request, Request::head(key), waiters, false);
@@ -549,7 +688,7 @@ impl Node {
             } else {
                 self.waiting.remove(&request);
                 let head = ResponseHead::status(head.status);
-                self.respond(request, head, Vec::new(), Holds::default());
+                self.respond(request, head, Vec::new(), Holds::default(), None);
             }
             for waiter in waiters {
                 self.serve(now, waiter);
@@ -559,16 +698,25 @@ impl Node {
         if let Some(meta) = meta.as_ref().filter(|_| !superseded) {
             self.know(key.clone(), meta.clone(), sent);
         }
-        let client = self
+        let Read::Object {
+            request: client, ..
+        } = self
             .waiting
             .remove(&request)
             .expect("the first request waits")
-            .request;
+            .read
+        else {
+            unreachable!("a first fetch serves an object read");
+        };
         let answer = meta
             .as_ref()
-            .and_then(|meta| conditional_answer(&client, meta));
+            .and_then(|meta| preconditions(&client, &meta.etag));
+        let known = meta
+            .as_ref()
+            .filter(|_| !superseded)
+            .map(|meta| shared(meta, sent, now));
         match answer {
-            Some(head) => self.respond(request, head, Vec::new(), Holds::default()),
+            Some(head) => self.respond(request, head, Vec::new(), Holds::default(), known),
             None => {
                 let len = match self.origins[&origin].method {
                     Method::Get => head.content_length,
@@ -584,7 +732,7 @@ impl Node {
                     });
                     self.read(origin, &mut holds);
                 }
-                self.respond(request, head.clone(), body, holds);
+                self.respond(request, head.clone(), body, holds, known);
             }
         }
         if let Some(meta) = meta
@@ -673,39 +821,55 @@ impl Node {
     }
 
     /// Plans the response to a request whose metadata is known and fresh.
-    fn plan(&mut self, id: GatewayRequestId, key: &ObjectKey, meta: &Meta) {
-        let request = self.waiting[&id].request.clone();
-        if let Some(head) = conditional_answer(&request, meta) {
+    fn plan(&mut self, id: GatewayRequestId, key: &ObjectKey, meta: &Meta, shared: ObjectMeta) {
+        let request = self.object_request(id).clone();
+        let (head, first, last) = match answer(&request, &meta.etag, meta.size, &meta.headers) {
+            Answer::Head(head) => {
+                self.waiting.remove(&id);
+                return self.respond(id, head, Vec::new(), Holds::default(), Some(shared));
+            }
+            Answer::Body { head, first, last } => (head, first, last),
+        };
+        let layout = self.config.layout;
+        let beyond_home = layout
+            .runs(key, meta.size, first, last)
+            .iter()
+            .any(|(placement, _, _)| self.ring.owner(placement.hash()) != Some(self.id));
+        if beyond_home {
             self.waiting.remove(&id);
-            return self.respond(id, head, Vec::new(), Holds::default());
+            self.actions.push(Action::Metadata {
+                request: id,
+                meta: shared,
+            });
+            return;
         }
-        let span = match request.range {
-            None => (meta.size > 0).then(|| (0, meta.size - 1)),
-            Some(range) => match range.resolve(meta.size) {
-                Some(span) => Some(span),
-                None => {
-                    self.waiting.remove(&id);
-                    let head = ResponseHead::status(416);
-                    return self.respond(id, head, Vec::new(), Holds::default());
-                }
-            },
+        let body = BodyPlan {
+            head,
+            meta: Some(shared),
+            first,
+            last,
         };
-        let head = ResponseHead {
-            status: if request.range.is_some() { 206 } else { 200 },
-            etag: Some(meta.etag.clone()),
-            content_range: request.range.and(span).map(|(first, last)| ContentRange {
-                first,
-                last,
-                size: meta.size,
-            }),
-            content_length: span.map_or(0, |(first, last)| last - first + 1),
-            headers: meta.headers.clone(),
-        };
-        let (Method::Get, Some((first, last))) = (request.method, span) else {
-            self.waiting.remove(&id);
-            return self.respond(id, head, Vec::new(), Holds::default());
-        };
-        let version = self.version(key, &meta.etag);
+        self.plan_body(id, key, &meta.etag.clone(), meta.size, body);
+    }
+
+    /// Plans the body of bytes `first..=last` of a version: stored blocks,
+    /// blocks already arriving, and fills for the rest. The response starts
+    /// once every fill it reads has answered.
+    fn plan_body(
+        &mut self,
+        id: GatewayRequestId,
+        key: &ObjectKey,
+        etag: &ETag,
+        size: u64,
+        plan: BodyPlan,
+    ) {
+        let BodyPlan {
+            head,
+            meta,
+            first,
+            last,
+        } = plan;
+        let version = self.version(key, etag);
         let mut body = Vec::new();
         let mut holds = Holds::default();
         let mut awaiting = BTreeSet::new();
@@ -715,7 +879,7 @@ impl Node {
         while next < blocks.len() {
             let index = blocks[next];
             let block = BlockKey { version, index };
-            let span = layout.block_span(meta.size, index);
+            let span = layout.block_span(size, index);
             let piece = span.start.max(first)..span.end.min(last + 1);
             let len = piece.end - piece.start;
             let ready = self
@@ -748,7 +912,7 @@ impl Node {
                         })
                         .count();
                     let run = blocks[next]..=blocks[next + run_end - 1];
-                    self.fill(key, meta, version, run)
+                    self.fill(key, etag, size, version, run)
                 }
             };
             let body_start = self.origins[&origin].body_start;
@@ -766,7 +930,7 @@ impl Node {
         self.forget_if_unused(version);
         if awaiting.is_empty() {
             self.waiting.remove(&id);
-            return self.respond(id, head, body, holds);
+            return self.respond(id, head, body, holds, meta);
         }
         for origin in &awaiting {
             let request = self.origins.get_mut(origin).expect("awaited fill exists");
@@ -778,6 +942,7 @@ impl Node {
             .expect("the planned request waits");
         waiting.plan = Some(Plan {
             head,
+            meta,
             body,
             holds,
             awaiting,
@@ -789,13 +954,14 @@ impl Node {
     fn fill(
         &mut self,
         key: &ObjectKey,
-        meta: &Meta,
+        etag: &ETag,
+        size: u64,
         version: VersionId,
         run: std::ops::RangeInclusive<u64>,
     ) -> OriginRequestId {
         let layout = self.config.layout;
-        let first = layout.block_span(meta.size, *run.start()).start;
-        let last_byte = layout.block_span(meta.size, *run.end()).end - 1;
+        let first = layout.block_span(size, *run.start()).start;
+        let last_byte = layout.block_span(size, *run.end()).end - 1;
         let request = Request {
             method: Method::Get,
             key: key.clone(),
@@ -803,7 +969,7 @@ impl Node {
                 first,
                 last: last_byte,
             }),
-            if_match: Some(meta.etag.clone()),
+            if_match: Some(etag.clone()),
             if_none_match: None,
         };
         let purpose = Purpose::Fill {
@@ -816,7 +982,7 @@ impl Node {
         for index in run {
             let block = BlockKey { version, index };
             self.track_in_flight(block, origin);
-            if let Some(location) = self.admit(key, &meta.etag, meta.size, block) {
+            if let Some(location) = self.admit(key, etag, size, block) {
                 stored.push((block, location));
             }
         }
@@ -905,7 +1071,7 @@ impl Node {
                 .expect("waiting")
                 .plan
                 .expect("plan");
-            self.respond(id, plan.head, plan.body, plan.holds);
+            self.respond(id, plan.head, plan.body, plan.holds, plan.meta);
         }
     }
 
@@ -919,6 +1085,25 @@ impl Node {
             self.release(plan.holds);
         }
         self.actions.push(Action::Stale { request: id });
+    }
+
+    /// Answers a direct read with S3's response to `origin`.
+    fn relay(&mut self, id: GatewayRequestId, origin: OriginRequestId, head: ResponseHead) {
+        let mut holds = Holds::default();
+        let mut body = Vec::new();
+        let len = match self.origins[&origin].method {
+            Method::Get => head.content_length,
+            Method::Head => 0,
+        };
+        if len > 0 {
+            self.read(origin, &mut holds);
+            body.push(Segment::Origin {
+                origin,
+                offset: 0,
+                len,
+            });
+        }
+        self.respond(id, head, body, holds, None);
     }
 
     /// Answers a waiting request with S3's error response to `origin`.
@@ -943,7 +1128,7 @@ impl Node {
             content_length: error.content_length,
             ..ResponseHead::status(error.status)
         };
-        self.respond(id, head, body, holds);
+        self.respond(id, head, body, holds, None);
     }
 
     fn respond(
@@ -952,6 +1137,7 @@ impl Node {
         head: ResponseHead,
         body: Vec<Segment>,
         holds: Holds,
+        meta: Option<ObjectMeta>,
     ) {
         for segment in &body {
             match segment {
@@ -964,6 +1150,7 @@ impl Node {
             request: id,
             head,
             body,
+            meta,
         });
     }
 
@@ -1024,6 +1211,10 @@ impl Node {
         block: BlockKey,
     ) -> Option<Location> {
         let layout = self.config.layout;
+        let placement = layout.placement(key, size, block.index).hash();
+        if self.ring.owner(placement) != Some(self.id) {
+            return None;
+        }
         let hash = block_hash(key, etag, layout.block_size(), block.index);
         if !self.policy(&key.bucket).admit_on_first_read && !self.doorkeeper.contains(hash) {
             self.doorkeeper.insert(hash);
@@ -1034,7 +1225,6 @@ impl Node {
         if self.filling_bytes + len > self.config.fill_budget {
             return None;
         }
-        let placement = layout.placement(key, size, block.index).hash();
         let location = self.store.reserve(block, len, hash, placement);
         for evicted in self.store.drain_evicted() {
             self.stats.evicted_blocks += 1;
@@ -1151,6 +1341,24 @@ impl Node {
     }
 }
 
+/// A body to plan: its head, the metadata to send with it, and its bytes.
+struct BodyPlan {
+    head: ResponseHead,
+    meta: Option<ObjectMeta>,
+    first: u64,
+    last: u64,
+}
+
+/// Metadata as a home shares it with gateways.
+fn shared(meta: &Meta, validated: Time, now: Time) -> ObjectMeta {
+    ObjectMeta {
+        etag: meta.etag.clone(),
+        size: meta.size,
+        headers: meta.headers.clone(),
+        age: now.0.saturating_sub(validated.0),
+    }
+}
+
 /// The metadata a successful response carries.
 fn metadata(head: &ResponseHead) -> Option<Meta> {
     let size = match head.status {
@@ -1165,24 +1373,6 @@ fn metadata(head: &ResponseHead) -> Option<Meta> {
         size,
         headers,
     })
-}
-
-/// The answer to a request whose preconditions fail against `meta`.
-fn conditional_answer(request: &Request, meta: &Meta) -> Option<ResponseHead> {
-    if request
-        .if_match
-        .as_ref()
-        .is_some_and(|etag| *etag != meta.etag)
-    {
-        return Some(ResponseHead::status(412));
-    }
-    if request.if_none_match.as_ref() == Some(&meta.etag) {
-        return Some(ResponseHead {
-            etag: Some(meta.etag.clone()),
-            ..ResponseHead::status(304)
-        });
-    }
-    None
 }
 
 /// A block's identity: bucket, key, ETag, block size and index.

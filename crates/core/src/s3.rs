@@ -107,6 +107,69 @@ impl ResponseHead {
     }
 }
 
+/// How S3 answers a `GetObject` or `HeadObject` for one version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// A response with no body: a failed precondition, an unsatisfiable
+    /// range, a `HeadObject`, or an empty object.
+    Head(ResponseHead),
+    /// A response whose body is bytes `first..=last` of the object.
+    Body {
+        head: ResponseHead,
+        first: u64,
+        last: u64,
+    },
+}
+
+/// S3's answer to `request` for the version `etag`, of `size` bytes, that
+/// carries `headers`. The request's range must be valid.
+pub fn answer(request: &Request, etag: &ETag, size: u64, headers: &[(String, String)]) -> Answer {
+    if let Some(head) = preconditions(request, etag) {
+        return Answer::Head(head);
+    }
+    let span = match request.range {
+        None => (size > 0).then(|| (0, size - 1)),
+        Some(range) => match range.resolve(size) {
+            Some(span) => Some(span),
+            None => return Answer::Head(ResponseHead::status(416)),
+        },
+    };
+    let head = ResponseHead {
+        status: if request.range.is_some() { 206 } else { 200 },
+        etag: Some(etag.clone()),
+        content_range: request.range.and(span).map(|(first, last)| ContentRange {
+            first,
+            last,
+            size,
+        }),
+        content_length: span.map_or(0, |(first, last)| last - first + 1),
+        headers: headers.to_vec(),
+    };
+    match (request.method, span) {
+        (Method::Get, Some((first, last))) => Answer::Body { head, first, last },
+        _ => Answer::Head(head),
+    }
+}
+
+/// The answer to a request whose preconditions fail against `etag`: S3
+/// checks `If-Match`, then `If-None-Match`, before anything else.
+pub fn preconditions(request: &Request, etag: &ETag) -> Option<ResponseHead> {
+    if request
+        .if_match
+        .as_ref()
+        .is_some_and(|expected| expected != etag)
+    {
+        return Some(ResponseHead::status(412));
+    }
+    if request.if_none_match.as_ref() == Some(etag) {
+        return Some(ResponseHead {
+            etag: Some(etag.clone()),
+            ..ResponseHead::status(304)
+        });
+    }
+    None
+}
+
 /// A `Content-Range` header: the body's inclusive span and the object's size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContentRange {

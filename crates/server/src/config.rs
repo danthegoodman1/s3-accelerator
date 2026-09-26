@@ -1,5 +1,6 @@
 //! The server's TOML configuration.
 
+use s3_accelerator_core::gateway;
 use s3_accelerator_core::layout::Layout;
 use s3_accelerator_core::node::{self, BucketPolicy, Freshness};
 use s3_accelerator_core::store::StoreConfig;
@@ -74,6 +75,10 @@ pub struct CacheConfig {
     pub doorkeeper_window: u64,
     pub fill_budget: u64,
     pub metadata_capacity: usize,
+    /// Objects whose metadata the gateway keeps, and how long it keeps
+    /// metadata of objects that may change, in milliseconds.
+    pub gateway_metadata_capacity: usize,
+    pub gateway_metadata_ttl_ms: u64,
     pub default_policy: PolicyConfig,
     pub buckets: BTreeMap<String, PolicyConfig>,
 }
@@ -89,6 +94,8 @@ impl Default for CacheConfig {
             doorkeeper_window: 100_000,
             fill_budget: 64 << 20,
             metadata_capacity: 100_000,
+            gateway_metadata_capacity: 100_000,
+            gateway_metadata_ttl_ms: 1_000,
             default_policy: PolicyConfig::default(),
             buckets: BTreeMap::new(),
         }
@@ -128,6 +135,17 @@ impl PolicyConfig {
 }
 
 impl CacheConfig {
+    pub fn gateway_config(&self) -> gateway::Config {
+        let node = self.node_config();
+        gateway::Config {
+            layout: node.layout,
+            default_policy: node.default_policy,
+            buckets: node.buckets,
+            metadata_capacity: self.gateway_metadata_capacity,
+            metadata_ttl: self.gateway_metadata_ttl_ms,
+        }
+    }
+
     pub fn node_config(&self) -> node::Config {
         node::Config {
             layout: Layout::new(self.block_size, self.chunk_blocks),

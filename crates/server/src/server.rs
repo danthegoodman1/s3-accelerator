@@ -44,7 +44,11 @@ pub async fn run(listener: TcpListener, config: Config) -> io::Result<()> {
         config.max_body,
     ));
     let context = Rc::new(Context {
-        engine: Engine::new(config.cache.node_config(), origin.clone()),
+        engine: Engine::new(
+            config.cache.node_config(),
+            config.cache.gateway_config(),
+            origin.clone(),
+        ),
         origin,
         clients: config.clients,
         max_body: config.max_body,

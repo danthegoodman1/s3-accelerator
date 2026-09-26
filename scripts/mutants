@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Plants known bugs, one at a time, in a scratch copy of the workspace and
-reports whether the core's unit tests, the simulator's scenarios or a seed
-sweep catch each one.
+reports whether the core's unit tests, the server's tests, the simulator's
+tests (scenarios and regression seeds) or a seed sweep catch each one.
 
-    scripts/mutants [--seeds N] [--only NAME]
+    scripts/mutants [--seeds N] [--only NAME] [--check]
 
 A mutant is a list of replacements; each must match exactly once, ignoring
 whitespace, so formatting changes leave the mutants intact. The copy lives
@@ -22,6 +22,7 @@ from pathlib import Path
 
 NODE = "crates/core/src/node.rs"
 STORE = "crates/core/src/store.rs"
+GATEWAY = "crates/core/src/gateway.rs"
 SERVER = "crates/server/src/server.rs"
 STEP_TIMEOUT = 600
 
@@ -29,7 +30,7 @@ MUTANTS = [
     (
         "fill accepts any version",
         [
-            (NODE, "if_match: Some(meta.etag.clone()),", "if_match: None,"),
+            (NODE, "if_match: Some(etag.clone()),", "if_match: None,"),
             (NODE, "&& head.etag.as_ref() == Some(etag)", ""),
         ],
     ),
@@ -63,7 +64,7 @@ MUTANTS = [
     ),
     (
         "416 relayed despite preconditions",
-        [(NODE, "if relay && head.status == 416 && preconditions {", "if false {")],
+        [(NODE, "if relay && head.status == 416 && conditional {", "if false {")],
     ),
     (
         "stale request sent back twice",
@@ -118,6 +119,49 @@ MUTANTS = [
         [(SERVER, 'if key.split(\'/\').any(|segment| segment == "." || segment == "..") {', "if false {")],
     ),
     (
+        "parts assembled out of order",
+        [(GATEWAY, "let (head, parts) = (planned.clone(), parts.clone());",
+          "let (head, parts) = (planned.clone(), parts.iter().rev().copied().collect());")],
+    ),
+    (
+        "a stale gateway entry is kept",
+        [(GATEWAY, "self.cache.remove(&key);\n        self.plan(now, id);", "self.plan(now, id);")],
+    ),
+    (
+        "nodes store blocks they do not own",
+        [(NODE, "if self.ring.owner(placement) != Some(self.id) {", "if false {")],
+    ),
+    (
+        "gateway metadata used past the bucket's ttl",
+        [(GATEWAY, "cached.validated.0 + bucket_ttl >= arrived.0 && cached.received.0 + ttl >= arrived.0",
+          "cached.received.0 + ttl >= arrived.0")],
+    ),
+    (
+        "the home serves blocks it does not hold",
+        [(NODE, "if beyond_home {", "if false {")],
+    ),
+    (
+        "the proxying gateway keeps its entry after a write",
+        [(GATEWAY, "self.cache.written(key, now);", "let _ = (key, now);")],
+    ),
+    (
+        "an answer older than a write restores the gateway's entry",
+        [(GATEWAY, "Some(entry) if sent < entry.written => return,", "")],
+    ),
+    (
+        "the gateway sends preconditions to the home",
+        [(GATEWAY, "if !direct && let Some(cached) = self.cache.fresh(&key, arrived, policy, ttl) {",
+          "if !direct && self.reads[&id].request.if_none_match.is_none() && let Some(cached) = self.cache.fresh(&key, arrived, policy, ttl) {")],
+    ),
+    (
+        "a read that keeps finding its object changed never goes direct",
+        [(GATEWAY, "let direct = read.retries >= STALE_RETRIES;", "let direct = false;")],
+    ),
+    (
+        "the home ignores stale reports",
+        [(NODE, "stale.take().is_some_and(|stale| stale == meta.etag)", "false")],
+    ),
+    (
         "metadata never forgotten",
         [(NODE, "while self.recency.len() > self.config.metadata_capacity && kept < self.recency.len() {",
           "while false {")],
@@ -129,6 +173,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--seeds", type=int, default=300)
     parser.add_argument("--only")
+    parser.add_argument("--check", action="store_true", help="only check that every mutant applies")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent.parent
@@ -136,6 +181,17 @@ def main():
     copy = work / "src"
     target = work / "target"
     results = []
+    if args.check:
+        broken = 0
+        for name, replacements in MUTANTS:
+            if args.only and args.only != name:
+                continue
+            for path, old, new in replacements:
+                count = len(list(re.finditer(pattern(old), (root / path).read_text())))
+                if count != 1:
+                    print(f"{name}: {count} matches in {path}")
+                    broken += 1
+        sys.exit(1 if broken else 0)
     for name, replacements in MUTANTS:
         if args.only and args.only != name:
             continue
@@ -149,8 +205,7 @@ def main():
         for path, old, new in replacements:
             file = copy / path
             text = file.read_text()
-            pattern = r"\s*".join(re.escape(char) for char in old if not char.isspace())
-            matches = list(re.finditer(pattern, text))
+            matches = list(re.finditer(pattern(old), text))
             if len(matches) != 1:
                 sys.exit(f"{name}: expected one match in {path}, found {len(matches)}, for:\n{old}")
             match = matches[0]
@@ -165,8 +220,13 @@ def main():
         sys.exit(1)
 
 
+def pattern(old):
+    """A regex for `old` that ignores whitespace."""
+    return r"\s*".join(re.escape(char) for char in old if not char.isspace())
+
+
 def catch(copy, target, seeds):
-    """Which layer catches the mutant: unit tests, scenarios, seeds, or none."""
+    """Which layer catches the mutant, or MISSED."""
     env = {"CARGO_TARGET_DIR": str(target)}
     build = run(copy, env, ["cargo", "build", "-q", "--release", "--workspace", "--tests", "--bins"])
     if build is None or build.returncode != 0:
@@ -175,7 +235,7 @@ def catch(copy, target, seeds):
     layers = [
         ("core unit tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator-core"]),
         ("server tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator"]),
-        ("scenarios", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator-sim", "--test", "scenarios"]),
+        ("sim tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator-sim"]),
         ("seeds", ["cargo", "run", "-q", "--release", "-p", "s3-accelerator-sim", "--", "0",
                    "--seeds", str(seeds)]),
     ]

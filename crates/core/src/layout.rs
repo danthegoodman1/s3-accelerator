@@ -48,12 +48,47 @@ impl Layout {
     /// holds chunk 0 and every block overlapping the final chunk-sized
     /// region, so objects up to two chunks live entirely on their home.
     pub fn placement(self, key: &ObjectKey, size: u64, index: u64) -> Placement<'_> {
-        let tail_start = size.saturating_sub(self.chunk_size());
-        if index < self.chunk_blocks || (index + 1) * self.block_size > tail_start {
-            Placement::Home(key)
-        } else {
-            Placement::Chunk(key, index / self.chunk_blocks)
+        match self.chunk(size, index) {
+            None => Placement::Home(key),
+            Some(chunk) => Placement::Chunk(key, chunk),
         }
+    }
+
+    /// The chunk block `index` is placed by, or `None` for the home's region.
+    fn chunk(self, size: u64, index: u64) -> Option<u64> {
+        let tail_start = size.saturating_sub(self.chunk_size());
+        let home = index < self.chunk_blocks || (index + 1) * self.block_size > tail_start;
+        (!home).then_some(index / self.chunk_blocks)
+    }
+
+    /// Bytes `first..=last` split into runs that share a placement, in
+    /// order.
+    pub fn runs(
+        self,
+        key: &ObjectKey,
+        size: u64,
+        first: u64,
+        last: u64,
+    ) -> Vec<(Placement<'_>, u64, u64)> {
+        let mut runs: Vec<(Option<u64>, u64, u64)> = Vec::new();
+        for index in self.blocks_covering(first, last) {
+            let chunk = self.chunk(size, index);
+            let span = self.block_span(size, index);
+            let (start, end) = (span.start.max(first), (span.end - 1).min(last));
+            match runs.last_mut() {
+                Some((run_chunk, _, run_end)) if *run_chunk == chunk => *run_end = end,
+                _ => runs.push((chunk, start, end)),
+            }
+        }
+        runs.into_iter()
+            .map(|(chunk, start, end)| {
+                let placement = match chunk {
+                    None => Placement::Home(key),
+                    Some(chunk) => Placement::Chunk(key, chunk),
+                };
+                (placement, start, end)
+            })
+            .collect()
     }
 }
 
@@ -84,6 +119,24 @@ mod tests {
         assert_eq!(layout.block_span(25, 2), 20..25);
         assert_eq!(layout.blocks_covering(9, 10), 0..=1);
         assert_eq!(layout.blocks_covering(20, 24), 2..=2);
+    }
+
+    #[test]
+    fn runs_group_bytes_by_placement() {
+        // 125 bytes: chunk 0 (0..40) and the tail (80..125) are the home's.
+        let layout = Layout::new(10, 4);
+        let runs: Vec<(Option<u64>, u64, u64)> = layout
+            .runs(&key(), 125, 5, 124)
+            .into_iter()
+            .map(|(placement, first, last)| {
+                let chunk = match placement {
+                    Placement::Home(_) => None,
+                    Placement::Chunk(_, chunk) => Some(chunk),
+                };
+                (chunk, first, last)
+            })
+            .collect();
+        assert_eq!(runs, [(None, 5, 39), (Some(1), 40, 79), (None, 80, 124)]);
     }
 
     #[test]

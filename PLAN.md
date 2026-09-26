@@ -162,15 +162,15 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 2A: Gateway read planning | Missing: implementation and unit tests. |
-| Incomplete | Work | 2B: Multi-owner response assembly | Missing: implementation. |
-| Incomplete | Work | 2C: Gateway metadata cache | Missing: implementation and stale-entry coverage. |
-| Incomplete | Work | 2D: Chunk owner fills and non-owner behavior | Missing: implementation. |
-| Incomplete | Work | 2E: Simulator gateways and per-node metrics | Missing: simulator changes. |
-| Incomplete | Work | 2F: Response headers in metadata | Missing: core, model and server changes, and a conformance test. |
-| Incomplete | Test | Planted bugs for Phase 2 | Missing: `scripts/mutants` entries and report. |
-| Incomplete | Gate | 10,000-seed sweep | Missing: sweep output. |
-| Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
+| Complete | Work | 2A: Gateway read planning | `Gateway::plan`, `plan_with` and `owners` over `Layout::runs` in `crates/core/src/gateway.rs`; the home answers `Action::Metadata` when a read reaches blocks it does not own (`Node::plan`); scenario `a_large_object_spreads_across_owners`; mutant "the home serves blocks it does not hold". |
+| Complete | Work | 2B: Multi-owner response assembly | `gateway::Action::Relay` lists parts in order; the simulator and the server's engine concatenate them, and the engine answers 500 if a part is missing; mutant "parts assembled out of order". |
+| Complete | Work | 2C: Gateway metadata cache | LRU `MetadataCache` with write markers; freshness bounded by the bucket TTL from the home's confirmation and by `metadata_ttl`; stale parts drop the entry and report the ETag to the home; after `STALE_RETRIES` the home reads S3 directly (`Read::Object { direct }`). Scenarios `the_gateway_answers_heads_and_preconditions_itself`, `a_gateway_with_a_stale_etag_reads_the_new_version`, `a_stale_report_makes_the_home_revalidate`, `an_answer_older_than_a_write_is_not_cached`, `a_read_of_an_object_that_keeps_changing_finishes`; mutants for each. |
+| Complete | Work | 2D: Chunk owner fills and non-owner behavior | `Node::read_range` fills with the ETag the gateway names; only owners admit blocks (`Node::admit`); the simulator misroutes a seed-drawn share of range reads and checks on every write that a node stores only blocks it owns (`check_owned`); mutant "nodes store blocks they do not own". |
+| Complete | Work | 2E: Simulator gateways and per-node metrics | `Options` draws gateway cache size and TTL and a misroute share; `Summary::node_reads` (seed 2: reads per node 62, 557, 44, 1,102, 68, 63). |
+| Complete | Work | 2F: Response headers in metadata | Commit `2F: carry object headers in metadata`; conformance `object_headers_come_back_with_every_read` passes against s3proxy and through the accelerator. |
+| Complete | Test | Planted bugs for Phase 2 | `scripts/mutants`: 35 of 35 caught, 11 of them Phase 2's. The direct-read mutant was first missed because its scenario read blocks the home owns, whose failed fill makes the retry a first fetch; the scenario now reads one middle chunk. |
+| Complete | Gate | 10,000-seed sweep | `cargo run --release -p s3-accelerator-sim -- 0 --seeds 10000`: 0 of 10,000 failed, after the review fixes. A draft of this phase livelocked under zero network delay (the home was not told of stale ETags); the simulator now fails any tick with over a million events. |
+| Complete | Gate | Code review | `/code-review high` found 10 issues, all resolved: write markers and newest-wins in the gateway cache; a stale-retry cap ending in a direct read; misroutes and new options on their own draws; ownership, not placement kind, decides the home's redirect; `--check` exits non-zero; mutants for the gateway's write invalidation and local preconditions; one `s3::answer` shared by gateway and node; placement computed per run; a missing part answers 500; `CachedMeta` wraps `ObjectMeta`. |
 
 ## Phase 3: Faults
 

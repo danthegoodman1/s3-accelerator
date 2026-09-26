@@ -151,6 +151,8 @@ fn the_fill_budget_caps_blocks_filling_at_once() {
 fn the_home_forgets_its_least_recently_used_metadata() {
     let mut options = Options::scenario();
     options.metadata_capacity = 2;
+    // The gateway remembers only the last object, so the HEADs reach the home.
+    options.gateway_metadata_capacity = 1;
     let mut sim = Simulator::new(1, options);
     let [a, b, c] = ["a", "b", "c"].map(|name| key(IMMUTABLE_BUCKET, name));
     for key in [&a, &b, &c] {
@@ -208,6 +210,169 @@ fn a_first_fetch_sent_before_a_write_is_not_kept() {
     sim.write_through(&key, 120).unwrap();
     let (_, old) = sim.finish(racing).unwrap();
     assert_eq!(old.len(), 100);
+    let (head, body) = sim.read(Request::get(key.clone())).unwrap();
+    let current = sim.origin().current(&key).unwrap();
+    assert_eq!(head.etag.as_ref(), Some(&current.etag));
+    assert_eq!(body.len(), 120);
+}
+
+/// Four nodes; 64-byte blocks, 2-block chunks: a 2 KiB object has 16
+/// chunks placed across the cluster.
+fn cluster() -> Options {
+    let mut options = Options::scenario();
+    options.nodes = 4;
+    options.chunk_blocks = 2;
+    options
+}
+
+fn nodes_read(sim: &Simulator) -> usize {
+    sim.summary()
+        .node_reads
+        .iter()
+        .filter(|&&reads| reads > 0)
+        .count()
+}
+
+/// A home that knows the object answers with its metadata, and the
+/// gateway reads each chunk from its owner.
+#[test]
+fn a_large_object_spreads_across_owners() {
+    let mut options = cluster();
+    // The gateway keeps no metadata, so every read asks the home.
+    options.gateway_metadata_ttl = 0;
+    let mut sim = Simulator::new(1, options);
+    let key = key(TTL_BUCKET, "large");
+    sim.put(&key, 2_048);
+    sim.read(Request::get(key.clone())).unwrap();
+    assert_eq!(
+        nodes_read(&sim),
+        1,
+        "the cold read is the home's first fetch"
+    );
+    let (_, body) = sim.read(Request::get(key)).unwrap();
+    assert_eq!(body.len(), 2_048);
+    assert!(
+        nodes_read(&sim) >= 3,
+        "reads per node: {:?}",
+        sim.summary().node_reads
+    );
+}
+
+#[test]
+fn the_gateway_answers_heads_and_preconditions_itself() {
+    let mut sim = Simulator::new(1, cluster());
+    let key = key(IMMUTABLE_BUCKET, "k");
+    sim.put(&key, 300);
+    let (head, _) = sim.read(Request::get(key.clone())).unwrap();
+    let reads = sim.summary().node_reads.iter().sum::<u64>();
+    assert_eq!(sim.read(Request::head(key.clone())).unwrap().0.status, 200);
+    let unchanged = Request {
+        if_none_match: head.etag,
+        ..Request::get(key)
+    };
+    assert_eq!(sim.read(unchanged).unwrap().0.status, 304);
+    assert_eq!(sim.summary().node_reads.iter().sum::<u64>(), reads);
+}
+
+/// An object changed behind the cache: the owner's `If-Match` fill fails,
+/// and the gateway forgets the ETag and reads the new version.
+#[test]
+fn a_gateway_with_a_stale_etag_reads_the_new_version() {
+    let mut options = cluster();
+    options.ttl = 1_000_000;
+    let mut sim = Simulator::new(1, options);
+    let key = key(TTL_BUCKET, "k");
+    sim.put(&key, 1_024);
+    sim.read(Request::get(key.clone())).unwrap();
+    sim.put(&key, 1_000);
+    let (head, body) = sim.read(Request::get(key.clone())).unwrap();
+    let current = sim.origin().current(&key).unwrap();
+    assert_eq!(head.etag.as_ref(), Some(&current.etag));
+    assert_eq!(body.len(), 1_000);
+    assert!(sim.summary().retries >= 1);
+}
+
+/// A read of middle chunks only reaches their owners. When those find the
+/// ETag stale, the home must hear of it and revalidate, so one retry
+/// suffices; otherwise it hands out the old ETag again until the read gives
+/// up and goes to S3 directly. The simulator found the missing report as a
+/// livelock under zero network delay.
+#[test]
+fn a_stale_report_makes_the_home_revalidate() {
+    let mut options = cluster();
+    options.ttl = 1_000_000;
+    let mut sim = Simulator::new(1, options);
+    let key = key(TTL_BUCKET, "k");
+    sim.put(&key, 2_048);
+    sim.read(Request::get(key.clone())).unwrap();
+    sim.put(&key, 2_048);
+    // Chunk 4 alone, so one owner answers and one stale message comes back.
+    let middle = Request {
+        range: Some(ByteRange::Inclusive {
+            first: 512,
+            last: 639,
+        }),
+        ..Request::get(key.clone())
+    };
+    let (head, _) = sim.read(middle).unwrap();
+    let current = sim.origin().current(&key).unwrap();
+    assert_eq!(head.etag.as_ref(), Some(&current.etag));
+    assert_eq!(sim.summary().retries, 1);
+}
+
+/// Every attempt to read a middle chunk finds the object changed: each
+/// stale report makes the home revalidate and hand out a newer ETag, which
+/// is stale again by the time its owner fills. After a few retries the
+/// gateway reads S3 directly, and the read finishes.
+#[test]
+fn a_read_of_an_object_that_keeps_changing_finishes() {
+    let mut options = cluster();
+    options.ttl = 1_000_000;
+    let mut sim = Simulator::new(1, options);
+    let key = key(TTL_BUCKET, "k");
+    sim.put(&key, 2_048);
+    sim.read(Request::get(key.clone())).unwrap();
+    let middle = Request {
+        range: Some(ByteRange::Inclusive {
+            first: 512,
+            last: 639,
+        }),
+        ..Request::get(key.clone())
+    };
+    let request = sim.start(middle);
+    for _ in 0..1_000 {
+        if let Some((head, body)) = sim.take_answer(request) {
+            assert_eq!((head.status, body.len()), (206, 128));
+            return;
+        }
+        sim.put(&key, 2_048);
+        sim.step().unwrap();
+    }
+    panic!("the read never finished");
+}
+
+/// A home's answer that reaches the gateway after a write through that
+/// gateway predates the write, so it must not restore the gateway's entry.
+#[test]
+fn an_answer_older_than_a_write_is_not_cached() {
+    let mut options = Options::scenario();
+    options.ttl = 1_000_000;
+    options.ttl_admit_on_first_read = true;
+    options.gateway_metadata_capacity = 1;
+    let mut sim = Simulator::new(1, options);
+    let [key, other] = ["k", "other"].map(|name| key(TTL_BUCKET, name));
+    sim.put(&key, 100);
+    sim.put(&other, 100);
+    sim.read(Request::get(key.clone())).unwrap();
+    // The gateway forgets `key`; the home still knows it.
+    sim.read(Request::get(other)).unwrap();
+    let racing = sim.start(Request::get(key.clone()));
+    // The home answers on the third tick; the answer reaches the gateway after it.
+    for _ in 0..3 {
+        sim.step().unwrap();
+    }
+    sim.write_through(&key, 120).unwrap();
+    sim.finish(racing).unwrap();
     let (head, body) = sim.read(Request::get(key.clone())).unwrap();
     let current = sim.origin().current(&key).unwrap();
     assert_eq!(head.etag.as_ref(), Some(&current.etag));

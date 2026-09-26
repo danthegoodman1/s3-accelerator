@@ -39,19 +39,20 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(config: node::Config, origin: Rc<Origin>) -> Shared {
+    pub fn new(config: node::Config, gateway: gateway::Config, origin: Rc<Origin>) -> Shared {
         let member = Member {
             id: NodeId(0),
             weight: NonZeroU32::MIN,
         };
+        let ring = Ring::new(1, vec![member]);
         let extents = (0..config.store.extents)
             .map(|_| vec![0; config.store.extent_size as usize])
             .collect();
         Rc::new(RefCell::new(Engine {
             started: Instant::now(),
             origin,
-            gateway: Gateway::new(Ring::new(1, vec![member])),
-            node: Node::new(config),
+            gateway: Gateway::new(ring.clone(), gateway),
+            node: Node::new(NodeId(0), ring, config),
             extents,
             bodies: BTreeMap::new(),
             next_id: 0,
@@ -70,7 +71,8 @@ impl Engine {
             let mut this = engine.borrow_mut();
             let id = ClientRequestId(this.next_id());
             this.clients.insert(id, sender);
-            this.gateway.on_request(id, request);
+            let now = this.now();
+            this.gateway.on_request(now, id, request);
             this.pump()
         };
         start_fetches(engine, fetches);
@@ -83,6 +85,7 @@ impl Engine {
             let mut this = engine.borrow_mut();
             let now = this.now();
             this.node.on_write(now, key);
+            this.gateway.on_write(now, key);
             this.pump()
         };
         start_fetches(engine, fetches);
@@ -108,31 +111,47 @@ impl Engine {
 
     fn gateway_action(&mut self, action: gateway::Action) {
         match action {
-            gateway::Action::Send { id, request, .. } => {
+            gateway::Action::Send { id, read, .. } => {
                 let local = GatewayRequestId(self.next_id());
                 self.node_requests.insert(local, id);
                 let now = self.now();
-                self.node.on_request(now, local, request);
+                self.node.on_request(now, local, read);
             }
             gateway::Action::Relay {
                 request,
                 head,
                 from,
             } => {
-                let body = self.relayed.remove(&from).unwrap_or_default();
-                self.answer(request, head, body);
+                let parts: Option<Vec<Bytes>> =
+                    from.iter().map(|part| self.relayed.remove(part)).collect();
+                match parts {
+                    Some(parts) if parts.len() == 1 => {
+                        let body = parts.into_iter().next().expect("one part");
+                        self.answer(request, head, body);
+                    }
+                    Some(parts) => self.answer(request, head, Bytes::from(parts.concat())),
+                    // Every part's body arrives before its relay; a missing
+                    // one is a bug, and the client gets an error, not a
+                    // short body.
+                    None => self.answer(request, ResponseHead::status(500), Bytes::new()),
+                }
             }
             gateway::Action::Respond { request, head } => self.answer(request, head, Bytes::new()),
+            gateway::Action::Discard { id } => {
+                self.relayed.remove(&id);
+            }
         }
     }
 
     fn node_action(&mut self, action: node::Action) {
+        let now = self.now();
         match action {
             node::Action::Fetch { origin, request } => self.fetches.push((origin, request)),
             node::Action::Respond {
                 request,
                 head,
                 body,
+                meta,
             } => {
                 let bytes = self.assemble(&body);
                 let id = self
@@ -140,15 +159,22 @@ impl Engine {
                     .remove(&request)
                     .expect("a gateway asked");
                 self.relayed.insert(id, bytes);
-                self.gateway.on_node_response(id, head);
+                self.gateway.on_node_response(now, id, head, meta);
                 self.node.on_sent(request);
+            }
+            node::Action::Metadata { request, meta } => {
+                let id = self
+                    .node_requests
+                    .remove(&request)
+                    .expect("a gateway asked");
+                self.gateway.on_node_metadata(now, id, meta);
             }
             node::Action::Stale { request } => {
                 let id = self
                     .node_requests
                     .remove(&request)
                     .expect("a gateway asked");
-                self.gateway.on_node_stale(id);
+                self.gateway.on_node_stale(now, id);
             }
             node::Action::Write {
                 location,

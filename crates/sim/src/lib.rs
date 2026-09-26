@@ -23,7 +23,8 @@ use s3_accelerator_core::Time;
 use s3_accelerator_core::gateway::{self, ClientRequestId, Gateway, NodeRequestId};
 use s3_accelerator_core::layout::Layout;
 use s3_accelerator_core::node::{
-    self, BucketPolicy, Freshness, GatewayRequestId, Node, OriginRequestId, Segment,
+    self, BucketPolicy, Freshness, GatewayRequestId, Node, ObjectMeta, OriginRequestId, Read,
+    Segment,
 };
 use s3_accelerator_core::placement::{Member, NodeId, Placement, Ring};
 use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
@@ -32,6 +33,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU32;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
+
+/// More events than any tick of a live run delivers: with zero delays, a
+/// retry loop would otherwise spin within one tick forever.
+const EVENTS_PER_TICK: u64 = 1_000_000;
 
 /// Objects in this bucket are written once and never change.
 pub const IMMUTABLE_BUCKET: &str = "immutable";
@@ -53,6 +58,13 @@ pub struct Options {
     pub fill_budget_blocks: u64,
     /// Objects whose metadata a home keeps.
     pub metadata_capacity: usize,
+    /// Objects whose metadata a gateway keeps, and for how many ticks it
+    /// keeps metadata of objects that may change.
+    pub gateway_metadata_capacity: usize,
+    pub gateway_metadata_ttl: u64,
+    /// Chance that a gateway's range read reaches a node that does not own
+    /// its blocks, as when gateways and nodes disagree about the ring.
+    pub misroute_percent: u64,
     /// Freshness of the TTL bucket's metadata, in ticks.
     pub ttl: u64,
     pub immutable_admit_on_first_read: bool,
@@ -110,6 +122,11 @@ impl Options {
             delay_max: delay_min + prng.range(0..=20),
             disk_delay_max: prng.range(0..=6),
             send_delay_max: prng.range(0..=6),
+            // Options added since Phase 1 draw last, so earlier ones keep
+            // their values for every seed.
+            gateway_metadata_capacity: prng.range(1..=32) as usize,
+            gateway_metadata_ttl: prng.range(0..=200),
+            misroute_percent: prng.range(0..=20),
         }
     }
 
@@ -128,6 +145,9 @@ impl Options {
             doorkeeper_window: 1_024,
             fill_budget_blocks: 64,
             metadata_capacity: 1_024,
+            gateway_metadata_capacity: 1_024,
+            gateway_metadata_ttl: 1_000,
+            misroute_percent: 0,
             ttl: 1_000,
             immutable_admit_on_first_read: false,
             ttl_admit_on_first_read: false,
@@ -142,6 +162,17 @@ impl Options {
             delay_max: 1,
             disk_delay_max: 1,
             send_delay_max: 1,
+        }
+    }
+
+    fn gateway_config(&self) -> gateway::Config {
+        let node = self.node_config();
+        gateway::Config {
+            layout: node.layout,
+            default_policy: node.default_policy,
+            buckets: node.buckets,
+            metadata_capacity: self.gateway_metadata_capacity,
+            metadata_ttl: self.gateway_metadata_ttl,
         }
     }
 
@@ -198,7 +229,7 @@ enum Message {
     NodeRequest {
         gateway: usize,
         id: NodeRequestId,
-        read: Request,
+        read: Read,
     },
     OriginRequest {
         node: usize,
@@ -214,6 +245,11 @@ enum Message {
         id: NodeRequestId,
         head: ResponseHead,
         body: Vec<u8>,
+        meta: Option<ObjectMeta>,
+    },
+    NodeMetadata {
+        id: NodeRequestId,
+        meta: ObjectMeta,
     },
     NodeStale {
         id: NodeRequestId,
@@ -260,6 +296,7 @@ struct Write {
 struct Sending {
     head: ResponseHead,
     body: Vec<Segment>,
+    meta: Option<ObjectMeta>,
 }
 
 pub struct Simulator {
@@ -270,6 +307,7 @@ pub struct Simulator {
     workload: Prng,
     writers: Prng,
     network: Prng,
+    misroutes: Prng,
     disk_delays: Prng,
     send_delays: Prng,
     now: u64,
@@ -332,6 +370,7 @@ impl Simulator {
             workload: Prng::stream(seed, "workload"),
             writers: Prng::stream(seed, "writers"),
             network: Prng::stream(seed, "network"),
+            misroutes: Prng::stream(seed, "misroutes"),
             disk_delays: Prng::stream(seed, "disk delays"),
             send_delays: Prng::stream(seed, "send delays"),
             now: 0,
@@ -340,10 +379,10 @@ impl Simulator {
             keys,
             ring: ring.clone(),
             gateways: (0..options.gateways)
-                .map(|_| Gateway::new(ring.clone()))
+                .map(|_| Gateway::new(ring.clone(), options.gateway_config()))
                 .collect(),
             nodes: (0..options.nodes)
-                .map(|_| Node::new(config.clone()))
+                .map(|index| Node::new(NodeId(index as u64), ring.clone(), config.clone()))
                 .collect(),
             disks: (0..options.nodes)
                 .map(|_| Disk::new(config.store.extents, config.store.extent_size))
@@ -406,6 +445,7 @@ impl Simulator {
             .expect("a node")
             .0 as usize;
         self.nodes[home].on_write(Time(self.now), key);
+        self.gateways[0].on_write(Time(self.now), key);
         self.drain_node(home)
     }
 
@@ -441,6 +481,11 @@ impl Simulator {
         answer.ok_or_else(|| self.failure(format!("request {request} was never started")))
     }
 
+    /// The answer to a started request, once it has arrived.
+    pub fn take_answer(&mut self, request: u64) -> Option<(ResponseHead, Vec<u8>)> {
+        self.watched.get_mut(&request)?.take()
+    }
+
     /// Runs one tick.
     pub fn step(&mut self) -> Result<(), Failure> {
         self.tick()
@@ -456,6 +501,7 @@ impl Simulator {
             summary.miss_bytes += stats.miss_bytes;
             summary.written_bytes += stats.written_bytes;
             summary.evicted_blocks += stats.evicted_blocks;
+            summary.node_reads.push(stats.reads);
         }
         summary
     }
@@ -463,7 +509,12 @@ impl Simulator {
     fn tick(&mut self) -> Result<(), Failure> {
         self.tick_writes();
         self.tick_clients();
+        let mut events = 0;
         while let Some(event) = self.queue.pop_due(self.now) {
+            events += 1;
+            if events > EVENTS_PER_TICK {
+                return Err(self.failure("livelock: events keep arriving within one tick".into()));
+            }
             self.handle(event)?;
         }
         if self.now.is_multiple_of(64) {
@@ -486,10 +537,15 @@ impl Simulator {
             + self.origin_bodies.len()
             + self.writes.len()
             + self.sending.len();
-        let busy = self.nodes.iter().filter(|node| !node.is_idle()).count();
+        let busy = self.nodes.iter().filter(|node| !node.is_idle()).count()
+            + self
+                .gateways
+                .iter()
+                .filter(|gateway| !gateway.is_idle())
+                .count();
         if stranded > 0 || busy > 0 {
             return Err(self.failure(format!(
-                "{stranded} requests or bodies stranded and {busy} nodes busy after the last response"
+                "{stranded} requests or bodies stranded and {busy} nodes or gateways busy after the last response"
             )));
         }
         Ok(())
@@ -608,17 +664,29 @@ impl Simulator {
             (Address::Gateway(gateway), Message::ClientRequest { request, read }) => {
                 let id = ClientRequestId(self.next_id());
                 self.gateway_requests.insert((gateway, id), request);
-                self.gateways[gateway].on_request(id, read);
+                self.gateways[gateway].on_request(now, id, read);
                 self.drain_gateway(gateway)
             }
-            (Address::Gateway(gateway), Message::NodeResponse { id, head, body }) => {
+            (
+                Address::Gateway(gateway),
+                Message::NodeResponse {
+                    id,
+                    head,
+                    body,
+                    meta,
+                },
+            ) => {
                 self.gateway_bodies.insert((gateway, id), body);
-                self.gateways[gateway].on_node_response(id, head);
+                self.gateways[gateway].on_node_response(now, id, head, meta);
+                self.drain_gateway(gateway)
+            }
+            (Address::Gateway(gateway), Message::NodeMetadata { id, meta }) => {
+                self.gateways[gateway].on_node_metadata(now, id, meta);
                 self.drain_gateway(gateway)
             }
             (Address::Gateway(gateway), Message::NodeStale { id }) => {
                 self.summary.retries += 1;
-                self.gateways[gateway].on_node_stale(id);
+                self.gateways[gateway].on_node_stale(now, id);
                 self.drain_gateway(gateway)
             }
             (Address::Node(node), Message::NodeRequest { gateway, id, read }) => {
@@ -653,32 +721,51 @@ impl Simulator {
     fn drain_gateway(&mut self, gateway: usize) -> Result<(), Failure> {
         for action in self.gateways[gateway].drain() {
             match action {
-                gateway::Action::Send { node, id, request } => {
-                    let message = Message::NodeRequest {
-                        gateway,
-                        id,
-                        read: request,
-                    };
-                    self.send(Address::Node(node.0 as usize), message);
+                gateway::Action::Send { node, id, read } => {
+                    let node = self.route(node.0 as usize, &read);
+                    let message = Message::NodeRequest { gateway, id, read };
+                    self.send(Address::Node(node), message);
                 }
                 gateway::Action::Relay {
                     request,
                     head,
                     from,
                 } => {
-                    let Some(body) = self.gateway_bodies.remove(&(gateway, from)) else {
-                        return Err(
-                            self.failure(format!("gateway {gateway} relayed {from:?} twice"))
-                        );
-                    };
+                    let mut body = Vec::new();
+                    for part in from {
+                        let Some(bytes) = self.gateway_bodies.remove(&(gateway, part)) else {
+                            return Err(
+                                self.failure(format!("gateway {gateway} relayed {part:?} twice"))
+                            );
+                        };
+                        body.extend_from_slice(&bytes);
+                    }
                     self.respond_to_client(gateway, request, head, body)?;
                 }
                 gateway::Action::Respond { request, head } => {
                     self.respond_to_client(gateway, request, head, Vec::new())?;
                 }
+                gateway::Action::Discard { id } => {
+                    if self.gateway_bodies.remove(&(gateway, id)).is_none() {
+                        return Err(
+                            self.failure(format!("gateway {gateway} discarded {id:?} twice"))
+                        );
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// Where a read goes: its node, or sometimes, for a range, another one.
+    fn route(&mut self, node: usize, read: &Read) -> usize {
+        let misroute = matches!(read, Read::Range(_))
+            && self.nodes.len() > 1
+            && self.misroutes.percent(self.options.misroute_percent);
+        match misroute {
+            true => (node + 1 + self.misroutes.index(self.nodes.len() - 1)) % self.nodes.len(),
+            false => node,
+        }
     }
 
     fn respond_to_client(
@@ -716,11 +803,22 @@ impl Simulator {
                     request,
                     head,
                     body,
+                    meta,
                 } => {
                     let delay = self.send_delays.range(0..=self.options.send_delay_max);
-                    self.sending.insert((node, request), Sending { head, body });
+                    self.sending
+                        .insert((node, request), Sending { head, body, meta });
                     self.queue
                         .push(self.now + delay, Event::Sent { node, id: request });
+                }
+                node::Action::Metadata { request, meta } => {
+                    let Some((gateway, id)) = self.node_requests.remove(&(node, request)) else {
+                        return Err(self.failure(format!("node {node} answered {request:?} twice")));
+                    };
+                    self.send(
+                        Address::Gateway(gateway),
+                        Message::NodeMetadata { id, meta },
+                    );
                 }
                 node::Action::Stale { request } => {
                     let Some((gateway, id)) = self.node_requests.remove(&(node, request)) else {
@@ -782,13 +880,14 @@ impl Simulator {
         self.disks[node].write(location, &bytes);
         self.nodes[node].on_written(location);
         self.check_disk(node, Some(location))?;
+        self.check_owned(node, location)?;
         self.drain_node(node)
     }
 
     /// Reads a response body as `sendfile` and `splice` would, at the moment
     /// it is sent, and forwards it.
     fn sent(&mut self, node: usize, id: GatewayRequestId) -> Result<(), Failure> {
-        let Sending { head, body } = self
+        let Sending { head, body, meta } = self
             .sending
             .remove(&(node, id))
             .expect("a send was scheduled");
@@ -826,6 +925,7 @@ impl Simulator {
             id: gateway_id,
             head,
             body: bytes,
+            meta,
         };
         self.send(Address::Gateway(gateway), response);
         self.nodes[node].on_sent(id);
@@ -878,6 +978,26 @@ impl Simulator {
         Ok(())
     }
 
+    /// A node stores only blocks it owns.
+    fn check_owned(&self, node: usize, location: Location) -> Result<(), Failure> {
+        let Some(block) = self.nodes[node].stored_block_at(location) else {
+            return Ok(());
+        };
+        let Some(object) = self.origin.version(block.etag) else {
+            return Ok(());
+        };
+        let layout = Layout::new(self.options.block_size, self.options.chunk_blocks);
+        let placement = layout.placement(block.key, object.size, block.index).hash();
+        let owner = self.ring.owner(placement).map(|id| id.0 as usize);
+        if owner != Some(node) {
+            return Err(self.failure(format!(
+                "node {node} stored block {} of {:?}, which node {owner:?} owns",
+                block.index, block.key
+            )));
+        }
+        Ok(())
+    }
+
     fn send(&mut self, to: Address, message: Message) {
         let delay = self
             .network
@@ -914,6 +1034,8 @@ pub struct Summary {
     pub miss_bytes: u64,
     pub written_bytes: u64,
     pub evicted_blocks: u64,
+    /// Requests each node received from gateways.
+    pub node_reads: Vec<u64>,
     /// A digest of every response: its request, tick, status and body.
     pub fingerprint: u64,
 }
@@ -937,7 +1059,7 @@ impl fmt::Display for Summary {
             f,
             "seed {} passed: {} ticks, {} writes, {} retries, responses {}, \
              {}% of body bytes from disk, {} S3 requests, {} bytes written, \
-             {} blocks evicted, fingerprint {:016x}",
+             {} blocks evicted, node reads {:?}, fingerprint {:016x}",
             self.seed,
             self.ticks,
             self.writes,
@@ -947,6 +1069,7 @@ impl fmt::Display for Summary {
             self.origin_requests,
             self.written_bytes,
             self.evicted_blocks,
+            self.node_reads,
             self.fingerprint
         )
     }
