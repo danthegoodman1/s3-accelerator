@@ -12,7 +12,7 @@
 
 ## Testing
 
-- Every behavior the spec names needs a simulator property or a scripted simulator scenario.
+- Every behavior the spec names needs a simulator property or a scripted simulator scenario, and a planted bug in `scripts/mutants` that one of them catches.
 - The simulator checks responses against its model of S3, never against the core's own state.
 - A seed replays its run exactly. The simulator draws from its own PRNG; give each new source of randomness its own `Prng::stream`, so it leaves existing draws unchanged.
 - A bug the simulator finds becomes a regression test in `crates/sim/tests` that runs its seed. The commit message records the seed and the commit that failed.
@@ -24,5 +24,6 @@
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 scripts/s3proxy start && cargo test --workspace -- --include-ignored
-cargo run --release -p s3-accelerator-sim [-- SEED]
+cargo run --release -p s3-accelerator-sim [-- SEED] [--seeds N]
+scripts/mutants
 ```

@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Plants known bugs, one at a time, in a scratch copy of the workspace and
+reports whether the core's unit tests, the simulator's scenarios or a seed
+sweep catch each one.
+
+    scripts/mutants [--seeds N] [--only NAME]
+
+A mutant is a list of replacements; each must match exactly once, ignoring
+whitespace, so formatting changes leave the mutants intact. The copy lives
+in target/mutants/src and shares one target directory, so each mutant
+recompiles only what it changed. A step that hangs counts as a catch. Exits
+non-zero if any mutant goes uncaught or fails to build.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+NODE = "crates/core/src/node.rs"
+STORE = "crates/core/src/store.rs"
+STEP_TIMEOUT = 600
+
+MUTANTS = [
+    (
+        "fill accepts any version",
+        [
+            (NODE, "if_match: Some(meta.etag.clone()),", "if_match: None,"),
+            (NODE, "&& head.etag.as_ref() == Some(etag)", ""),
+        ],
+    ),
+    (
+        "hit reads the wrong offset in its slot",
+        [(NODE, "let offset = piece.start - span.start;", "let offset = 0;")],
+    ),
+    (
+        "ttl metadata served past its age",
+        [(NODE, "Freshness::Ttl(ttl) => validated.0 + ttl >= arrived.0,", "Freshness::Ttl(_) => true,")],
+    ),
+    (
+        "doorkeeper admits on the first read",
+        [(NODE, "if !self.policy(&key.bucket).admit_on_first_read && !self.doorkeeper.contains(hash) {", "if false {")],
+    ),
+    (
+        "response leaves its blocks unpinned",
+        [(NODE, "self.store.pin(block);\n                holds.pins.push(block);", "")],
+    ),
+    (
+        "write leaves its body unheld",
+        [
+            (NODE, 'self.origins.get_mut(&origin).expect("written body exists").readers += 1;', ""),
+            (NODE, "self.stats.written_bytes += len;\n        if self.in_flight.get(&block) == Some(&origin) {\n            self.in_flight.remove(&block);\n            self.unref(block.version);\n        }\n        self.stop_reading(origin);",
+             "self.stats.written_bytes += len;\n        if self.in_flight.get(&block) == Some(&origin) {\n            self.in_flight.remove(&block);\n            self.unref(block.version);\n        }"),
+        ],
+    ),
+    (
+        "first fetch body read from the wrong offset",
+        [(NODE, 'self.origins.get_mut(&origin).expect("answered origin").body_start = first;', "")],
+    ),
+    (
+        "416 relayed despite preconditions",
+        [(NODE, "if relay && head.status == 416 && preconditions {", "if false {")],
+    ),
+    (
+        "stale request sent back twice",
+        [(NODE, "// A request awaiting several failed fills goes back once.\n        let Some(waiting) = self.waiting.remove(&id) else {\n            return;\n        };",
+          'let waiting = self.waiting.remove(&id).expect("a stale request was waiting");')],
+    ),
+    (
+        "revalidation keeps the old metadata",
+        [(NODE, "(200, Some(fresh)) => {\n                *meta = fresh;\n                *validated = sent;\n            }",
+          "(200, Some(_)) => *validated = sent,")],
+    ),
+    (
+        "concurrent first reads fetch separately",
+        [(NODE, "Some(Object::Fetching { waiting, .. }) => waiting.push(id),",
+          "Some(Object::Fetching { .. }) => self.first_fetch(now, id, Request::get(key.clone()), Vec::new(), true),")],
+    ),
+    (
+        "ghost queue ignored",
+        [(STORE, "if self.ghosts.contains_key(&entry.hash) {", "if false {")],
+    ),
+    (
+        "fill budget ignored",
+        [(NODE, "if self.filling_bytes + len > self.config.fill_budget {", "if false {")],
+    ),
+    (
+        "a pinned main queue blocks the small queue",
+        [(STORE, "(false, true) => true,", "(false, true) => self.small_bytes > small_target,")],
+    ),
+    (
+        "metadata never forgotten",
+        [(NODE, "while self.recency.len() > self.config.metadata_capacity && kept < self.recency.len() {",
+          "while false {")],
+    ),
+]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--seeds", type=int, default=300)
+    parser.add_argument("--only")
+    args = parser.parse_args()
+
+    root = Path(__file__).resolve().parent.parent
+    work = root / "target" / "mutants"
+    copy = work / "src"
+    target = work / "target"
+    results = []
+    for name, replacements in MUTANTS:
+        if args.only and args.only != name:
+            continue
+        print(f"== {name}", flush=True)
+        if copy.exists():
+            shutil.rmtree(copy)
+        shutil.copytree(root, copy, ignore=shutil.ignore_patterns("target", ".git"))
+        for path, old, new in replacements:
+            file = copy / path
+            text = file.read_text()
+            pattern = r"\s*".join(re.escape(char) for char in old if not char.isspace())
+            matches = list(re.finditer(pattern, text))
+            if len(matches) != 1:
+                sys.exit(f"{name}: expected one match in {path}, found {len(matches)}, for:\n{old}")
+            match = matches[0]
+            file.write_text(text[: match.start()] + new + text[match.end() :])
+        results.append((name, catch(copy, target, args.seeds)))
+
+    print()
+    width = max(len(name) for name, _ in results)
+    for name, outcome in results:
+        print(f"{name:<{width}}  {outcome}")
+    if any(outcome in ("MISSED", "did not build") for _, outcome in results):
+        sys.exit(1)
+
+
+def catch(copy, target, seeds):
+    """Which layer catches the mutant: unit tests, scenarios, seeds, or none."""
+    env = {"CARGO_TARGET_DIR": str(target)}
+    build = run(copy, env, ["cargo", "build", "-q", "--release", "--workspace", "--tests", "--bins"])
+    if build is None or build.returncode != 0:
+        print(build.stderr[-2000:] if build else "build timed out")
+        return "did not build"
+    layers = [
+        ("core unit tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator-core"]),
+        ("scenarios", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator-sim", "--test", "scenarios"]),
+        ("seeds", ["cargo", "run", "-q", "--release", "-p", "s3-accelerator-sim", "--", "0",
+                   "--seeds", str(seeds)]),
+    ]
+    for layer, command in layers:
+        result = run(copy, env, command)
+        if result is None:
+            return f"caught by {layer} (hung)"
+        if result.returncode != 0:
+            summary = next((line for line in result.stdout.splitlines() if " seeds from " in line), "")
+            return f"caught by {layer}" + (f" ({summary})" if summary else "")
+    return "MISSED"
+
+
+def run(cwd, env, command):
+    """The finished process, or None if it ran past the step timeout."""
+    try:
+        return subprocess.run(command, cwd=cwd, env={**os.environ, **env}, capture_output=True,
+                              text=True, timeout=STEP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+if __name__ == "__main__":
+    main()

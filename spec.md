@@ -87,10 +87,10 @@ A distributed NVMe read cache in front of S3. S3 remains the source of truth, an
 ### Consistency
 
 - **No mixed versions.** Blocks are keyed by `(bucket, key, etag, block_size, block_index)`, so a response never combines bytes from two versions of an object.
-- **Validated fills.** The home's first fetch of an object is unconditional, and its response sets the metadata: ETag, headers, and size from `Content-Range`. The home merges concurrent first fetches for a key into one. Every later fill carries `If-Match` with that ETag. A 412 or 404 drops the metadata. If the response hasn't started, the Gateway restarts the read; otherwise it ends the response early, and the client's retry reads the new version.
+- **Validated fills.** The home's first fetch of an object is unconditional, and its response sets the metadata: ETag, headers, and size from `Content-Range`. The home merges concurrent first fetches for a key into one. S3 checks preconditions before ranges, so when a first fetch returns 416 for a request with preconditions, the home fetches the metadata with a HEAD and answers the request itself. Every later fill carries `If-Match` with that ETag. A 412 or 404 drops the metadata; any other S3 error passes to the client and leaves the metadata in place. If the response hasn't started, the Gateway restarts the read; otherwise it ends the response early, and the client's retry reads the new version.
 - **Freshness mode**, set per bucket or prefix:
   - `immutable`: never revalidate. Use for content-addressed or never-overwritten keys.
-  - `ttl`: revalidate metadata with `If-None-Match` after a set age.
+  - `ttl`: after a set age, revalidate metadata with a HEAD carrying `If-None-Match`.
   - `events`: S3 Event Notifications invalidate metadata.
 - **Gateway metadata cache.** Gateways keep object metadata in a bounded LRU. Entries for `immutable` objects last until evicted; others expire after a short TTL. A stale entry is safe: an owner serves the old version consistently, or its fill fails `If-Match` and the Gateway drops the entry and retries.
 - **Writes go through the object's home.** Once the write succeeds, the home drops the metadata, or replaces it when warming on write. It discards any first fetch that started before then, so a read racing the write can't pin the old version. It forwards the invalidation to replica holders. The Gateway that proxied the write drops its own cached entry; other gateways catch up when their entries expire. Clusters in other zones see the change through their freshness mode.
@@ -103,7 +103,7 @@ The core decides what a node admits and evicts and which slot each block fills. 
 
 - **Layout:** preallocated files divided into 64 MiB extents. Each extent holds fixed-size slots of one size class, in powers of two from 4 KiB to 1 MiB. A block fills one slot, so it is a `(file, offset, length)` that `sendfile` serves directly. Freeing a block frees its slot, and the store never compacts or rewrites data. Rounding costs space: a 2 KiB manifest fills a 4 KiB slot.
 - **Size classes share the disk.** Extents move between classes as demand shifts. To give a class more room, the store empties an extent from another class by evicting its blocks.
-- **Object metadata** (size, ETag and headers) lives in small slots, keyed by bucket and key.
+- **Object metadata** (size, ETag and headers) lives in small slots, keyed by bucket and key. A home keeps metadata for a bounded number of objects and drops the least recently used; a dropped entry costs one first fetch.
 - **Index:** an in-memory map from block to slot, at about 100 bytes per block, so 4 TB of 1 MiB blocks needs about 400 MB. A slot table on disk, with one fixed-size record per slot, persists it. The store writes a block, syncs it, then writes its record, and it clears a slot's record before reusing the slot.
 - **Restarts and crashes:** the index survives restarts, so rolling deploys keep the cache warm. After a crash, a block's first hit reads it and verifies its checksum before `sendfile` serves it, and a mismatch counts as a miss. A clean shutdown marks the table, so the next start skips those checks.
 - **Memory:** the OS page cache holds hot blocks, and `sendfile` serves them from it. The kernel ranks pages read twice above pages read once, which shields hot blocks from scans.
@@ -156,4 +156,4 @@ The system is written in Rust.
 - **Workload targets:** object-size mix, request rate, working-set size, and hit-rate and latency goals. These set the chunk size, block size and hot-key thresholds.
 - **Chunk size:** larger chunks mean fewer hops per read; smaller chunks spread load more evenly.
 - **Grace window:** how long to keep previous-owner fallback after a ring change.
-- **Storage layout:** revisit once the simulator and NVMe benchmarks produce numbers. It carries three risks: rebalancing size classes evicts every block in an extent, hot ones included; the kernel decides what stays in memory; and fills land as random writes, which wear flash faster in small slots. A log-structured store is the fallback if these bite.
+- **Storage layout:** revisit once the simulator and NVMe benchmarks produce numbers. It carries three risks: rebalancing size classes evicts every block in an extent, hot ones included, and a reservation first evicts up to eight blocks of any class before it empties an extent; the kernel decides what stays in memory; and fills land as random writes, which wear flash faster in small slots. A log-structured store is the fallback if these bite.

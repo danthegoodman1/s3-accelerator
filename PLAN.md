@@ -85,17 +85,17 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 1A: Layout math | Missing: `core` layout module and unit tests. |
-| Incomplete | Work | 1B: Home metadata and validated fills | Missing: node implementation and simulator coverage of 412/404 restarts. |
-| Incomplete | Work | 1C: Freshness modes, `HeadObject`, client conditionals | Missing: implementation and properties for both modes. |
-| Incomplete | Work | 1D: Fill merging, range GET coalescing, streaming from filling blocks | Missing: implementation and tests. |
-| Incomplete | Work | 1E: Block store policy | Missing: slot allocator, S3-FIFO, doorkeeper, fill budget with unit tests. |
-| Incomplete | Work | 1F: Simulator disk model, sizes from seed, summary metrics | Missing: simulator changes. |
-| Incomplete | Test | 1G: Staleness-bounded response property and disk-content property | Missing: properties with checker unit tests. |
-| Incomplete | Test | 1H: Scan resistance and doorkeeper scenarios | Missing: scenario tests. |
-| Incomplete | Test | Planted bugs for Phase 1 | Missing: `scripts/mutants` and its report. |
-| Incomplete | Gate | 10,000-seed sweep | Missing: sweep command output. |
-| Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
+| Complete | Work | 1A: Layout math | `crates/core/src/layout.rs`; tests `spans_cover_the_object`, `objects_up_to_two_chunks_live_on_their_home`, `home_holds_chunk_0_and_the_final_chunk_sized_region`. The home serves every block this phase; stored blocks record their placement hash. |
+| Complete | Work | 1B: Home metadata and validated fills | `Node::first_fetch`, `first_answered`, `fill`, `fill_answered`, `stale` in `crates/core/src/node.rs`; `Gateway::on_node_stale`; scenario `a_request_whose_fills_all_fail_retries_once`; mutants "fill accepts any version", "stale request sent back twice". |
+| Complete | Work | 1C: Freshness modes, `HeadObject`, client conditionals | `Node::serve`, `revalidated`, `conditional_answer`; a 416 first fetch with preconditions falls back to a HEAD (`spec.md` Consistency); scenario `preconditions_come_before_an_unsatisfiable_range`; mutants "ttl metadata served past its age", "revalidation keeps the old metadata", "416 relayed despite preconditions". |
+| Complete | Work | 1D: Fill merging, range GET coalescing, streaming from filling blocks | `Node::plan` joins in-flight bodies and fetches each run of missing blocks with one range GET; responses start once every fill they read has a validated head and read its body through `Segment::Origin`; mutants "first fetch body read from the wrong offset", "write leaves its body unheld". |
+| Complete | Work | 1E: Block store policy | `crates/core/src/store.rs` (extents, size classes, evacuation, S3-FIFO, pins) with 7 unit tests; `crates/core/src/doorkeeper.rs` with 2; fill budget in `Node::admit`; mutants "doorkeeper admits on the first read", "response leaves its blocks unpinned". |
+| Complete | Work | 1F: Simulator disk model, sizes from seed, summary metrics | `crates/sim/src/{disk,queue}.rs`; `Options::swarm` draws block, chunk, extent and slot sizes, capacity, policies and delays; `Summary` reports hit percentage, S3 requests, bytes written and evictions (seeds 1 to 8 range from 5% to 99% of body bytes from disk). |
+| Complete | Test | 1G: Staleness-bounded response property and disk-content property | `properties::check_response` and `check_block` with 5 unit tests; checked on every answer, every write, and every 64 ticks. |
+| Complete | Test | 1H: Scan resistance and doorkeeper scenarios | `crates/sim/tests/scenarios.rs`: `the_doorkeeper_stores_a_block_on_its_second_read`, `a_scan_leaves_the_hot_set_cached` (both admission modes). |
+| Complete | Test | Planted bugs for Phase 1 | `scripts/mutants`: 15 of 15 caught (2 by core unit tests, 8 by scenarios, 5 by 300-seed sweeps). |
+| Complete | Gate | 10,000-seed sweep | `cargo run --release -p s3-accelerator-sim -- 0 --seeds 10000`: 0 of 10,000 failed, after the review fixes. |
+| Complete | Gate | Code review | `/code-review high` found 10 issues, all resolved: mutants now match ignoring whitespace; eviction falls back to the other queue when one is fully pinned (`a_pinned_queue_yields_to_the_other`, `frequent_blocks_still_leave_eventually`); fill errors other than 412 and 404 pass to the client; inverted ranges are ignored, as S3 does; home metadata has an LRU capacity (`the_home_forgets_its_least_recently_used_metadata`); each random source has its own stream; planted bugs for first-fetch merging, the ghost queue and the fill budget; evacuation checks a per-extent busy count; `Node::stored_block_at`; `Node::new` checks block and slot sizes. Wrong-class evictions before an evacuation are recorded under the storage-layout open question in `spec.md`. |
 
 ## Phase S1: Pass-Through Server
 

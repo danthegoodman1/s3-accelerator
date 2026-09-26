@@ -6,5 +6,6 @@ disallowed-types = [
     { path = "std::time::SystemTime", reason = "the simulator keeps its own time" },
 ]
 disallowed-methods = [
+    { path = "std::thread::scope", reason = "a run executes on one thread" },
     { path = "std::thread::spawn", reason = "a run executes on one thread" },
 ]

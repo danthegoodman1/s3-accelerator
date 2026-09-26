@@ -6,5 +6,6 @@ disallowed-types = [
     { path = "std::time::SystemTime", reason = "time is an input to the core" },
 ]
 disallowed-methods = [
+    { path = "std::thread::scope", reason = "the core runs on its owner's thread" },
     { path = "std::thread::spawn", reason = "the core runs on its owner's thread" },
 ]

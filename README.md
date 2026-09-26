@@ -2,7 +2,7 @@
 
 A distributed NVMe read cache in front of S3. [spec.md](spec.md) describes the design.
 
-The core routes each read to its object's home node, which fetches it from S3. The server binary has no modes yet.
+The core serves reads from each object's home node, which keeps the object's metadata and caches its blocks under the block store policy. The server binary has no modes yet. [PLAN.md](PLAN.md) tracks the remaining work.
 
 ## Layout
 
@@ -24,11 +24,14 @@ The conformance suite reads `CONFORMANCE_ENDPOINT`, `CONFORMANCE_ACCESS_KEY_ID` 
 
 ### Simulator
 
-The seed determines the whole run: the cluster's size, the workload and every network delay. Writers overwrite and delete objects in the model of S3 while clients read, and every response must equal what S3 would have returned at some tick while the request was in flight.
+The seed determines the whole run: the cluster's size, block and slot sizes, disk capacity, admission policy, the workload, and every network, disk and send delay. Writers create, overwrite and delete objects in the model of S3 while clients read. Every response must equal what S3 would have returned for a state its key held between the request's issue, less the bucket's staleness bound, and its answer. Every stored block must hold the bytes of the version it is keyed by.
 
 Every run prints its seed. Pass it back to replay the run exactly. A git commit hash also works as a seed, and CI uses the commit being tested.
 
 ```console
-cargo run --release -p s3-accelerator-sim         # a random seed
-cargo run --release -p s3-accelerator-sim -- 42   # replay seed 42
+cargo run --release -p s3-accelerator-sim                      # a random seed
+cargo run --release -p s3-accelerator-sim -- 42                # replay seed 42
+cargo run --release -p s3-accelerator-sim -- 0 --seeds 10000   # seeds 0 to 9,999 on every core
 ```
+
+`scripts/mutants` plants known bugs, one at a time, in a scratch copy and reports whether the scenarios in `crates/sim/tests/scenarios.rs` or a seed sweep catch each one.
