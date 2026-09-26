@@ -1,6 +1,6 @@
 # s3-accelerator
 
-`spec.md` is the design contract. Read it before changing behavior, and when code and spec disagree, fix one of them in the same change.
+`spec.md` is the design contract. Read it before changing behavior, and when code and spec disagree, fix one of them in the same change. `PLAN.md` is the build plan: work in its order and update its ledgers with evidence.
 
 ## Core rules
 

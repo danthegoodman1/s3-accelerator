@@ -1,0 +1,321 @@
+# Development Plan
+
+## Overarching Goal
+
+Build the S3 accelerator that `spec.md` describes: a distributed NVMe read cache in front of S3 whose cache logic runs as deterministic state machines, proven in a simulator before it runs on real sockets and disks. Each core feature lands with the simulator models and properties that test it. The server track runs the same core over real I/O and passes the S3 conformance suite through the accelerator.
+
+Non-goals until a phase names them: POSIX access, multipart-upload warming, SSE-C caching, cross-zone clusters.
+
+## Implementation Principles
+
+- `spec.md` is the design contract. A change that alters the design updates the spec, and the page that renders it, in the same commit.
+- The core does no I/O, reads no clocks and starts no threads (`AGENTS.md`). It handles block locations and response heads; the server and simulator move bytes.
+- Every core feature ships with its simulator model, a property that fails on a wrong answer, and a planted bug that the simulator catches.
+- Build the smallest implementation that meets the phase gate. Add abstraction when a later phase needs it.
+- Execution order: Phase 1, S1, Phase 2, Phase 3, S2, Phase 4, Phase 5, S3.
+
+## Testing Strategy
+
+- **Unit tests** for pure logic: layout math, placement, eviction and admission policy.
+- **Simulator:** `cargo test` runs a fixed seed range; CI runs the commit hash as a seed; a phase ends with a local sweep of at least 10,000 seeds and no failures.
+- **Planted bugs:** `scripts/mutants` applies known bugs to a scratch copy and reports how many seeds catch each. Every phase adds its own and must catch all of them.
+- **Regression tests:** a bug the simulator finds becomes a test in `crates/sim/tests` that runs its seed, with the seed and failing commit in the commit message.
+- **Conformance:** the suite in `tests/` passes against s3proxy, and against the accelerator once S1 lands.
+- **Code review:** each phase ends with `/code-review`. Findings are fixed or recorded in the phase ledger before the phase closes.
+
+## Phase 0: Scaffold
+
+Goal:
+A workspace with a deterministic core, a simulator, a conformance suite and CI.
+
+Scope:
+- Cargo workspace with `core`, `server`, `sim` and `tests`.
+- Placement by weighted rendezvous hashing over placement hashes.
+- Simulator with a versioned model of S3, a delayed network and a response property.
+- Conformance suite against s3proxy, pinned by digest.
+- CI: fmt, clippy, tests with s3proxy, and a simulator run seeded by the commit hash.
+
+Completion gate:
+CI passes on `main`.
+
+Testing plan:
+- Core unit tests, simulator seed tests, conformance tests against s3proxy.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Scope | Workspace and crates | Commit `0b68204`; `Cargo.toml`, `crates/*`, `tests/`. |
+| Complete | Scope | Rendezvous placement over placement hashes | `crates/core/src/placement.rs`; tests `placement_is_stable`, `adding_a_node_moves_keys_only_to_it`, `weights_split_keys_proportionally`; commit `4b92bd8`. |
+| Complete | Scope | Simulator with S3 model and response property | `crates/sim/src/{lib,origin,properties}.rs`; `crates/sim/tests/seeds.rs`; planted `If-Match` drop caught by seed 1 at tick 56. |
+| Complete | Scope | Conformance suite against s3proxy | `tests/get_object.rs` (8 tests); `scripts/s3proxy`. |
+| Complete | Gate | CI passes on `main` | GitHub Actions run `36257988788` (`0b68204`) and the run for `4b92bd8`: `test` and `simulate` succeeded. |
+
+## Phase 1: Single-Node Read Path
+
+Goal:
+A storage node caches the objects it is home to, block by block, and every response stays correct while writers overwrite and delete objects. The simulator reports hit rates.
+
+Scope:
+- 1A Layout: block and chunk sizes as configuration; range to blocks; chunk 0 and every block overlapping the final chunk-sized region belong to the home; objects up to two chunks live on the home. In this phase the home serves every block of its objects.
+- 1B Object metadata at the home: the first fetch is unconditional and merged across concurrent readers; size comes from `Content-Range` or `Content-Length`; later fills carry `If-Match`; a 412 or 404 on a fill drops the metadata, and the gateway restarts a read whose response has not started.
+- 1C Freshness and requests: `immutable` and `ttl` modes per bucket (`ttl` revalidates with `If-None-Match` after its age); no negative caching; `HeadObject` from metadata; client `If-Match` and `If-None-Match` evaluated against metadata.
+- 1D Fills: concurrent misses for a block merge into one fill; adjacent missing blocks combine into one range GET; a response streams from blocks that are still filling.
+- 1E Block store policy: extents of power-of-two slot classes, extent moves between classes, S3-FIFO with small, main and ghost queues, a doorkeeper with aging, admit on first read per bucket, and a fill budget.
+- 1F Simulator: a disk model that holds bytes at `(file, offset)`; block and chunk sizes drawn from the seed; objects spanning several chunks; disk capacity small enough to force eviction; hit rate, S3 GETs and drive writes in the summary; buckets with freshness modes.
+- 1G Properties: a response equals S3's response for a state the key held within its staleness bound (`ttl` buckets: from `ttl` before the request to its answer; `immutable` buckets are written once); every indexed block's bytes equal the model's bytes for its key.
+- 1H Policy scenarios: a scan leaves a hot set cached; a block read once stays off disk under the doorkeeper.
+
+Out of scope:
+- Chunks on other nodes, gateway metadata cache (Phase 2).
+- Crashes, message loss, persistence (Phase 3).
+- Membership changes (Phase 4).
+- Writes through the home, `events` mode (Phase 5).
+
+Completion gate:
+All scope items have tests; a 10,000-seed sweep passes; `scripts/mutants` catches every Phase 1 planted bug; `/code-review` findings are resolved.
+
+Testing plan:
+- Unit tests for layout math, the slot allocator, S3-FIFO and the doorkeeper.
+- Simulator seeds with overwrites, deletes, both freshness modes, and eviction pressure.
+- Scenario tests for scan resistance and doorkeeper admission.
+- Planted bugs: a fill without `If-Match`; a block indexed under the wrong ETag; a wrong slot offset; `ttl` metadata served past its age; a block admitted on its first read under the doorkeeper.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 1A: Layout math | Missing: `core` layout module and unit tests. |
+| Incomplete | Work | 1B: Home metadata and validated fills | Missing: node implementation and simulator coverage of 412/404 restarts. |
+| Incomplete | Work | 1C: Freshness modes, `HeadObject`, client conditionals | Missing: implementation and properties for both modes. |
+| Incomplete | Work | 1D: Fill merging, range GET coalescing, streaming from filling blocks | Missing: implementation and tests. |
+| Incomplete | Work | 1E: Block store policy | Missing: slot allocator, S3-FIFO, doorkeeper, fill budget with unit tests. |
+| Incomplete | Work | 1F: Simulator disk model, sizes from seed, summary metrics | Missing: simulator changes. |
+| Incomplete | Test | 1G: Staleness-bounded response property and disk-content property | Missing: properties with checker unit tests. |
+| Incomplete | Test | 1H: Scan resistance and doorkeeper scenarios | Missing: scenario tests. |
+| Incomplete | Test | Planted bugs for Phase 1 | Missing: `scripts/mutants` and its report. |
+| Incomplete | Gate | 10,000-seed sweep | Missing: sweep command output. |
+| Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
+
+## Phase S1: Pass-Through Server
+
+Goal:
+The `s3-accelerator` binary serves S3 over plaintext HTTP/1.1 by running the core, and the conformance suite passes through it.
+
+Scope:
+- S1A HTTP/1.1 request parsing and response writing, adapted from `rust_http_router_template`.
+- S1B SigV4 header validation against a static credential file, with bucket and prefix grants.
+- S1C S3 client that signs requests to the origin with the cluster's credentials.
+- S1D The core's gateway and node run in one process; `GetObject` and `HeadObject` follow the core's actions, with blocks held in memory; other operations pass through.
+- S1E CI runs the conformance suite against s3proxy and through the accelerator.
+
+Out of scope:
+- Disk storage, `sendfile`, `splice`, kTLS (S2 and S3).
+- Presigned URLs and streaming uploads.
+
+Completion gate:
+The conformance suite passes through the accelerator in CI; `/code-review` findings are resolved.
+
+Testing plan:
+- Unit tests for request parsing and SigV4 validation, using the AWS test vectors.
+- Conformance suite through the accelerator.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | S1A: HTTP/1.1 parsing and responses | Missing: server module and tests. |
+| Incomplete | Work | S1B: SigV4 validation and grants | Missing: implementation and test vectors. |
+| Incomplete | Work | S1C: Origin signing client | Missing: implementation. |
+| Incomplete | Work | S1D: Core-driven `GetObject` and `HeadObject` | Missing: server wiring. |
+| Incomplete | Test | S1E: Conformance through the accelerator in CI | Missing: CI job and passing run. |
+| Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
+
+## Phase 2: Chunks Across Nodes
+
+Goal:
+Large objects spread across the cluster, and gateways assemble responses from several owners.
+
+Scope:
+- 2A Gateway read planning: with metadata, send each range to its owner; without it, ask the home, which returns metadata with head and tail bytes; the home's first fetch serves middle ranges without admitting them.
+- 2B Fan-out and ordered assembly of responses from several owners.
+- 2C Gateway metadata cache: bounded LRU, `immutable` entries until evicted, a short TTL for others; a stale entry makes the owner's fill fail `If-Match`, and the gateway drops it and retries.
+- 2D Chunk owners fill with the ETag the gateway sends; a node asked for a chunk it does not own serves its copy or fetches without admitting.
+- 2E Simulator: gateways with independent caches; per-node hit rates and load.
+
+Out of scope:
+- Ring changes (Phase 4).
+
+Completion gate:
+A 10,000-seed sweep passes; planted bugs are caught; `/code-review` findings are resolved.
+
+Testing plan:
+- Unit tests for read planning over many sizes and ranges.
+- Simulator seeds with multi-chunk objects and several gateways.
+- Planted bugs: segments assembled out of order; a stale gateway ETag served without retry; a middle range admitted from a first fetch.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 2A: Gateway read planning | Missing: implementation and unit tests. |
+| Incomplete | Work | 2B: Multi-owner response assembly | Missing: implementation. |
+| Incomplete | Work | 2C: Gateway metadata cache | Missing: implementation and stale-entry coverage. |
+| Incomplete | Work | 2D: Chunk owner fills and non-owner behavior | Missing: implementation. |
+| Incomplete | Work | 2E: Simulator gateways and per-node metrics | Missing: simulator changes. |
+| Incomplete | Test | Planted bugs for Phase 2 | Missing: `scripts/mutants` entries and report. |
+| Incomplete | Gate | 10,000-seed sweep | Missing: sweep output. |
+| Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
+
+## Phase 3: Faults
+
+Goal:
+Correct answers survive lost messages, node crashes and restarts, and the cluster converges once faults stop.
+
+Scope:
+- 3A Time in the core: ticks as input, request timeouts and retries.
+- 3B Network faults drawn from the seed: loss, duplication, delay spikes, partitions; a safety phase with faults and a liveness phase without.
+- 3C Failover partway through a response through the next rendezvous candidate, with `Range` and `If-Match`; a response ends early when the version changes after it started, and the client retries.
+- 3D Crash and restart: memory lost; the disk model keeps synced writes and may tear or drop unsynced ones; the slot table persists the index; write, sync, then record; clear a record before reusing its slot; after a crash, a block's first hit verifies its checksum; a clean shutdown skips verification.
+- 3E Properties: an early-ended response is a client error followed by a correct retry; every request completes in the liveness phase; the disk-content property holds after restarts.
+
+Out of scope:
+- Membership changes (Phase 4).
+
+Completion gate:
+A 10,000-seed sweep with faults passes; planted bugs are caught; `/code-review` findings are resolved.
+
+Testing plan:
+- Simulator seeds with every fault type.
+- Scripted fault scenarios for crash during a fill and failover mid-response.
+- Planted bugs: a record written before its data syncs; a slot reused before its record clears; failover without `If-Match`.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 3A: Ticks, timeouts, retries | Missing: implementation. |
+| Incomplete | Work | 3B: Network fault models and liveness phase | Missing: simulator changes. |
+| Incomplete | Work | 3C: Mid-response failover and early-ended responses | Missing: implementation and scenario. |
+| Incomplete | Work | 3D: Crash, restart, slot table, post-crash verification | Missing: implementation, disk fault model. |
+| Incomplete | Test | 3E: Fault properties and liveness | Missing: properties. |
+| Incomplete | Test | Planted bugs for Phase 3 | Missing: `scripts/mutants` entries and report. |
+| Incomplete | Gate | 10,000-seed sweep with faults | Missing: sweep output. |
+| Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
+
+## Phase S2: Real Block Store and Zero-Copy
+
+Goal:
+Storage nodes keep blocks on disk and serve hits with `sendfile`, and gateways relay with `splice`.
+
+Scope:
+- S2A Slab files, extents and the slot table on disk, executing the core's storage actions.
+- S2B `fdatasync` ordering, restart recovery, clean-shutdown marker.
+- S2C `sendfile` for hits and `splice` for relays, on worker threads off the event loop.
+- S2D Separate gateway and storage-node processes, and a restart test that keeps the cache warm.
+
+Out of scope:
+- kTLS (S3).
+
+Completion gate:
+Conformance passes through a multi-process cluster; a restart test shows hits after restart; `/code-review` findings are resolved.
+
+Testing plan:
+- Conformance through the accelerator; restart integration test; crash test that kills the process during fills.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | S2A: On-disk slab files and slot table | Missing: implementation. |
+| Incomplete | Work | S2B: Sync ordering and recovery | Missing: implementation and crash test. |
+| Incomplete | Work | S2C: `sendfile` and `splice` | Missing: implementation. |
+| Incomplete | Work | S2D: Multi-process cluster and restart test | Missing: test. |
+| Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
+
+## Phase 4: Membership and Ring Changes
+
+Goal:
+The cluster resizes without losing its cache: new owners fill from previous owners, and the simulator measures the hit rate through a resize.
+
+Scope:
+- 4A foca in the core, fed packets and timer events; versioned ring snapshots; the previous snapshot kept for the grace window; unresponsive nodes stay in the ring for a grace period.
+- 4B Gateways fetch the ring from storage nodes; responses carry the ring version; gateways refetch on a newer one.
+- 4C On a miss within the grace window, owners fetch from the previous owner first; those blocks skip the doorkeeper.
+- 4D Blocks a node no longer owns are evicted first once the grace window ends, using stored placement hashes.
+- 4E Simulator: nodes join, leave and are replaced; a property bounds the hit-rate drop and S3 GETs through a one-node resize, against a control run without fallback.
+
+Completion gate:
+A 10,000-seed sweep with resizes passes; the resize property holds; planted bugs are caught; `/code-review` findings are resolved.
+
+Testing plan:
+- Simulator seeds with membership changes alongside Phase 3 faults.
+- Planted bugs: fallback outside the grace window; owned blocks evicted before non-owned ones.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 4A: foca membership and ring snapshots | Missing: implementation. |
+| Incomplete | Work | 4B: Gateway ring fetch and versioning | Missing: implementation. |
+| Incomplete | Work | 4C: Previous-owner fallback | Missing: implementation. |
+| Incomplete | Work | 4D: Eviction of non-owned blocks | Missing: implementation. |
+| Incomplete | Test | 4E: Resize scenarios and hit-rate property | Missing: property and control run. |
+| Incomplete | Gate | 10,000-seed sweep with resizes | Missing: sweep output. |
+| Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
+
+## Phase 5: Writes, Hot Keys and Warming
+
+Goal:
+Writes pass through the home without exposing stale data, hot keys spread across replicas, and warming cuts first-read misses.
+
+Scope:
+- 5A `PutObject` through the gateway and the home: the home drops or replaces metadata, discards first fetches that started before the write, and forwards invalidations; the proxying gateway drops its entry.
+- 5B `events` freshness mode with a model of S3 event notifications that delays and duplicates them.
+- 5C Hot-key leases: rate tracking, leases to the next K candidates, hot hints, renewal above half the promotion threshold, expiry.
+- 5D Warming on write with the HEAD check, and metadata prefetch for Parquet, ORC and safetensors; the simulator's model generates objects with valid trailers and headers.
+- 5E Properties: read-after-write through the writing gateway; hot-key load spread; prefetch removes the second miss.
+
+Completion gate:
+A 10,000-seed sweep with writes passes; planted bugs are caught; `/code-review` findings are resolved.
+
+Testing plan:
+- Simulator seeds with writes through the cache, event delivery faults and hot keys.
+- Planted bugs: a first fetch that started before a write still indexed; warmed blocks indexed without the ETag check; a lease that never expires.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 5A: Writes through the home | Missing: implementation. |
+| Incomplete | Work | 5B: `events` freshness mode | Missing: implementation and event model. |
+| Incomplete | Work | 5C: Hot-key leases | Missing: implementation. |
+| Incomplete | Work | 5D: Warming on write and metadata prefetch | Missing: implementation and format-aware object model. |
+| Incomplete | Test | 5E: Write, hot-key and prefetch properties | Missing: properties. |
+| Incomplete | Gate | 10,000-seed sweep with writes | Missing: sweep output. |
+| Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
+
+## Phase S3: TLS and Benchmarks
+
+Goal:
+Clients and peers connect over TLS with zero-copy intact, and benchmarks answer the storage-layout open question.
+
+Scope:
+- S3A rustls handshake and the `ktls` crate for client and peer listeners.
+- S3B Benchmarks on NVMe: hit throughput, time to first byte, fill throughput, and drive writes under scan and reread workloads.
+- S3C Record the storage-layout decision in `spec.md`.
+
+Completion gate:
+TLS conformance passes; benchmark results are recorded; `/code-review` findings are resolved.
+
+Testing plan:
+- Conformance over TLS; benchmark harness with recorded results.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | S3A: rustls and kTLS listeners | Missing: implementation. |
+| Incomplete | Test | S3B: NVMe benchmarks | Missing: harness and results. |
+| Incomplete | Doc | S3C: Storage-layout decision | Missing: spec update. |
+| Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
