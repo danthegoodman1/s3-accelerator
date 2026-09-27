@@ -694,6 +694,15 @@ MUTANTS = [
         ],
     ),
     (
+        "gossip without the cluster's key is taken",
+        [(MEMBERSHIP_ENGINE, "self.mac(packet).verify_slice(tag).ok()?;", "")],
+    ),
+    (
+        "nodes take requests without the cluster's secret",
+        [(NODE_ENGINE, "if !given.is_some_and(|given| constant_time_eq(given.as_bytes(), secret.as_bytes())) {",
+                       "if false {")],
+    ),
+    (
         "reads waiting on a newly down node wait out the timeout",
         [(GATEWAY, "for id in waiting {\n            self.fail_over(now, id, None, false);\n        }", "")],
     ),

@@ -323,7 +323,9 @@ pub fn unix_now() -> i64 {
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// Whether `a` and `b` hold the same bytes, taking the same time wherever
+/// they differ.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 

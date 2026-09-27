@@ -15,6 +15,7 @@ use crate::origin::{self, Origin, OriginBody};
 use crate::passthrough;
 use crate::peers::{Exchanged, Peers};
 use crate::protocol::{self, Forward, Hint, NodeAnswer, NodeRequest, Versions};
+use crate::sigv4::constant_time_eq;
 use crate::sqs::{self, Queue};
 use crate::tls::{self, Tls};
 use bytes::Bytes;
@@ -1230,7 +1231,8 @@ async fn serve_connection(
 ) -> io::Result<()> {
     while let Some(head) = connection.read_head().await? {
         let len = head.content_length().map_err(io::Error::other)?;
-        if header(&head.headers, protocol::SECRET) != Some(secret) {
+        let given = header(&head.headers, protocol::SECRET);
+        if !given.is_some_and(|given| constant_time_eq(given.as_bytes(), secret.as_bytes())) {
             return refuse(&mut connection, 403, len).await;
         }
         let request = protocol::decode_request(&head.path, &head.query, &head.headers, len);

@@ -9,9 +9,11 @@
 use crate::node_engine::{NodeEngine, SharedNode};
 use crate::peers::{Exchanged, Peers};
 use crate::protocol::{NodeAnswer, NodeRequest};
+use hmac::{Hmac, KeyInit, Mac};
 use s3_accelerator_core::Time;
 use s3_accelerator_core::membership::{self, Membership};
 use s3_accelerator_core::placement::NodeId;
+use sha2::Sha256;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -28,6 +30,8 @@ pub struct MembershipEngine {
     started: Instant,
     membership: Membership,
     socket: Rc<UdpSocket>,
+    /// The key gossip packets carry a tag under, from the cluster's secret.
+    key: GossipKey,
     /// Where each node listens for gossip, its cluster address, as last
     /// resolved from the address membership gives, and names resolving.
     resolved: BTreeMap<NodeId, (String, SocketAddr)>,
@@ -42,8 +46,45 @@ impl MembershipEngine {
     }
 }
 
+/// A key that tags gossip packets, derived from the cluster's secret, so
+/// only processes that hold the secret take part in membership.
+#[derive(Clone)]
+pub struct GossipKey([u8; 32]);
+
+/// Bytes of the tag that ends each gossip packet: an HMAC-SHA256 of the
+/// packet under the gossip key.
+const TAG: usize = 32;
+
+impl GossipKey {
+    pub fn new(secret: &str) -> GossipKey {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("any key length");
+        mac.update(b"s3-accelerator gossip");
+        GossipKey(mac.finalize().into_bytes().into())
+    }
+
+    fn mac(&self, packet: &[u8]) -> Hmac<Sha256> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.0).expect("any key length");
+        mac.update(packet);
+        mac
+    }
+
+    /// `packet` followed by its tag.
+    pub fn seal(&self, packet: &[u8]) -> Vec<u8> {
+        let mut sealed = packet.to_vec();
+        sealed.extend_from_slice(&self.mac(packet).finalize().into_bytes());
+        sealed
+    }
+
+    /// The packet `sealed` carries, if its tag is right.
+    pub fn open<'a>(&self, sealed: &'a [u8]) -> Option<&'a [u8]> {
+        let (packet, tag) = sealed.split_at(sealed.len().checked_sub(TAG)?);
+        self.mac(packet).verify_slice(tag).ok()?;
+        Some(packet)
+    }
+}
+
 /// Joins the cluster through `seeds`, then gossips until the node stops.
-/// `membership` started at `started`.
+/// `membership` started at `started`; `key` tags its packets.
 pub async fn run(
     started: Instant,
     membership: Membership,
@@ -51,6 +92,7 @@ pub async fn run(
     peers: Rc<Peers>,
     socket: UdpSocket,
     seeds: Vec<NodeId>,
+    key: GossipKey,
 ) -> SharedMembership {
     let me = NodeId(membership.me().id);
     for &seed in seeds.iter().filter(|&&seed| seed != me) {
@@ -73,6 +115,7 @@ pub async fn run(
         started,
         membership,
         socket: Rc::new(socket),
+        key,
         resolved: BTreeMap::new(),
         resolving: BTreeMap::new(),
         node,
@@ -94,8 +137,13 @@ pub async fn run(
             };
             {
                 let mut this = receiving.borrow_mut();
+                let Some(opened) = this.key.open(&packet[..len]) else {
+                    // Only a process without the cluster's secret sends it.
+                    continue;
+                };
+                let opened = opened.to_vec();
                 let now = this.now();
-                this.membership.on_packet(now, &packet[..len]);
+                this.membership.on_packet(now, &opened);
             }
             apply(&receiving);
         }
@@ -187,7 +235,7 @@ fn apply(engine: &SharedMembership) {
                 let this = engine.borrow();
                 // Gossip tolerates lost packets, so a full socket drops one.
                 if let Some((_, address)) = this.resolved.get(&to) {
-                    let _ = this.socket.try_send_to(&packet, *address);
+                    let _ = this.socket.try_send_to(&this.key.seal(&packet), *address);
                 }
             }
             membership::Action::Schedule { timer, at } => {
@@ -217,5 +265,23 @@ fn apply(engine: &SharedMembership) {
                 NodeEngine::on_down(&node, down);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_clusters_key_opens_a_packet() {
+        let key = GossipKey::new("cluster-secret");
+        let sealed = key.seal(b"announce");
+        assert_eq!(key.open(&sealed), Some(&b"announce"[..]));
+        assert_eq!(GossipKey::new("other-secret").open(&sealed), None);
+        let mut altered = sealed.clone();
+        altered[0] ^= 1;
+        assert_eq!(key.open(&altered), None);
+        assert_eq!(key.open(b"announce"), None);
+        assert_eq!(key.open(b""), None);
     }
 }

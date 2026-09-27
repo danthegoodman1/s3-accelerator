@@ -7,9 +7,12 @@ use common::{
     CLUSTER_CACHE, Cluster, LISTING, data_dir, object, object_of, send, start_origin, start_queue,
     try_get,
 };
+use s3_accelerator::peers::Peers;
+use s3_accelerator::protocol::{NodeAnswer, NodeRequest};
 use s3_accelerator_core::layout::Layout;
 use s3_accelerator_core::placement::{Member, NodeId, Placement, Ring};
 use s3_accelerator_core::s3::ObjectKey;
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::time::Duration;
 use tokio::task::LocalSet;
@@ -85,6 +88,47 @@ async fn a_node_killed_during_fills_serves_correct_bytes_after_it_restarts() {
 /// Fast membership: a node is declared down within half a second, and
 /// leaves the ring a second after that.
 const GOSSIP: &str = "[cluster.membership]\nprobe_period_ms = 100\nprobe_rtt_ms = 40\nsuspect_to_down_ms = 300\ndown_grace_ms = 1000\ngossip_period_ms = 50";
+
+/// A process without the cluster's secret gets 403 from a node, and its
+/// gossip is dropped: a node that names it nowhere never takes it into
+/// its ring. The same process with the secret joins.
+#[tokio::test(flavor = "current_thread")]
+async fn a_process_without_the_clusters_secret_can_not_join() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, _origin) = start_origin().await;
+            let cluster =
+                Cluster::with_nodes(&data_dir(), origin_port, CLUSTER_CACHE, 2, GOSSIP, &[1]);
+            let config = std::fs::read_to_string(&cluster.nodes[1].1).unwrap();
+            let impostor = config.replace(r#""cluster-secret""#, r#""impostor-secret""#);
+            std::fs::write(&cluster.nodes[1].1, impostor).unwrap();
+            let _node = cluster.start(0).await;
+            let ring_of_node_0 = |secret: &str| {
+                let address = format!("127.0.0.1:{}", cluster.nodes[0].0);
+                let peers = Peers::new(BTreeMap::from([(NodeId(0), address)]), secret.into(), None);
+                async move {
+                    match peers.exchange(NodeId(0), &NodeRequest::Ring).await?.answer {
+                        NodeAnswer::Ring { ring, .. } => Ok(members(&ring)),
+                        other => Err(std::io::Error::other(format!("{other:?}"))),
+                    }
+                }
+            };
+            assert!(ring_of_node_0("impostor-secret").await.is_err());
+            let impostor = cluster.start(1).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(ring_of_node_0("cluster-secret").await.unwrap(), [0]);
+            impostor.stop();
+            std::fs::write(&cluster.nodes[1].1, config).unwrap();
+            let _member = cluster.start(1).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(ring_of_node_0("cluster-secret").await.unwrap(), [0, 1]);
+        })
+        .await;
+}
+
+fn members(ring: &Ring) -> Vec<u64> {
+    ring.members().iter().map(|member| member.id.0).collect()
+}
 
 /// Two nodes serve and fill the cache; then a third, which no other
 /// config names, joins and takes over some objects' homes. The others and

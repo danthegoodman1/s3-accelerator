@@ -7,7 +7,7 @@ use crate::disk::Disk;
 use crate::gateway_engine::{Event, GatewayEngine, SharedGateway};
 use crate::http::{Connection, Framing, RequestHead, Response};
 use crate::http::{etag_condition, format_content_range, header, parse_range, split_path};
-use crate::membership_engine;
+use crate::membership_engine::{self, GossipKey};
 use crate::node_engine::{self, NodeEngine};
 use crate::origin::{self, Origin};
 use crate::passthrough::{self, ToNode};
@@ -190,6 +190,7 @@ pub async fn run_with(
             );
             let seeds: Vec<NodeId> = config.addresses().into_keys().collect();
             let fallback_window = Duration::from_millis(config.cache.fallback_window_ms);
+            let gossip_key = GossipKey::new(&config.cluster.secret);
             let (engine_for_membership, peers) = (engine.clone(), peers.clone());
             let stopper = stopping.clone();
             tokio::task::spawn_local(async move {
@@ -200,6 +201,7 @@ pub async fn run_with(
                     peers,
                     socket,
                     seeds,
+                    gossip_key,
                 )
                 .await;
                 leave.await;
