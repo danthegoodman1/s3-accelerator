@@ -4,6 +4,7 @@
 
 use crate::http::{Connection, header};
 use crate::protocol::{self, NodeAnswer, NodeRequest};
+use crate::tls::Connector;
 use bytes::Bytes;
 use rustix::io::Errno;
 use rustix::net::RecvFlags;
@@ -22,6 +23,8 @@ pub struct Peers {
     /// secret the cluster shares.
     addresses: RefCell<BTreeMap<NodeId, String>>,
     secret: Rc<str>,
+    /// Nodes take members over mutual TLS when set.
+    tls: Option<Connector>,
     idle: RefCell<BTreeMap<NodeId, Vec<Connection>>>,
 }
 
@@ -57,10 +60,15 @@ pub struct Exchanged {
 }
 
 impl Peers {
-    pub fn new(addresses: BTreeMap<NodeId, String>, secret: Rc<str>) -> Rc<Peers> {
+    pub fn new(
+        addresses: BTreeMap<NodeId, String>,
+        secret: Rc<str>,
+        tls: Option<Connector>,
+    ) -> Rc<Peers> {
         Rc::new(Peers {
             addresses: RefCell::new(addresses),
             secret,
+            tls,
             idle: RefCell::new(BTreeMap::new()),
         })
     }
@@ -89,9 +97,9 @@ impl Peers {
         let (answer, ring, len, connection) = match self.take_idle(node) {
             Some(connection) => match exchange_on(connection, request, &self.secret).await {
                 Ok(exchanged) => exchanged,
-                Err(_) => exchange_on(connect(address).await?, request, &self.secret).await?,
+                Err(_) => exchange_on(self.connect(address).await?, request, &self.secret).await?,
             },
-            None => exchange_on(connect(address).await?, request, &self.secret).await?,
+            None => exchange_on(self.connect(address).await?, request, &self.secret).await?,
         };
         let body = NodeBody {
             node,
@@ -115,7 +123,7 @@ impl Peers {
                 let address = self.addresses.borrow().get(&node).cloned();
                 let address = address
                     .ok_or_else(|| io::Error::other(format!("no address for node {}", node.0)))?;
-                connect(&address).await?
+                self.connect(&address).await?
             }
         };
         let (method, target, headers) = protocol::encode_request(request, &self.secret);
@@ -123,6 +131,21 @@ impl Peers {
             .write_request_head(method, &target, &headers, len)
             .await?;
         Ok(connection)
+    }
+
+    /// A new connection to the node at `address`, with its handshake done.
+    async fn connect(&self, address: &str) -> io::Result<Connection> {
+        let connecting = async {
+            let stream = TcpStream::connect(address).await?;
+            stream.set_nodelay(true)?;
+            match &self.tls {
+                Some(tls) => Ok(Connection::tls(tls.connect(stream, address).await?)),
+                None => Ok(Connection::new(stream)),
+            }
+        };
+        tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
     }
 
     /// Keeps a connection whose last answer was read in full for the next
@@ -175,14 +198,6 @@ fn open(connection: &Connection) -> bool {
         rustix::net::recv(connection.stream(), &mut byte, flags),
         Err(Errno::AGAIN)
     )
-}
-
-async fn connect(address: &str) -> io::Result<Connection> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
-        .await
-        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
-    stream.set_nodelay(true)?;
-    Ok(Connection::new(stream))
 }
 
 async fn exchange_on(

@@ -73,6 +73,7 @@ pub fn unescape(text: &str) -> String {
 }
 
 /// One completed system call from a trace.
+#[derive(Clone)]
 pub struct Call {
     pub name: String,
     /// When it began and returned, in seconds since the epoch.

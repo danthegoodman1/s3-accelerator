@@ -37,6 +37,25 @@ pub struct ClusterConfig {
     pub nodes: Vec<ClusterNode>,
     #[serde(default)]
     pub membership: MembershipConfig,
+    /// Gateways and nodes reach nodes over mutual TLS when set, and over
+    /// plaintext otherwise.
+    pub tls: Option<ClusterTlsConfig>,
+}
+
+/// Mutual TLS among cluster members. Each presents a certificate the
+/// cluster's CA signed, and a node's certificate names the host of its
+/// address.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterTlsConfig {
+    /// PEM files: the CA's certificate, this process's certificate chain,
+    /// leaf first, and its private key.
+    pub ca: String,
+    pub cert: String,
+    pub key: String,
+    /// As for clients' TLS.
+    #[serde(default = "default_kernel")]
+    pub kernel: bool,
 }
 
 /// SWIM's timings among storage nodes.

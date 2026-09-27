@@ -15,7 +15,7 @@ use crate::peers::{Exchanged, Peers};
 use crate::protocol::{self, NodeAnswer, NodeRequest};
 use crate::sigv4::{self, AuthError, Credentials, Signable};
 use crate::sqs::Queue;
-use crate::tls::Tls;
+use crate::tls::{self, Connector, Tls};
 use crate::zero_copy::{self, Short};
 use bytes::Bytes;
 use s3_accelerator_core::Time;
@@ -97,7 +97,26 @@ pub async fn run_with(
     leave: impl Future<Output = ()> + 'static,
 ) -> io::Result<()> {
     let secret: Rc<str> = config.cluster.secret.as_str().into();
-    let peers = Peers::new(config.addresses(), secret.clone());
+    let client_tls = config
+        .gateway
+        .as_ref()
+        .and_then(|gateway| gateway.tls.as_ref());
+    let wants_kernel = client_tls.is_some_and(|tls| tls.kernel)
+        || config.cluster.tls.as_ref().is_some_and(|tls| tls.kernel);
+    let kernel = tls::kernel(wants_kernel).await;
+    let (members, connector) = match &config.cluster.tls {
+        Some(tls) => {
+            let kernel = kernel && tls.kernel;
+            let members = Rc::new(Tls::members(tls, kernel)?);
+            (Some(members), Some(Connector::new(tls, kernel)?))
+        }
+        None => (None, None),
+    };
+    let clients = match client_tls {
+        Some(tls) => Some(Rc::new(Tls::clients(tls, kernel && tls.kernel)?)),
+        None => None,
+    };
+    let peers = Peers::new(config.addresses(), secret.clone(), connector);
     let (stopping, stopped) = watch::channel(false);
     let stopping = Rc::new(stopping);
     let stopper = stopping.clone();
@@ -194,6 +213,7 @@ pub async fn run_with(
             let stop = stopped_signal(stopped.clone());
             Some(tokio::task::spawn_local(node_engine::serve(
                 listener,
+                members,
                 engine,
                 secret.clone(),
                 stop,
@@ -201,17 +221,13 @@ pub async fn run_with(
         }
         _ => None,
     };
-    if let (Some(gateway), Some(listener)) = (&config.gateway, listeners.gateway) {
-        let tls = match &gateway.tls {
-            Some(tls) => Some(Rc::new(Tls::new(tls).await?)),
-            None => None,
-        };
+    if let (Some(_), Some(listener)) = (&config.gateway, listeners.gateway) {
         let gateway = GatewayEngine::new(config.ring(), config.cache.gateway_config(), peers);
         let context = Rc::new(Context {
             gateway,
             clients: config.clients,
         });
-        serve_clients(listener, context, tls, stopped_signal(stopped)).await?;
+        serve_clients(listener, context, clients, stopped_signal(stopped)).await?;
     }
     match node {
         Some(node) => node.await.map_err(io::Error::other)?,
@@ -256,17 +272,8 @@ async fn serve_clients(
         stream.set_nodelay(true)?;
         let (context, tls) = (context.clone(), tls.clone());
         tokio::task::spawn_local(async move {
-            let connection = match tls {
-                None => Connection::new(stream),
-                Some(tls) => match tls.accept(stream).await {
-                    Ok(accepted) => {
-                        Connection::tls(accepted.stream, accepted.read_ahead, accepted.kernel)
-                    }
-                    // A client that closes before its handshake, such as
-                    // a TCP health check, is no failure.
-                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return,
-                    Err(error) => return eprintln!("a TLS handshake failed: {error}"),
-                },
+            let Some(connection) = tls::accept(tls.as_deref(), stream).await else {
+                return;
             };
             if let Err(error) = serve_connection(connection, &context).await {
                 eprintln!("connection closed: {error}");

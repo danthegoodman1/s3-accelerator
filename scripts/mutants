@@ -40,6 +40,7 @@ GATEWAY_ENGINE = "crates/server/src/gateway_engine.rs"
 PASSTHROUGH = "crates/server/src/passthrough.rs"
 SQS = "crates/server/src/sqs.rs"
 TLS = "crates/server/src/tls.rs"
+PEERS = "crates/server/src/peers.rs"
 STEP_TIMEOUT = 600
 
 MUTANTS = [
@@ -607,7 +608,20 @@ MUTANTS = [
     ),
     (
         "TLS sessions stay in userspace",
-        [(TLS, "let kernel = config.kernel && kernel_takes_sessions().await;", "let kernel = false;")],
+        [(TLS, "let kernel = wanted && kernel_takes_sessions().await;", "let kernel = false;")],
+    ),
+    (
+        "sessions among members stay in userspace",
+        [(SERVER, "let kernel = kernel && tls.kernel;\n            let members", "let kernel = false;\n            let members")],
+    ),
+    (
+        "a node takes members without the cluster's certificates",
+        [(TLS, ".with_client_cert_verifier(verifier)", ".with_no_client_auth()")],
+    ),
+    (
+        "a member reaches nodes without TLS",
+        [(PEERS, "Some(tls) => Ok(Connection::tls(tls.connect(stream, address).await?)),",
+          "Some(_) => Ok(Connection::new(stream)),")],
     ),
     (
         "a kernel TLS session ends without close_notify",

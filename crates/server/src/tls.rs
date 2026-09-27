@@ -1,98 +1,213 @@
-//! TLS for S3 clients. rustls runs the handshake, and the session then
-//! moves into the kernel (kTLS), which encrypts what the server writes,
-//! sends with `sendfile` or moves with `splice`, and decrypts what it
-//! reads: to the rest of the server the connection stays a plain TCP
-//! socket. Where the kernel cannot take sessions, or the config asks for
-//! userspace TLS, a task relays between the rustls stream and a loopback
-//! socket that the server uses instead.
+//! TLS for S3 clients and among cluster members. rustls runs the handshake,
+//! and the session then moves into the kernel (kTLS), which encrypts what
+//! the server writes, sends with `sendfile` or moves with `splice`, and
+//! decrypts what it reads: to the rest of the server the connection stays a
+//! plain TCP socket. Where the kernel cannot take sessions, or the config
+//! asks for userspace TLS, a task relays between the rustls stream and a
+//! loopback socket that the server uses instead.
 
-use crate::config::TlsConfig;
+use crate::config::{ClusterTlsConfig, TlsConfig};
+use crate::http::Connection;
 use ktls::CorkStream;
-use rustls::ServerConfig;
+use rustls::client::Resumption;
+use rustls::server::WebPkiClientVerifier;
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+/// The server side: a gateway's listener for S3 clients, or a node's for
+/// members.
 pub struct Tls {
     acceptor: TlsAcceptor,
     /// Whether sessions move into the kernel.
     kernel: bool,
 }
 
-/// A client's connection once the handshake is done: the socket the server
-/// reads and writes, the plaintext rustls read past the handshake, and
-/// whether the kernel holds the session.
-pub struct Accepted {
+/// The client side, with which members reach nodes.
+pub struct Connector {
+    connector: TlsConnector,
+    kernel: bool,
+}
+
+/// A connection once its handshake is done: the socket the server reads and
+/// writes, the plaintext rustls read past the handshake, and whether the
+/// kernel holds the session.
+pub struct Session {
     pub stream: TcpStream,
     pub read_ahead: Vec<u8>,
     pub kernel: bool,
 }
 
+/// Whether sessions move into the kernel: the config asks for it, and the
+/// kernel takes them.
+pub async fn kernel(wanted: bool) -> bool {
+    let kernel = wanted && kernel_takes_sessions().await;
+    if wanted && !kernel {
+        eprintln!(
+            "the kernel cannot take TLS sessions (is the tls module loaded?); using userspace TLS"
+        );
+    }
+    kernel
+}
+
 impl Tls {
-    /// Loads the certificate chain and key the config names. Sessions move
-    /// into the kernel if the config allows it and the kernel takes them.
-    pub async fn new(config: &TlsConfig) -> io::Result<Tls> {
-        let chain = CertificateDer::pem_file_iter(&config.cert)
-            .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
-            .map_err(|error| io::Error::other(format!("{}: {error}", config.cert)))?;
-        let key = PrivateKeyDer::from_pem_file(&config.key)
-            .map_err(|error| io::Error::other(format!("{}: {error}", config.key)))?;
-        let mut server = ServerConfig::builder()
+    /// Serves S3 clients with the certificate `config` names.
+    pub fn clients(config: &TlsConfig, kernel: bool) -> io::Result<Tls> {
+        let server = ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(chain, key)
+            .with_single_cert(chain(&config.cert)?, key(&config.key)?)
             .map_err(io::Error::other)?;
+        Ok(Tls::new(server, kernel))
+    }
+
+    /// Serves cluster members, each with a certificate the cluster's CA
+    /// signed.
+    pub fn members(config: &ClusterTlsConfig, kernel: bool) -> io::Result<Tls> {
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots(&config.ca)?))
+            .build()
+            .map_err(io::Error::other)?;
+        let server = ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(chain(&config.cert)?, key(&config.key)?)
+            .map_err(io::Error::other)?;
+        Ok(Tls::new(server, kernel))
+    }
+
+    fn new(mut server: ServerConfig, kernel: bool) -> Tls {
         // The kernel takes the session's secrets once the handshake ends,
         // and with no tickets to send, rustls has nothing left to write.
         server.enable_secret_extraction = true;
         server.send_tls13_tickets = 0;
         server.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let kernel = config.kernel && kernel_takes_sessions().await;
-        if config.kernel && !kernel {
-            eprintln!(
-                "the kernel cannot take TLS sessions (is the tls module loaded?); using userspace TLS"
-            );
-        }
-        Ok(Tls {
+        Tls {
             acceptor: TlsAcceptor::from(Arc::new(server)),
             kernel,
-        })
+        }
     }
 
-    pub fn kernel(&self) -> bool {
-        self.kernel
-    }
-
-    /// Runs the handshake on a client's connection.
-    pub async fn accept(&self, stream: TcpStream) -> io::Result<Accepted> {
+    /// Runs the handshake on a connection a client opened.
+    pub async fn accept(&self, stream: TcpStream) -> io::Result<Session> {
         if self.kernel {
             let session = self.acceptor.accept(CorkStream::new(stream)).await?;
             let ktls = ktls::config_ktls_server(session)
                 .await
                 .map_err(io::Error::other)?;
             let (read_ahead, stream) = ktls.into_raw();
-            return Ok(Accepted {
+            return Ok(Session {
                 stream,
                 read_ahead: read_ahead.unwrap_or_default(),
                 kernel: true,
             });
         }
-        let mut session = self.acceptor.accept(stream).await?;
-        let (inner, mut outer) = loopback_pair().await?;
-        tokio::task::spawn_local(async move {
-            let _ = tokio::io::copy_bidirectional(&mut session, &mut outer).await;
-            let _ = session.shutdown().await;
-        });
-        Ok(Accepted {
-            stream: inner,
-            read_ahead: Vec::new(),
-            kernel: false,
+        relayed(self.acceptor.accept(stream).await?).await
+    }
+}
+
+impl Connector {
+    /// Reaches nodes whose certificates the cluster's CA signed, with this
+    /// process's own certificate.
+    pub fn new(config: &ClusterTlsConfig, kernel: bool) -> io::Result<Connector> {
+        let mut client = ClientConfig::builder()
+            .with_root_certificates(roots(&config.ca)?)
+            .with_client_auth_cert(chain(&config.cert)?, key(&config.key)?)
+            .map_err(io::Error::other)?;
+        client.enable_secret_extraction = true;
+        client.resumption = Resumption::disabled();
+        client.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Ok(Connector {
+            connector: TlsConnector::from(Arc::new(client)),
+            kernel,
         })
     }
+
+    /// Runs the handshake with the node at `address`, whose certificate
+    /// must name the address's host.
+    pub async fn connect(&self, stream: TcpStream, address: &str) -> io::Result<Session> {
+        let host = address
+            .rsplit_once(':')
+            .map_or(address, |(host, _)| host)
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let name = ServerName::try_from(host.to_string()).map_err(io::Error::other)?;
+        if self.kernel {
+            let session = self
+                .connector
+                .connect(name, CorkStream::new(stream))
+                .await?;
+            let ktls = ktls::config_ktls_client(session)
+                .await
+                .map_err(io::Error::other)?;
+            let (read_ahead, stream) = ktls.into_raw();
+            return Ok(Session {
+                stream,
+                read_ahead: read_ahead.unwrap_or_default(),
+                kernel: true,
+            });
+        }
+        relayed(self.connector.connect(name, stream).await?).await
+    }
+}
+
+/// A connection a client opened, once its handshake is done, or `None` if
+/// the handshake failed.
+pub async fn accept(tls: Option<&Tls>, stream: TcpStream) -> Option<Connection> {
+    let Some(tls) = tls else {
+        return Some(Connection::new(stream));
+    };
+    match tls.accept(stream).await {
+        Ok(session) => Some(Connection::tls(session)),
+        // A client that closes before its handshake, such as a TCP health
+        // check, is no failure.
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => None,
+        Err(error) => {
+            eprintln!("a TLS handshake failed: {error}");
+            None
+        }
+    }
+}
+
+/// A userspace session, relayed to a loopback socket the server uses in
+/// its place.
+async fn relayed<S>(mut session: S) -> io::Result<Session>
+where
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    let (inner, mut outer) = loopback_pair().await?;
+    tokio::task::spawn_local(async move {
+        let _ = tokio::io::copy_bidirectional(&mut session, &mut outer).await;
+        let _ = session.shutdown().await;
+    });
+    Ok(Session {
+        stream: inner,
+        read_ahead: Vec::new(),
+        kernel: false,
+    })
+}
+
+fn chain(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
+    CertificateDer::pem_file_iter(path)
+        .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
+        .map_err(|error| io::Error::other(format!("{path}: {error}")))
+}
+
+fn key(path: &str) -> io::Result<PrivateKeyDer<'static>> {
+    PrivateKeyDer::from_pem_file(path).map_err(|error| io::Error::other(format!("{path}: {error}")))
+}
+
+fn roots(path: &str) -> io::Result<RootCertStore> {
+    let mut roots = RootCertStore::empty();
+    for certificate in chain(path)? {
+        roots
+            .add(certificate)
+            .map_err(|error| io::Error::other(format!("{path}: {error}")))?;
+    }
+    Ok(roots)
 }
 
 /// Whether the kernel takes TLS sessions: the `tls` module is loaded and

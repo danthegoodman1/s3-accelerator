@@ -9,7 +9,9 @@
 #   scripts/cluster stop                    # shut every process down cleanly
 #
 # With --tls, the gateway serves HTTPS with a self-signed certificate in
-# target/cluster/tls, which clients trust through SSL_CERT_FILE.
+# target/cluster/tls, which clients trust through SSL_CERT_FILE, and every
+# process reaches nodes over mutual TLS with a certificate a CA made there
+# signed.
 set -euo pipefail
 
 dir=target/cluster
@@ -62,12 +64,31 @@ case "${1:-}" in
     cargo build -q -p s3-accelerator
     rm -rf "$dir"
     mkdir -p "$dir"
+    members=
+    if [ "$tls" = --tls ]; then
+      tls_dir="$dir/tls"
+      mkdir -p "$tls_dir"
+      ec=(-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes)
+      openssl req -x509 "${ec[@]}" -days 1 -subj "/CN=cluster CA" \
+        -keyout "$tls_dir/ca-key.pem" -out "$tls_dir/ca.pem" 2>/dev/null
+      openssl req "${ec[@]}" -subj /CN=member \
+        -keyout "$tls_dir/member-key.pem" -out "$tls_dir/member.csr" 2>/dev/null
+      printf 'subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\n' >"$tls_dir/member.ext"
+      openssl x509 -req -in "$tls_dir/member.csr" -CA "$tls_dir/ca.pem" -CAkey "$tls_dir/ca-key.pem" \
+        -days 1 -extfile "$tls_dir/member.ext" -out "$tls_dir/member.pem" 2>/dev/null
+      members="
+[cluster.tls]
+ca = \"$tls_dir/ca.pem\"
+cert = \"$tls_dir/member.pem\"
+key = \"$tls_dir/member-key.pem\""
+    fi
     for id in $(seq 0 $((nodes - 1))); do
       config "$nodes" "$origin
 
 [node]
 id = $id
-data_dir = \"$dir/node-$id\"" >"$dir/node-$id.toml"
+data_dir = \"$dir/node-$id\"
+$members" >"$dir/node-$id.toml"
       "$binary" "$dir/node-$id.toml" >"$dir/node-$id.log" 2>&1 &
       echo $! >"$dir/node-$id.pid"
       wait_for $((9101 + id))
@@ -75,7 +96,6 @@ data_dir = \"$dir/node-$id\"" >"$dir/node-$id.toml"
     gateway='[gateway]
 listen = "127.0.0.1:9000"'
     if [ "$tls" = --tls ]; then
-      mkdir -p "$dir/tls"
       openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
         -days 1 -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1,DNS:localhost \
         -addext basicConstraints=critical,CA:FALSE \
@@ -84,7 +104,8 @@ listen = "127.0.0.1:9000"'
 
 [gateway.tls]
 cert = \"$dir/tls/cert.pem\"
-key = \"$dir/tls/key.pem\""
+key = \"$dir/tls/key.pem\"
+$members"
     fi
     config "$nodes" "$gateway" >"$dir/gateway.toml"
     "$binary" "$dir/gateway.toml" >"$dir/gateway.log" 2>&1 &

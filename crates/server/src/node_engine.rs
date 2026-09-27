@@ -16,6 +16,7 @@ use crate::passthrough;
 use crate::peers::{Exchanged, Peers};
 use crate::protocol::{self, Forward, Hint, NodeAnswer, NodeRequest};
 use crate::sqs::{self, Queue};
+use crate::tls::{self, Tls};
 use bytes::Bytes;
 use hyper::body::Incoming;
 use s3_accelerator_core::Time;
@@ -33,7 +34,7 @@ use std::os::fd::AsFd;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 pub type SharedNode = Rc<RefCell<NodeEngine>>;
@@ -1160,6 +1161,7 @@ pub async fn take_events(engine: SharedNode, queue: Rc<Queue>, visibility: Durat
 /// in progress and shuts the disk down cleanly.
 pub async fn serve(
     listener: TcpListener,
+    tls: Option<Rc<Tls>>,
     engine: SharedNode,
     secret: Rc<str>,
     stop: impl Future<Output = ()>,
@@ -1179,9 +1181,12 @@ pub async fn serve(
             () = &mut stop => break,
         };
         stream.set_nodelay(true)?;
-        let (engine, secret) = (engine.clone(), secret.clone());
+        let (tls, engine, secret) = (tls.clone(), engine.clone(), secret.clone());
         tokio::task::spawn_local(async move {
-            if let Err(error) = connection(stream, &engine, &secret).await {
+            let Some(connection) = tls::accept(tls.as_deref(), stream).await else {
+                return;
+            };
+            if let Err(error) = serve_connection(connection, &engine, &secret).await {
                 eprintln!("gateway connection closed: {error}");
             }
         });
@@ -1200,8 +1205,11 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
 /// How long a node waits for another to take an event it passes on.
 const PASS_WAIT: Duration = Duration::from_secs(10);
 
-async fn connection(stream: TcpStream, engine: &SharedNode, secret: &str) -> io::Result<()> {
-    let mut connection = Connection::new(stream);
+async fn serve_connection(
+    mut connection: Connection,
+    engine: &SharedNode,
+    secret: &str,
+) -> io::Result<()> {
     while let Some(head) = connection.read_head().await? {
         let len = head.content_length().map_err(io::Error::other)?;
         if header(&head.headers, protocol::SECRET) != Some(secret) {

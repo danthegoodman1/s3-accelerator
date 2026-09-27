@@ -2,6 +2,7 @@
 //! responses, and a client writes requests and reads responses. Also the
 //! header formats S3 and the cluster share.
 
+use crate::tls::Session;
 use bytes::Bytes;
 use percent_encoding::percent_decode_str;
 use s3_accelerator_core::s3::{ByteRange, ContentRange, ETag};
@@ -92,14 +93,14 @@ impl Connection {
         }
     }
 
-    /// A client's connection after its TLS handshake: `read_ahead` holds
-    /// plaintext the handshake read past its end.
-    pub fn tls(stream: TcpStream, read_ahead: Vec<u8>, kernel: bool) -> Connection {
+    /// A connection after its TLS handshake, starting with the plaintext
+    /// the handshake read past its end.
+    pub fn tls(session: Session) -> Connection {
         Connection {
-            stream,
-            buffer: read_ahead,
-            kernel_tls: kernel,
-            owes_close_notify: kernel,
+            stream: session.stream,
+            buffer: session.read_ahead,
+            kernel_tls: session.kernel,
+            owes_close_notify: session.kernel,
         }
     }
 
