@@ -319,7 +319,7 @@ MUTANTS = [
     ),
     (
         "nodes store blocks they do not own",
-        [(NODE, "if self.ring.owner(placement) != Some(self.id) && !self.leased(placement) {", "if false {")],
+        [(NODE, "let owns = self.ring.owner(placement) == Some(self.id) || self.leased(placement);", "let owns = true;")],
     ),
     (
         "gateway metadata used past the bucket's ttl",
@@ -471,7 +471,10 @@ MUTANTS = [
     ),
     (
         "a reader waiting on a first fetch's write is never told",
-        [(NODE, "for waiter in self.awaiting_writes.remove(&location).unwrap_or_default() {\n            self.arrived(waiter, Await::Written(location));\n        }", "")],
+        [(NODE, "self.readable.insert(location);\n        for waiter in self.awaiting_writes.remove(&location).unwrap_or_default() {\n            self.arrived(waiter, Await::Written(location));\n        }",
+                "self.readable.insert(location);"),
+         (NODE, "self.stop_reading(origin);\n        for waiter in self.awaiting_writes.remove(&location).unwrap_or_default() {\n            self.arrived(waiter, Await::Written(location));\n        }",
+                "self.stop_reading(origin);")],
     ),
     (
         "queued readers never share an arriving body",
@@ -565,7 +568,8 @@ MUTANTS = [
     ),
     (
         "a replica never stores a leased placement's blocks",
-        [(NODE, "if self.ring.owner(placement) != Some(self.id) && !self.leased(placement) {", "if self.ring.owner(placement) != Some(self.id) {")],
+        [(NODE, "let owns = self.ring.owner(placement) == Some(self.id) || self.leased(placement);",
+                "let owns = self.ring.owner(placement) == Some(self.id);")],
     ),
     (
         "a kept upload is stored without the ETag check",
@@ -1026,7 +1030,7 @@ MUTANTS = [
     ),
     (
         "a block write skips the journal's earlier entries",
-        [(NODE_ENGINE, "disk.applied(issued);\n                disk.write(location, &bytes)", "disk.write(location, &bytes)")],
+        [(NODE_ENGINE, "disk.applied(issued);\n                disk.write(location, &bytes, move ||", "disk.write(location, &bytes, move ||")],
     ),
     (
         "readers of a block being written wait for its sync",
