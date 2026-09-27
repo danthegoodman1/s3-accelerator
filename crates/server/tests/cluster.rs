@@ -4,7 +4,8 @@
 mod common;
 
 use common::{
-    CLUSTER_CACHE, Cluster, LISTING, data_dir, object, send, start_origin, start_queue, try_get,
+    CLUSTER_CACHE, Cluster, LISTING, data_dir, object, object_of, send, start_origin, start_queue,
+    try_get,
 };
 use s3_accelerator_core::placement::{Member, NodeId, Placement, Ring};
 use s3_accelerator_core::s3::ObjectKey;
@@ -277,7 +278,12 @@ async fn a_read_after_a_write_through_the_gateway_sees_the_write() {
             let first = origin.object(path);
             for _ in 0..2 {
                 let read = send(port, "GET", path, "", &[], Vec::new()).await;
-                assert!(read == (200, first.clone()));
+                assert!(
+                    read == (200, first.clone()),
+                    "{} {:?}",
+                    read.0,
+                    String::from_utf8_lossy(&read.1[..read.1.len().min(300)])
+                );
             }
             let written = b"the new version".to_vec();
             let (status, _) = send(port, "PUT", path, "", &[], written.clone()).await;
@@ -394,6 +400,41 @@ async fn a_hot_key_is_read_from_its_replicas() {
                 assert_eq!(cluster.get("hot").await, (200, object()));
             }
             assert_eq!(origin.requests.get(), 1);
+        })
+        .await;
+}
+
+/// An upload passes through its home, which keeps what it holds of the
+/// body and checks with a HEAD that S3 holds the version: the first read
+/// after the check comes from the home's disk, with no further request to
+/// S3.
+#[tokio::test(flavor = "current_thread")]
+async fn an_upload_warms_its_home() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            let cluster = Cluster::with_nodes(&data_dir(), origin_port, CLUSTER_CACHE, 2, "", &[]);
+            let _nodes = [cluster.start(0).await, cluster.start(1).await];
+            let _gateway = cluster.start_gateway().await;
+            let port = cluster.gateway_port;
+            let body = object_of(200_000, "warm");
+            let (status, _) = send(port, "PUT", "/warm/k", "", &[], body.clone()).await;
+            assert_eq!(status, 200);
+            // The home checks the version after the client hears, and a
+            // read before it finishes would miss.
+            let checked = async {
+                while origin.requests.get() < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            tokio::time::timeout(Duration::from_secs(5), checked)
+                .await
+                .expect("the home sends a HEAD");
+            assert_eq!(origin.requests.get(), 2);
+            let read = send(port, "GET", "/warm/k", "", &[], Vec::new()).await;
+            assert!(read == (200, body), "{}", read.0);
+            assert_eq!(origin.requests.get(), 2);
         })
         .await;
 }

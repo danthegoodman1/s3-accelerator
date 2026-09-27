@@ -28,6 +28,7 @@ use s3_accelerator_core::store::Location;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
+use std::ops::Range;
 use std::os::fd::AsFd;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -69,6 +70,12 @@ enum Body {
     Arriving(Vec<Reader>),
     /// A body passing through to the readers it had as its head arrived.
     Passing,
+    /// The home's region of an upload, by each range's start, which holds
+    /// `reserved` bytes of the warming budget.
+    Kept {
+        ranges: Vec<(u64, Bytes)>,
+        reserved: u64,
+    },
 }
 
 /// Where bytes of an arriving body go.
@@ -88,6 +95,8 @@ enum Reader {
 /// Chunks of an arriving body queued for each reply. A reply that falls
 /// this far behind holds up the body for every reader.
 const QUEUED_CHUNKS: usize = 4;
+/// The most bytes of uploads a node keeps at once for warming.
+const WARM_BUDGET: u64 = 256 << 20;
 /// How long a write waits for a slot's old pages to be released, and how
 /// long it waits before it first looks again; each wait doubles, up to a
 /// second.
@@ -113,6 +122,8 @@ pub struct NodeEngine {
     /// Where each node in the ring is reached, for answering ring requests.
     addresses: BTreeMap<NodeId, String>,
     events: Events,
+    /// Bytes of uploads the node may still keep for warming.
+    warm_budget: u64,
 }
 
 /// Messages from S3's event queue while the core works through their
@@ -173,6 +184,7 @@ impl NodeEngine {
             tasks: BTreeMap::new(),
             unsynced_metadata: false,
             events: Events::default(),
+            warm_budget: WARM_BUDGET,
         }));
         // A recovering node's first actions clear records it cannot use.
         let work = engine.borrow_mut().pump();
@@ -301,6 +313,56 @@ impl NodeEngine {
             let mut this = engine.borrow_mut();
             let now = this.now();
             this.node.on_lease_report(now, placement, reads);
+            this.pump()
+        };
+        start(engine, work);
+    }
+
+    /// The byte ranges of an upload of `key`, `len` bytes long, to keep as
+    /// it passes to S3, with warming budget set aside for them; none if the
+    /// node does not warm the upload or the budget is spent.
+    fn keep_upload(engine: &SharedNode, key: &ObjectKey, len: u64) -> Vec<Range<u64>> {
+        let mut this = engine.borrow_mut();
+        let region = this.node.warm_region(key, len);
+        let bytes: u64 = region.iter().map(|range| range.end - range.start).sum();
+        if bytes > this.warm_budget {
+            return Vec::new();
+        }
+        this.warm_budget -= bytes;
+        region
+    }
+
+    /// S3 took an upload of `key` as version `etag` of `len` bytes, and the
+    /// node kept the bytes `keep_upload` named in `kept`, holding
+    /// `reserved` of the budget: the core checks the version and stores
+    /// them. Kept bytes that fall short, or that the core does not want,
+    /// free their budget at once.
+    fn uploaded(
+        engine: &SharedNode,
+        key: ObjectKey,
+        etag: Option<ETag>,
+        len: u64,
+        kept: Vec<(u64, Vec<u8>)>,
+        reserved: u64,
+    ) {
+        let work = {
+            let mut this = engine.borrow_mut();
+            let whole: u64 = kept.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+            let now = this.now();
+            let taken = match etag {
+                Some(etag) if whole == reserved => this.node.on_uploaded(now, key, etag, len),
+                _ => None,
+            };
+            match taken {
+                Some(origin) => {
+                    let ranges = kept
+                        .into_iter()
+                        .map(|(start, bytes)| (start, Bytes::from(bytes)))
+                        .collect();
+                    this.bodies.insert(origin, Body::Kept { ranges, reserved });
+                }
+                None => this.warm_budget += reserved,
+            }
             this.pump()
         };
         start(engine, work);
@@ -442,6 +504,10 @@ impl NodeEngine {
                     offset,
                     len,
                 }),
+                Some(Body::Kept { ranges, .. }) => match kept_slice(ranges, offset, len) {
+                    Some(bytes) => self.work.writes.push((location, bytes)),
+                    None => self.node.on_write_failed(location),
+                },
                 // Only a body's first readers read it as it passes.
                 Some(Body::Passing) | None => self.node.on_write_failed(location),
             },
@@ -463,7 +529,9 @@ impl NodeEngine {
                 checksum,
             } => self.work.verifies.push((location, len, checksum)),
             node::Action::Release { origin } => {
-                self.bodies.remove(&origin);
+                if let Some(Body::Kept { reserved, .. }) = self.bodies.remove(&origin) {
+                    self.warm_budget += reserved;
+                }
             }
             node::Action::PeerFetch { origin, peer, read } => {
                 self.work.peer_fetches.push((origin, peer, read));
@@ -541,6 +609,10 @@ impl NodeEngine {
                         bytes: slice(bytes, offset, len).unwrap_or_default(),
                         len,
                     },
+                    Some(Body::Kept { ranges, .. }) => Part::Held {
+                        bytes: kept_slice(ranges, offset, len).unwrap_or_default(),
+                        len,
+                    },
                     Some(Body::Arriving(readers)) => {
                         let (sender, receiver) = mpsc::channel(QUEUED_CHUNKS);
                         readers.push(Reader::Reply {
@@ -595,6 +667,15 @@ fn segment_len(segment: &Segment) -> u64 {
     match *segment {
         Segment::Slot { len, .. } | Segment::Origin { len, .. } => len,
     }
+}
+
+/// Bytes `offset..offset + len` of an object, from the kept range that
+/// holds them.
+fn kept_slice(ranges: &[(u64, Bytes)], offset: u64, len: u64) -> Option<Bytes> {
+    let (start, bytes) = ranges
+        .iter()
+        .find(|(start, bytes)| *start <= offset && offset + len <= start + bytes.len() as u64)?;
+    slice(bytes, offset - start, len)
 }
 
 fn slice(bytes: &Bytes, offset: u64, len: u64) -> Option<Bytes> {
@@ -1143,10 +1224,21 @@ async fn forward_to_s3(
     keep_alive: bool,
 ) -> io::Result<bool> {
     let origin = engine.borrow().origin.clone();
-    let sent = passthrough::to_s3(&origin, forward, connection).await;
+    let key = passthrough::written_key(&forward.method, &forward.path);
+    // The home keeps the region it holds of an upload, to store once S3
+    // takes it.
+    let keep = match &key {
+        Some(key) if passthrough::uploads_object(forward) => {
+            NodeEngine::keep_upload(engine, key, forward.len)
+        }
+        _ => Vec::new(),
+    };
+    let reserved: u64 = keep.iter().map(|range| range.end - range.start).sum();
+    let sent = passthrough::to_s3(&origin, forward, connection, &keep).await;
     let response = match sent.response {
         Ok(response) => response,
         Err(error) => {
+            engine.borrow_mut().warm_budget += reserved;
             eprintln!("forwarding to S3: {error}");
             let unread = if sent.body_read { 0 } else { forward.len };
             refuse(connection, 502, unread).await?;
@@ -1154,10 +1246,21 @@ async fn forward_to_s3(
         }
     };
     let status = response.status().as_u16();
-    if status < 300
-        && let Some(key) = passthrough::written_key(&forward.method, &forward.path)
-    {
-        NodeEngine::written(engine, &key, false);
+    match key {
+        Some(key) if status < 300 => {
+            NodeEngine::written(engine, &key, false);
+            if !keep.is_empty() {
+                let headers = origin::header_pairs(response.headers());
+                let etag = header(&headers, "etag").map(|etag| ETag(etag.to_string()));
+                let kept = if sent.body_read {
+                    sent.kept
+                } else {
+                    Vec::new()
+                };
+                NodeEngine::uploaded(engine, key, etag, forward.len, kept, reserved);
+            }
+        }
+        _ => engine.borrow_mut().warm_budget += reserved,
     }
     let answer = passthrough::forwarded(&forward.method, &response);
     let length = match &answer {

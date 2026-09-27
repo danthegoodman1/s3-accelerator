@@ -1082,6 +1082,7 @@ mod tests {
         let policy = BucketPolicy {
             freshness: Freshness::Immutable,
             admit_on_first_read: false,
+            warm_on_write: false,
         };
         let config = Config {
             layout: Layout::new(64, 1),

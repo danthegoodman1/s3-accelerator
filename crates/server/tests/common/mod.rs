@@ -127,8 +127,10 @@ async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
                 };
                 origin.requests.set(origin.requests.get() + 1);
                 origin.paths.borrow_mut().push(head.path.clone());
+                let mut headers = Vec::new();
                 if head.method == "PUT" {
                     let etag = format!("\"written-{}\"", origin.uploads.borrow().len());
+                    headers.push(("ETag".to_string(), etag.clone()));
                     let version = (etag, upload.clone());
                     origin
                         .written
@@ -137,7 +139,6 @@ async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
                     origin.uploads.borrow_mut().push(upload);
                 }
                 let (etag, object) = origin.current(&head.path);
-                let mut headers = Vec::new();
                 let (status, body) = match head.method.as_str() {
                     "POST" if head.query.contains("delete") => {
                         origin.deleted.set(true);
@@ -676,8 +677,9 @@ pub async fn listening(port: u16) {
 pub const CLUSTER_CACHE: &str = "block_size = 65536\nextent_size = 1048576\nextents = 32";
 
 /// Configs for storage nodes and a gateway, in `dir`. Bucket `bucket` is
-/// immutable, bucket `changing` keeps metadata for ten minutes, and both
-/// admit blocks on their first read.
+/// immutable, and bucket `changing` keeps metadata for ten minutes; both
+/// admit blocks on their first read. Bucket `warm` keeps metadata for ten
+/// minutes, and its homes store the uploads that pass through them.
 pub struct Cluster {
     pub gateway_port: u16,
     pub gateway: PathBuf,
@@ -742,7 +744,7 @@ impl Cluster {
             [[clients]]
             access_key_id = "reader"
             secret_access_key = "reader-secret"
-            grants = [{{ bucket = "bucket" }}, {{ bucket = "changing" }}]
+            grants = [{{ bucket = "bucket" }}, {{ bucket = "changing" }}, {{ bucket = "warm" }}]
             [cache]
             {cache}
             [cache.buckets.bucket]
@@ -751,6 +753,9 @@ impl Cluster {
             [cache.buckets.changing]
             ttl_ms = 600000
             admit_on_first_read = true
+            [cache.buckets.warm]
+            ttl_ms = 600000
+            warm_on_write = true
             [cluster]
             secret = "cluster-secret"
             nodes = [{named}]

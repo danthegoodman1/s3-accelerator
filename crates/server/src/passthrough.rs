@@ -14,6 +14,7 @@ use hyper::body::Incoming;
 use s3_accelerator_core::s3::ObjectKey;
 use sha2::{Digest, Sha256};
 use std::io;
+use std::ops::Range;
 use tokio::net::TcpStream;
 
 /// Where a passing body goes.
@@ -45,6 +46,44 @@ impl BodySink for ToNode<'_> {
     }
 
     fn abort(self) {}
+}
+
+/// A sink that keeps copies of the bytes within `ranges` of the body, in
+/// order, as it passes the body on.
+struct Keeping<'a, S> {
+    sink: S,
+    /// The body offset of the next piece.
+    offset: u64,
+    ranges: &'a [Range<u64>],
+    /// Each range's start and the bytes kept of it so far.
+    kept: &'a mut Vec<(u64, Vec<u8>)>,
+}
+
+impl<S: BodySink> BodySink for Keeping<'_, S> {
+    async fn send(&mut self, piece: Bytes) -> bool {
+        let (start, end) = (self.offset, self.offset + piece.len() as u64);
+        for range in self.ranges {
+            let (from, to) = (range.start.max(start), range.end.min(end));
+            if from >= to {
+                continue;
+            }
+            let bytes = &piece[(from - start) as usize..(to - start) as usize];
+            match self
+                .kept
+                .iter_mut()
+                .find(|(first, _)| *first == range.start)
+            {
+                Some((_, kept)) => kept.extend_from_slice(bytes),
+                None => self.kept.push((range.start, bytes.to_vec())),
+            }
+        }
+        self.offset = end;
+        self.sink.send(piece).await
+    }
+
+    fn abort(self) {
+        self.sink.abort();
+    }
 }
 
 /// Passes a `len`-byte body from `source` to `sink` as it arrives, and
@@ -99,42 +138,74 @@ pub struct Sent {
     pub response: io::Result<hyper::Response<Incoming>>,
     /// Whether the request's body was read to its end.
     pub body_read: bool,
+    /// The bytes kept of each range asked for, by the range's start.
+    pub kept: Vec<(u64, Vec<u8>)>,
 }
 
 /// Sends a forwarded request to S3, streaming its body from `source` while
 /// S3's answer is awaited: S3 may answer before the body ends, such as to
-/// refuse it. The gateway checked the body's hash.
-pub async fn to_s3(origin: &Origin, forward: &Forward, source: &mut Connection) -> Sent {
-    let (sender, body) = Channel::<Bytes, io::Error>::new(2);
-    let body: RequestBody = body.boxed();
-    let sent = origin.forward(
-        &forward.method,
-        &forward.path,
-        &forward.query,
-        &forward.headers,
-        &forward.payload_hash,
-        body,
-        forward.len,
-    );
-    let mut sent = std::pin::pin!(sent);
-    let mut passing = std::pin::pin!(pass_body(source, forward.len, None, sender));
-    let mut passed = None;
-    let response = loop {
-        tokio::select! {
-            result = &mut passing, if passed.is_none() => passed = Some(result),
-            response = &mut sent => break response,
-        }
-        if passed.is_some() {
-            // The body is sent; S3 has a while to answer.
-            break tokio::time::timeout(origin::READ_TIMEOUT, &mut sent)
-                .await
-                .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()));
-        }
+/// refuse it. The gateway checked the body's hash. The bytes within
+/// `keep` are kept as they pass.
+pub async fn to_s3(
+    origin: &Origin,
+    forward: &Forward,
+    source: &mut Connection,
+    keep: &[Range<u64>],
+) -> Sent {
+    let mut kept = Vec::new();
+    let (response, body_read) = {
+        let (sender, body) = Channel::<Bytes, io::Error>::new(2);
+        let body: RequestBody = body.boxed();
+        let sent = origin.forward(
+            &forward.method,
+            &forward.path,
+            &forward.query,
+            &forward.headers,
+            &forward.payload_hash,
+            body,
+            forward.len,
+        );
+        let sink = Keeping {
+            sink: sender,
+            offset: 0,
+            ranges: keep,
+            kept: &mut kept,
+        };
+        let mut sent = std::pin::pin!(sent);
+        let mut passing = std::pin::pin!(pass_body(source, forward.len, None, sink));
+        let mut passed = None;
+        let response = loop {
+            tokio::select! {
+                result = &mut passing, if passed.is_none() => passed = Some(result),
+                response = &mut sent => break response,
+            }
+            if passed.is_some() {
+                // The body is sent; S3 has a while to answer.
+                break tokio::time::timeout(origin::READ_TIMEOUT, &mut sent)
+                    .await
+                    .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()));
+            }
+        };
+        (response, matches!(passed, Some(Ok(_))))
     };
     Sent {
         response,
-        body_read: matches!(passed, Some(Ok(_))),
+        body_read,
+        kept,
     }
+}
+
+/// Whether a request uploads a whole object's body: a `PutObject`, rather
+/// than a part or a copy.
+pub fn uploads_object(forward: &Forward) -> bool {
+    let part = forward
+        .query
+        .split('&')
+        .any(|pair| pair.starts_with("partNumber=") || pair.starts_with("uploadId="));
+    forward.method == "PUT"
+        && forward.len > 0
+        && !part
+        && header(&forward.headers, "x-amz-copy-source").is_none()
 }
 
 /// Headers that describe a hop rather than the response.

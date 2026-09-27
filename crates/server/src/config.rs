@@ -308,6 +308,9 @@ pub struct PolicyConfig {
     /// Otherwise, how long metadata stays fresh.
     pub ttl_ms: u64,
     pub admit_on_first_read: bool,
+    /// The home stores what it holds of each upload that passes through
+    /// it, so the first read hits.
+    pub warm_on_write: bool,
 }
 
 impl Default for PolicyConfig {
@@ -316,6 +319,7 @@ impl Default for PolicyConfig {
             immutable: false,
             ttl_ms: 5_000,
             admit_on_first_read: false,
+            warm_on_write: false,
         }
     }
 }
@@ -328,6 +332,7 @@ impl PolicyConfig {
                 false => Freshness::Ttl(self.ttl_ms),
             },
             admit_on_first_read: self.admit_on_first_read,
+            warm_on_write: self.warm_on_write,
         }
     }
 }

@@ -153,6 +153,9 @@ pub struct Options {
     pub hot_replicas: usize,
     pub lease: u64,
     pub hot_percent: u64,
+    /// Whether each bucket's home stores the uploads that pass through it.
+    pub immutable_warm_on_write: bool,
+    pub ttl_warm_on_write: bool,
     /// One-way network delay, in ticks.
     pub delay_min: u64,
     pub delay_max: u64,
@@ -250,6 +253,8 @@ impl Options {
             hot_replicas: 0,
             lease: 0,
             hot_percent: 0,
+            immutable_warm_on_write: false,
+            ttl_warm_on_write: false,
         };
         // Timeouts outlast every exchange of a fault-free run, so only
         // faults make them fire: S3 answers within two hops, and a node
@@ -314,6 +319,8 @@ impl Options {
             true => 0,
             false => prng.range(10..=60),
         };
+        options.immutable_warm_on_write = prng.percent(50);
+        options.ttl_warm_on_write = prng.percent(50);
         options
     }
 
@@ -382,6 +389,8 @@ impl Options {
             hot_replicas: 2,
             lease: 1_000,
             hot_percent: 0,
+            immutable_warm_on_write: false,
+            ttl_warm_on_write: false,
         }
     }
 
@@ -399,12 +408,21 @@ impl Options {
     }
 
     fn node_config(&self) -> node::Config {
-        let policy = |freshness, admit_on_first_read| BucketPolicy {
+        let policy = |freshness, admit_on_first_read, warm_on_write| BucketPolicy {
             freshness,
             admit_on_first_read,
+            warm_on_write,
         };
-        let immutable = policy(Freshness::Immutable, self.immutable_admit_on_first_read);
-        let ttl = policy(Freshness::Ttl(self.ttl), self.ttl_admit_on_first_read);
+        let immutable = policy(
+            Freshness::Immutable,
+            self.immutable_admit_on_first_read,
+            self.immutable_warm_on_write,
+        );
+        let ttl = policy(
+            Freshness::Ttl(self.ttl),
+            self.ttl_admit_on_first_read,
+            self.ttl_warm_on_write,
+        );
         node::Config {
             layout: Layout::new(self.block_size, self.chunk_blocks),
             store: StoreConfig {
@@ -577,6 +595,8 @@ enum Message {
         key: ObjectKey,
         size: Option<u64>,
     },
+    /// S3's answer to a write, and for an upload, the version it made and
+    /// its size.
     OriginWriteResponse {
         run: u64,
         gateway: usize,
@@ -584,6 +604,7 @@ enum Message {
         key: ObjectKey,
         status: u16,
         applied: u64,
+        upload: Option<(ETag, u64)>,
     },
     NodeWriteResponse {
         change: u64,
@@ -887,6 +908,9 @@ pub struct Simulator {
     /// is longer than the given length ends there.
     cut_responses: BTreeMap<usize, u64>,
     cut_origin_responses: BTreeMap<usize, u64>,
+    /// Scripted: a write S3 applies just before it answers the next
+    /// request from a node.
+    write_before_answer: Option<(ObjectKey, u64)>,
     /// Scripted: forwards finish only once released.
     holding_forwards: bool,
     held_forwards: Vec<Event>,
@@ -1037,6 +1061,7 @@ impl Simulator {
             client_responses: BTreeMap::new(),
             cut_responses: BTreeMap::new(),
             cut_origin_responses: BTreeMap::new(),
+            write_before_answer: None,
             holding_forwards: false,
             held_forwards: Vec::new(),
             writes: BTreeMap::new(),
@@ -1142,6 +1167,12 @@ impl Simulator {
             self.tick()?;
         }
         self.settle()
+    }
+
+    /// Makes S3 write `size` bytes to `key` just before it answers the next
+    /// request from a node.
+    pub fn write_before_next_answer(&mut self, key: &ObjectKey, size: u64) {
+        self.write_before_answer = Some((key.clone(), size));
     }
 
     /// Makes the queue offer every event to `node`, whether or not it is up.
@@ -1684,6 +1715,7 @@ impl Simulator {
             summary.peer_bytes += stats.peer_bytes;
             summary.leases += stats.leases_granted;
             summary.leased_reads += stats.leased_reads;
+            summary.warmed_uploads += stats.warmed_uploads;
             summary.node_reads.push(stats.reads);
         }
         summary
@@ -2015,6 +2047,18 @@ impl Simulator {
             if status < 300 {
                 self.notify(&key);
             }
+            let upload = match (status, size) {
+                (200, Some(size)) => {
+                    let etag = self
+                        .origin
+                        .current(&key)
+                        .expect("just written")
+                        .etag
+                        .clone();
+                    Some((etag, size))
+                }
+                _ => None,
+            };
             if self.trace {
                 eprintln!(
                     "{} write {change} reached S3 via node {node}: {status}",
@@ -2028,6 +2072,7 @@ impl Simulator {
                 key,
                 status,
                 applied: self.now,
+                upload,
             };
             self.send(Address::Origin, Address::Node(node), response);
         }
@@ -2110,8 +2155,9 @@ impl Simulator {
             self.attempt(request);
         }
         // A write whose answer never comes may or may not have happened.
-        let before = self.now.saturating_sub(timeout);
-        self.changes.retain(|_, change| change.issued > before);
+        let now = self.now;
+        self.changes
+            .retain(|_, change| change.issued + timeout > now);
         for client in 0..self.options.clients {
             if self.issued == self.options.requests
                 || self.in_flight[client] == self.options.requests_in_flight
@@ -2463,6 +2509,9 @@ impl Simulator {
                     size,
                 },
             ) => {
+                if self.trace {
+                    eprintln!("{} node {node} takes write {change}", self.now);
+                }
                 let run = self.runs[node];
                 let message = Message::OriginWrite {
                     node,
@@ -2487,12 +2536,23 @@ impl Simulator {
                     key,
                     status,
                     applied,
+                    upload,
                     ..
                 },
             ) => {
-                // The home learns of the write before the gateway does.
+                // The home learns of the write before the gateway does, and
+                // stores the upload's home region if it warms on write.
                 if status < 300 {
                     self.node(node).on_write(now, &key);
+                    if let Some((etag, size)) = upload
+                        && let Some(kept) =
+                            self.node(node)
+                                .on_uploaded(now, key.clone(), etag.clone(), size)
+                    {
+                        let object = self.origin.version(&etag).expect("uploaded");
+                        let bytes = Body::whole(object.bytes(0..size));
+                        self.origin_bodies.insert((node, kept), bytes);
+                    }
                     self.drain_node(node)?;
                 }
                 let ring = (node, self.node(node).ring().version());
@@ -2671,7 +2731,12 @@ impl Simulator {
                         .percent(self.options.origin_error_percent)
                 {
                     true => (ResponseHead::status(503), Vec::new()),
-                    false => self.origin.respond_now(&read),
+                    false => {
+                        if let Some((key, size)) = self.write_before_answer.take() {
+                            self.put(&key, size);
+                        }
+                        self.origin.respond_now(&read)
+                    }
                 };
                 let mut body = Body::whole(body);
                 if let Some(&at) = self.cut_origin_responses.get(&node)
@@ -3536,6 +3601,8 @@ pub struct Summary {
     /// Leases owners granted, and reads replicas served under them.
     pub leases: u64,
     pub leased_reads: u64,
+    /// Uploads whose blocks their home stored as they passed through.
+    pub warmed_uploads: u64,
     /// Requests a node sent back because their object changed.
     pub retries: u64,
     pub origin_requests: u64,
@@ -3593,7 +3660,7 @@ impl fmt::Display for Summary {
         write!(
             f,
             "seed {} passed: {} ticks, {} writes ({} through gateways, {} around homes), {} events, \
-             {} leases serving {} reads, {} retries, responses {}, \
+             {} leases serving {} reads, {} uploads warmed, {} retries, responses {}, \
              {}% of body bytes from disk, {} S3 requests, {} bytes written, \
              {} blocks evicted, node reads {:?}, {} messages lost, {} server errors, \
              {} client retries, {} crashes, {} clean shutdowns, {} blocks verified, \
@@ -3607,6 +3674,7 @@ impl fmt::Display for Summary {
             self.events,
             self.leases,
             self.leased_reads,
+            self.warmed_uploads,
             self.retries,
             statuses.join(" "),
             self.hit_percent(),

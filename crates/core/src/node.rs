@@ -104,6 +104,9 @@ pub struct BucketPolicy {
     pub freshness: Freshness,
     /// Store blocks on their first read instead of their second.
     pub admit_on_first_read: bool,
+    /// Store the home's region of each upload that passes through the
+    /// home, so the first read hits.
+    pub warm_on_write: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -308,6 +311,8 @@ pub struct Stats {
     /// Reads served under a lease, and leases granted.
     pub leased_reads: u64,
     pub leases_granted: u64,
+    /// Uploads whose blocks the home stored as they passed through.
+    pub warmed_uploads: u64,
 }
 
 impl std::ops::AddAssign for Stats {
@@ -326,6 +331,7 @@ impl std::ops::AddAssign for Stats {
         self.peer_bytes += other.peer_bytes;
         self.leased_reads += other.leased_reads;
         self.leases_granted += other.leases_granted;
+        self.warmed_uploads += other.warmed_uploads;
     }
 }
 
@@ -501,6 +507,18 @@ enum Purpose {
         key: ObjectKey,
         request: GatewayRequestId,
         sent: Time,
+    },
+    /// The home's region of an upload this node passed to S3, which its
+    /// owner kept: version `etag` of `size` bytes, read by offset from the
+    /// object's start. S3 never answers it.
+    Kept {
+        key: ObjectKey,
+        etag: ETag,
+        size: u64,
+    },
+    /// A HEAD that checks S3 still holds the version a kept upload wrote.
+    WarmCheck {
+        kept: OriginRequestId,
     },
 }
 
@@ -936,8 +954,120 @@ impl Node {
                 let request = *request;
                 self.relay(request, origin, head);
             }
+            Purpose::WarmCheck { kept } => {
+                let kept = *kept;
+                self.warm_checked(origin, kept, head);
+            }
+            Purpose::Kept { .. } => unreachable!("S3 never answers a kept upload"),
         }
         self.release_if_unread(origin);
+    }
+
+    /// The bytes of an upload of `key`, `size` bytes long, that this node's
+    /// owner keeps as it passes the body to S3: the home's region, when the
+    /// bucket warms on write and this node is the key's home.
+    pub fn warm_region(&self, key: &ObjectKey, size: u64) -> Vec<std::ops::Range<u64>> {
+        match self.policy(&key.bucket).warm_on_write && self.is_home(key) {
+            true => self.config.layout.home_region(size),
+            false => Vec::new(),
+        }
+    }
+
+    /// S3 took an upload of `key` through this node as version `etag` of
+    /// `size` bytes, after `on_write`, and the owner kept the bytes
+    /// `warm_region` named. Returns the id to hold them under, as a body
+    /// read by offset from the object's start, and released once the node
+    /// is done: it checks S3 still holds the version with a HEAD, then
+    /// stores the blocks and the metadata.
+    pub fn on_uploaded(
+        &mut self,
+        now: Time,
+        key: ObjectKey,
+        etag: ETag,
+        size: u64,
+    ) -> Option<OriginRequestId> {
+        self.now = self.now.max(now);
+        if self.warm_region(&key, size).is_empty() {
+            return None;
+        }
+        let kept = OriginRequestId(self.next_origin);
+        self.next_origin += 1;
+        let purpose = Purpose::Kept {
+            key: key.clone(),
+            etag,
+            size,
+        };
+        // The check holds the body until its answer.
+        let request = OriginRequest {
+            purpose,
+            method: Method::Get,
+            sent: now,
+            timeout: self.config.origin_timeout,
+            peer: None,
+            answered: true,
+            cancelled: false,
+            body_start: 0,
+            readers: 1,
+            blocks: Vec::new(),
+            waiters: Vec::new(),
+        };
+        self.origins.insert(kept, request);
+        self.fetch(Purpose::WarmCheck { kept }, Request::head(key));
+        Some(kept)
+    }
+
+    /// S3 answered the HEAD for a kept upload. If it still holds the
+    /// upload's version, the home stores the region's blocks from the kept
+    /// bytes, and keeps the metadata if it has none: any it has came from
+    /// S3 since the write, and a change it learned of since the HEAD went
+    /// out makes the HEAD's stale.
+    fn warm_checked(&mut self, check: OriginRequestId, kept: OriginRequestId, head: ResponseHead) {
+        let sent = self.origins[&check].sent;
+        let Some(OriginRequest {
+            purpose: Purpose::Kept { key, etag, size },
+            ..
+        }) = self.origins.get(&kept)
+        else {
+            unreachable!("a check names its kept upload");
+        };
+        let (key, etag, size) = (key.clone(), etag.clone(), *size);
+        let current =
+            head.status == 200 && head.etag.as_ref() == Some(&etag) && head.content_length == size;
+        if current && self.is_home(&key) {
+            let unchanged = self
+                .written
+                .get(&key)
+                .is_none_or(|changed| *changed <= sent);
+            if unchanged && !self.objects.contains_key(&key) {
+                let meta = Meta {
+                    etag: etag.clone(),
+                    size,
+                    headers: head.headers.clone(),
+                };
+                self.know(key.clone(), meta, sent);
+            }
+            // The version stays while the loop runs, though a reservation
+            // may evict its other blocks.
+            let version = self.version(&key, &etag);
+            self.refer(version);
+            let layout = self.config.layout;
+            for range in layout.home_region(size) {
+                for index in layout.blocks_covering(range.start, range.end - 1) {
+                    let block = BlockKey { version, index };
+                    if self.store.get(&block).is_some() || self.in_flight.contains_key(&block) {
+                        continue;
+                    }
+                    if let Some(location) = self.admit(&key, size, block, true) {
+                        let span = layout.block_span(size, index);
+                        self.track_in_flight(block, kept);
+                        self.write(location, kept, span.start, span.end - span.start);
+                    }
+                }
+            }
+            self.unref(version);
+            self.stats.warmed_uploads += 1;
+        }
+        self.stop_reading(kept);
     }
 
     /// A write to `key` passed through this node and succeeded: its
@@ -2709,6 +2839,7 @@ mod tests {
         let policy = BucketPolicy {
             freshness: Freshness::Immutable,
             admit_on_first_read: false,
+            warm_on_write: false,
         };
         Config {
             layout: Layout::new(64, 1),

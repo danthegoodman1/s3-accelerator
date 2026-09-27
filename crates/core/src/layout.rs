@@ -61,6 +61,22 @@ impl Layout {
         (!home).then_some(index / self.chunk_blocks)
     }
 
+    /// The bytes of an object of `size` bytes that its home holds, as one
+    /// range or two: chunk 0, and the blocks overlapping the final
+    /// chunk-sized region.
+    pub fn home_region(self, size: u64) -> Vec<Range<u64>> {
+        let mut ranges: Vec<Range<u64>> = Vec::new();
+        for index in (0..self.block_count(size)).filter(|&index| self.chunk(size, index).is_none())
+        {
+            let span = self.block_span(size, index);
+            match ranges.last_mut() {
+                Some(last) if last.end == span.start => last.end = span.end,
+                _ => ranges.push(span),
+            }
+        }
+        ranges
+    }
+
     /// Bytes `first..=last` split into runs that share a placement, in
     /// order.
     pub fn runs(
@@ -101,6 +117,17 @@ mod tests {
             bucket: "b".into(),
             key: "k".into(),
         }
+    }
+
+    #[test]
+    fn the_home_region_is_chunk_0_and_the_tail() {
+        let layout = Layout::new(10, 4);
+        assert_eq!(layout.home_region(0), Vec::<Range<u64>>::new());
+        assert_eq!(layout.home_region(75), vec![Range { start: 0, end: 75 }]);
+        assert_eq!(layout.home_region(80), vec![Range { start: 0, end: 80 }]);
+        // Chunk 0 is bytes 0..40, and the final 40 bytes start at 105, in
+        // block 10.
+        assert_eq!(layout.home_region(145), [0..40, 100..145]);
     }
 
     fn chunk_of(layout: Layout, size: u64, index: u64) -> Option<u64> {

@@ -78,3 +78,23 @@ fn a_read_sent_around_the_home_reads_s3() {
         panic!("{failure}");
     }
 }
+
+/// Seed 947: a warm check found metadata the home had fetched since the
+/// write, with requests waiting on its revalidation, and replaced it,
+/// dropping the requests.
+#[test]
+fn a_warm_check_keeps_metadata_the_home_has() {
+    if let Err(failure) = Simulator::from_seed(947).run() {
+        panic!("{failure}");
+    }
+}
+
+/// Seed 6265: storing a warmed block evicted another block of the same
+/// version, its last reference, and the next block's admission found the
+/// version gone.
+#[test]
+fn warming_keeps_its_version_while_it_stores_blocks() {
+    if let Err(failure) = Simulator::from_seed(6265).run() {
+        panic!("{failure}");
+    }
+}
