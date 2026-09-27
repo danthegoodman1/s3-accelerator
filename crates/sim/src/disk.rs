@@ -79,6 +79,16 @@ impl Disk {
         self.unsynced = lost.to_vec();
     }
 
+    /// Replaces the metadata file with `entries`, durably, in place of every
+    /// entry appended so far.
+    pub fn rewrite_metadata(&mut self, entries: Vec<(ObjectKey, Meta)>) {
+        self.unsynced.clear();
+        self.metadata = entries
+            .into_iter()
+            .map(|(key, meta)| (key, Some(meta)))
+            .collect();
+    }
+
     /// Entries appended but not yet durable.
     pub fn unsynced(&self) -> usize {
         self.unsynced.len()

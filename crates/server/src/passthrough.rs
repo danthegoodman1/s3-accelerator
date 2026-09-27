@@ -196,8 +196,9 @@ pub async fn to_s3(
 }
 
 /// Whether a request uploads a whole object's bytes as its body: a
-/// `PutObject`, rather than a part, a copy, or a body in aws-chunked
-/// encoding, whose bytes on the wire are not the object's.
+/// `PutObject`, rather than a part, a copy, a body in aws-chunked encoding,
+/// whose bytes on the wire are not the object's, or one S3 encrypts with
+/// the client's key, which the cache never holds.
 pub fn uploads_object(forward: &Forward) -> bool {
     let part = forward
         .query
@@ -210,6 +211,11 @@ pub fn uploads_object(forward: &Forward) -> bool {
         && !part
         && !chunked
         && header(&forward.headers, "x-amz-copy-source").is_none()
+        && header(
+            &forward.headers,
+            "x-amz-server-side-encryption-customer-key",
+        )
+        .is_none()
 }
 
 /// Headers that describe a hop rather than the response.
@@ -317,5 +323,7 @@ mod tests {
         let mut part = put("UNSIGNED-PAYLOAD", &[]);
         part.query = "partNumber=1&uploadId=x".into();
         assert!(!uploads_object(&part));
+        let customer_key = [("x-amz-server-side-encryption-customer-key", "a2V5")];
+        assert!(!uploads_object(&put("UNSIGNED-PAYLOAD", &customer_key)));
     }
 }

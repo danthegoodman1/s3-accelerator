@@ -2,7 +2,7 @@
 //! other node drop theirs, telling each again until it confirms.
 
 use s3_accelerator_core::s3::{ObjectKey, Request};
-use s3_accelerator_sim::{Options, Simulator, TTL_BUCKET};
+use s3_accelerator_sim::{IMMUTABLE_BUCKET, Options, Simulator, TTL_BUCKET};
 
 /// Three nodes, 64-byte blocks in 4-block chunks, blocks stored on their
 /// first read: a 1,500-byte object's middle chunks spread across nodes.
@@ -119,4 +119,33 @@ fn a_purge_during_a_read_leaves_nothing_a_crash_restores() {
     sim.crash(home).unwrap();
     sim.restart(home).unwrap();
     assert_eq!(sim.recorded_blocks_of(home, &key), 0);
+}
+
+/// A gateway keeps an immutable object's metadata for the purge window at
+/// most, so a purge reaches every gateway within it: a gateway that cached
+/// the object answers a HEAD from its cache until then, and after it asks
+/// the home, which purged the metadata and fetches it again.
+#[test]
+fn a_purge_reaches_every_gateway_within_the_purge_window() {
+    let mut options = options();
+    options.gateways = 2;
+    let mut sim = Simulator::new(1, options);
+    let key = ObjectKey {
+        bucket: IMMUTABLE_BUCKET.into(),
+        key: "k".into(),
+    };
+    sim.put(&key, 100);
+    let head = |sim: &mut Simulator| {
+        let before = sim.summary().origin_requests;
+        let (head, _) = sim.read_through(1, Request::head(key.clone())).unwrap();
+        assert_eq!(head.status, 200);
+        sim.summary().origin_requests - before
+    };
+    assert_eq!(head(&mut sim), 1);
+    sim.purge(&key).unwrap();
+    assert_eq!(head(&mut sim), 0, "within the purge window");
+    for _ in 0..5_000 {
+        sim.step().unwrap();
+    }
+    assert_eq!(head(&mut sim), 1, "after the purge window");
 }

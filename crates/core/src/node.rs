@@ -245,6 +245,9 @@ pub enum Action {
     /// Append to the metadata file that `key`'s saved metadata no longer
     /// holds.
     Forget { key: ObjectKey },
+    /// Replace the metadata file with `entries`, least recently used first,
+    /// so a start keeps the most recently used up to capacity.
+    RewriteMetadata { entries: Vec<(ObjectKey, Meta)> },
     /// Check the `len` bytes of the block at `location` against the
     /// checksum its record held, then call `on_verified`.
     Verify {
@@ -400,6 +403,9 @@ pub struct Node {
     /// Known objects by when they were last used, oldest first.
     recency: BTreeMap<u64, ObjectKey>,
     next_use: u64,
+    /// Entries the metadata file holds, which the home rewrites past twice
+    /// the metadata capacity.
+    saved_entries: usize,
     versions: BTreeMap<VersionId, Version>,
     store: Store,
     doorkeeper: Doorkeeper,
@@ -449,13 +455,15 @@ enum Object {
 }
 
 /// A hot placement this node owns: the replicas it leased it to, when their
-/// leases run out, when it granted them, the reads since, its own and those
-/// replicas reported, and whether it let the leases end.
+/// leases run out, when it granted them, its own reads since, the reads
+/// replicas reported over the lease's first half, and whether it let the
+/// leases end.
 struct Hot {
     replicas: Vec<NodeId>,
     until: Time,
     granted: Time,
     reads: u64,
+    replica_reads: u64,
     ending: bool,
 }
 
@@ -525,8 +533,12 @@ enum Purpose {
     },
     Fill {
         version: VersionId,
+        size: u64,
         last_byte: u64,
         stored: Vec<(BlockKey, Location)>,
+        /// The blocks skipped the doorkeeper because a previous owner was
+        /// asked for them; if the fill goes to S3, they pass it after all.
+        provisional: bool,
     },
     /// Metadata asked of the object's previous home, for the request that
     /// found none.
@@ -609,6 +621,7 @@ impl Node {
             objects: BTreeMap::new(),
             recency: BTreeMap::new(),
             next_use: 0,
+            saved_entries: 0,
             versions: BTreeMap::new(),
 
             origins: BTreeMap::new(),
@@ -653,6 +666,7 @@ impl Node {
             };
         }
         for (key, meta) in metadata {
+            node.saved_entries += 1;
             match meta {
                 Some(meta) => node.keep(key, meta, Time::default()),
                 None => {
@@ -1361,7 +1375,7 @@ impl Node {
         self.changed(key);
         if self.policy(&key.bucket).freshness == Freshness::Immutable {
             let key = key.clone();
-            self.actions.push(Action::Forget { key });
+            self.save(Action::Forget { key });
         }
         match self.objects.get_mut(key) {
             Some(Object::Fetching { superseded, .. }) => *superseded = true,
@@ -1400,7 +1414,7 @@ impl Node {
     pub fn on_lease_report(&mut self, now: Time, placement: PlacementHash, reads: u64) {
         self.now = self.now.max(now);
         if let Some(hot) = self.hot.get_mut(&placement) {
-            hot.reads += reads;
+            hot.replica_reads += reads;
         }
     }
 
@@ -1489,6 +1503,7 @@ impl Node {
             until,
             granted: now,
             reads: 0,
+            replica_reads: 0,
             ending: false,
         };
         self.hot.insert(placement, hot);
@@ -1528,8 +1543,11 @@ impl Node {
         for placement in due {
             let hot = &self.hot[&placement];
             let period = now.0.saturating_sub(hot.granted.0).max(1);
-            // At least half the promotion rate, counted over the lease.
-            let busy = hot.reads * window * 2 >= self.config.hot_threshold * period;
+            // At least half the promotion rate: the owner's reads over the
+            // lease so far, and the replicas' over the half they reported.
+            let reported = half.max(1);
+            let busy = (hot.reads * reported + hot.replica_reads * period) * window * 2
+                >= self.config.hot_threshold * period * reported;
             if busy && self.ring.owner(placement) == Some(self.id) {
                 self.lease_out(now, placement);
             } else if let Some(hot) = self.hot.get_mut(&placement) {
@@ -2534,16 +2552,23 @@ impl Node {
             if_match: Some(etag.clone()),
             if_none_match: None,
         };
-        let purpose = Purpose::Fill {
-            version,
-            last_byte,
-            stored: Vec::new(),
-        };
         // A run shares one placement, so one node owns it, and owned it.
         let placement = layout.placement(key, size, *run.start()).hash();
-        let peer = match self.ring.owner(placement) == Some(self.id) {
+        let owner = self.ring.owner(placement) == Some(self.id);
+        let peer = match owner {
             true => self.previous_owner(placement),
             false => self.lease_owner(placement),
+        };
+        // A replica admits a leased placement's blocks without the
+        // doorkeeper; an owner, those a previous owner supplies.
+        let leased = !owner && self.leased(placement);
+        let skip_doorkeeper = leased || peer.is_some() || prefetch;
+        let purpose = Purpose::Fill {
+            version,
+            size,
+            last_byte,
+            stored: Vec::new(),
+            provisional: owner && peer.is_some() && !prefetch,
         };
         let origin = match peer {
             Some(peer) => {
@@ -2562,7 +2587,7 @@ impl Node {
         for index in run {
             let block = BlockKey { version, index };
             self.track_in_flight(block, origin);
-            if let Some(location) = self.admit(key, size, block, peer.is_some() || prefetch) {
+            if let Some(location) = self.admit(key, size, block, skip_doorkeeper) {
                 stored.push((block, location));
             }
         }
@@ -2580,6 +2605,7 @@ impl Node {
             version,
             last_byte,
             stored,
+            ..
         } = &request.purpose
         else {
             unreachable!("fill_answered on a fill");
@@ -2648,15 +2674,36 @@ impl Node {
         let request = &self.origins[&old];
         let Purpose::Fill {
             version,
+            size,
             last_byte,
             stored,
+            provisional,
         } = &request.purpose
         else {
             unreachable!("only fills are refilled");
         };
-        let (version, last_byte, stored) = (*version, *last_byte, stored.clone());
+        let (version, size, last_byte, provisional) = (*version, *size, *last_byte, *provisional);
+        let stored = stored.clone();
         let first = request.body_start;
         let (key, etag) = self.name(version).clone();
+        // The previous owner lacked the blocks, so S3's pass the doorkeeper.
+        let stored = match provisional {
+            true => {
+                let mut kept = Vec::new();
+                for (block, location) in stored {
+                    if self.passes_doorkeeper(&key, size, block) {
+                        kept.push((block, location));
+                    } else {
+                        let len = self.store.get(&block).expect("stored block reserved").len;
+                        self.store.remove(block);
+                        self.filling_bytes -= len;
+                        self.unref(block.version);
+                    }
+                }
+                kept
+            }
+            false => stored,
+        };
         let s3 = Request {
             method: Method::Get,
             key,
@@ -2669,8 +2716,10 @@ impl Node {
         };
         let purpose = Purpose::Fill {
             version,
+            size,
             last_byte,
             stored,
+            provisional: false,
         };
         let new = self.fetch(purpose, s3);
         let request = self.origins.get_mut(&old).expect("refilled fill");
@@ -2958,19 +3007,7 @@ impl Node {
             return None;
         }
         let hash = block_hash(block.version, layout.block_size(), block.index);
-        // A block at a format's spot is metadata every reader asks for.
-        let at_spot = Format::of(key)
-            .and_then(|format| format.spot(size))
-            .is_some_and(|spot| {
-                let span = layout.block_span(size, block.index);
-                span.start < spot.end && spot.start < span.end
-            });
-        if !skip_doorkeeper
-            && !at_spot
-            && !self.policy(&key.bucket).admit_on_first_read
-            && !self.doorkeeper.contains(hash)
-        {
-            self.doorkeeper.insert(hash);
+        if !skip_doorkeeper && !self.passes_doorkeeper(key, size, block) {
             return None;
         }
         let span = layout.block_span(size, block.index);
@@ -2992,6 +3029,27 @@ impl Node {
         let location = location?;
         self.filling_bytes += len;
         Some(location)
+    }
+
+    /// Whether a block goes to disk by the doorkeeper's rules: it lies at a
+    /// format's spot, its bucket admits on first read, or the doorkeeper
+    /// saw it lately. A block turned away marks the doorkeeper.
+    fn passes_doorkeeper(&mut self, key: &ObjectKey, size: u64, block: BlockKey) -> bool {
+        let layout = self.config.layout;
+        let hash = block_hash(block.version, layout.block_size(), block.index);
+        // A block at a format's spot is metadata every reader asks for.
+        let at_spot = Format::of(key)
+            .and_then(|format| format.spot(size))
+            .is_some_and(|spot| {
+                let span = layout.block_span(size, block.index);
+                span.start < spot.end && spot.start < span.end
+            });
+        if at_spot || self.policy(&key.bucket).admit_on_first_read || self.doorkeeper.contains(hash)
+        {
+            return true;
+        }
+        self.doorkeeper.insert(hash);
+        false
     }
 
     fn write(&mut self, location: Location, origin: OriginRequestId, offset: u64, len: u64) {
@@ -3048,11 +3106,35 @@ impl Node {
     /// Keeps metadata the home just validated, and saves it if its bucket
     /// is immutable.
     fn know(&mut self, key: ObjectKey, meta: Meta, validated: Time) {
+        self.keep(key.clone(), meta.clone(), validated);
         if self.policy(&key.bucket).freshness == Freshness::Immutable {
-            let (key, meta) = (key.clone(), meta.clone());
-            self.actions.push(Action::Remember { key, meta });
+            self.save(Action::Remember { key, meta });
         }
-        self.keep(key, meta, validated);
+    }
+
+    /// Appends an entry to the metadata file, and rewrites the file once it
+    /// holds twice the metadata capacity.
+    fn save(&mut self, entry: Action) {
+        self.actions.push(entry);
+        self.saved_entries += 1;
+        if self.saved_entries > 2 * self.config.metadata_capacity {
+            let entries = self.saved_metadata();
+            self.saved_entries = entries.len();
+            self.actions.push(Action::RewriteMetadata { entries });
+        }
+    }
+
+    /// The metadata the home saves, of immutable buckets, least recently
+    /// used first: what a rewrite of the metadata file holds.
+    pub fn saved_metadata(&self) -> Vec<(ObjectKey, Meta)> {
+        self.recency
+            .values()
+            .filter(|key| self.policy(&key.bucket).freshness == Freshness::Immutable)
+            .filter_map(|key| match self.objects.get(key) {
+                Some(Object::Known { meta, .. }) => Some((key.clone(), meta.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Keeps metadata in place of any the key had, then drops the least

@@ -335,6 +335,34 @@ fn blocks_from_a_previous_owner_skip_the_doorkeeper() {
     assert_eq!(second.origin_requests, 0);
 }
 
+/// Objects read once before a node joins leave their homes knowing their
+/// metadata, and the doorkeepers keep every block off the disks. After the
+/// ring change, the joined node asks previous owners first, which lack the
+/// blocks, so its fills go to S3 and pass its doorkeeper: rereading every
+/// object once stores nothing on it.
+#[test]
+fn fills_a_previous_owner_lacks_pass_the_doorkeeper() {
+    let keys = keys(0, IMMUTABLE_BUCKET);
+    let mut options = cluster(0, 50_000);
+    options.immutable_admit_on_first_read = false;
+    let mut sim = Simulator::new(0, options);
+    run(&mut sim, 300);
+    for (key, size) in &keys {
+        sim.put(key, *size);
+        sim.read(Request::get(key.clone())).unwrap();
+    }
+    let joined = sim.add_node().unwrap();
+    settle_ring(&mut sim, &keys[0].0);
+    let before = sim.summary();
+    reread(&mut sim, &keys);
+    assert!(sim.summary().peer_requests > before.peer_requests);
+    let stored: usize = keys
+        .iter()
+        .map(|(key, _)| sim.recorded_blocks_of(joined, key))
+        .sum();
+    assert_eq!(stored, 0);
+}
+
 /// A gateway still on the old ring tells the old home of a write to an
 /// object whose metadata the new home already copied. The old home passes
 /// the write on, and the next read through the new home returns the

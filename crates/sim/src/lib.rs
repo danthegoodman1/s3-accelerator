@@ -87,6 +87,8 @@ pub struct Options {
     /// keeps metadata of objects that may change.
     pub gateway_metadata_capacity: usize,
     pub gateway_metadata_ttl: u64,
+    /// Ticks a gateway keeps metadata of immutable objects.
+    pub purge_window: u64,
     /// Chance that a gateway's range read reaches a node that does not own
     /// its blocks, as when gateways and nodes disagree about the ring.
     pub misroute_percent: u64,
@@ -226,6 +228,7 @@ impl Options {
             // their values for every seed.
             gateway_metadata_capacity: prng.range(1..=32) as usize,
             gateway_metadata_ttl: prng.range(0..=200),
+            purge_window: 5_000,
             misroute_percent: prng.range(0..=20),
             origin_timeout: 0,
             node_timeout: 0,
@@ -355,6 +358,7 @@ impl Options {
             metadata_capacity: 1_024,
             gateway_metadata_capacity: 1_024,
             gateway_metadata_ttl: 1_000,
+            purge_window: 5_000,
             misroute_percent: 0,
             origin_timeout: 1_000,
             node_timeout: 1_000,
@@ -418,6 +422,7 @@ impl Options {
             buckets: node.buckets,
             metadata_capacity: self.gateway_metadata_capacity,
             metadata_ttl: self.gateway_metadata_ttl,
+            purge_window: self.purge_window,
             node_timeout: self.node_timeout,
             suspect_ttl: self.suspect_ttl,
         }
@@ -1811,6 +1816,11 @@ impl Simulator {
         found.is_some()
     }
 
+    /// Entries in `node`'s metadata file, durable or not.
+    pub fn metadata_file_entries(&self, node: usize) -> usize {
+        self.disks[node].metadata.len() + self.disks[node].unsynced()
+    }
+
     /// The simulated time, in ticks.
     pub fn now(&self) -> u64 {
         self.now
@@ -2002,8 +2012,9 @@ impl Simulator {
             for location in writes {
                 self.written(node, location)?;
             }
+            let entries = self.node(node).saved_metadata();
             let disk = &mut self.disks[node];
-            disk.keep_appended(disk.unsynced());
+            disk.rewrite_metadata(entries);
             disk.shut_down();
             self.summary.clean_shutdowns += 1;
         } else {
@@ -3332,6 +3343,9 @@ impl Simulator {
                 node::Action::Forget { key } => {
                     let delay = self.disk_delays.range(0..=self.options.disk_delay_max);
                     self.disks[node].append(self.now + delay, key, None);
+                }
+                node::Action::RewriteMetadata { entries } => {
+                    self.disks[node].rewrite_metadata(entries);
                 }
                 node::Action::Verify {
                     location,

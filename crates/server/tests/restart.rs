@@ -41,6 +41,42 @@ async fn a_clean_restart_keeps_the_cache_warm() {
         .await;
 }
 
+/// A clean shutdown rewrites the metadata file least recently used first,
+/// so a restart keeps the metadata the node used last: here, one it served
+/// from memory after fetching it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_clean_restart_keeps_the_most_recently_used_metadata() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            let dir = data_dir();
+            let cache = "block_size = 65536\nextent_size = 1048576\nextents = 8\n\
+                         metadata_capacity = 4\ngateway_metadata_capacity = 1";
+            let start = || Server::start_with(origin_port, &dir, GRANTS, IMMUTABLE, cache);
+            let head = |server: &Server, index: usize| {
+                let (port, path) = (server.port, format!("/bucket/k{index}"));
+                async move { send(port, "HEAD", &path, "", &[], Vec::new()).await.0 }
+            };
+            let server = start().await;
+            for index in 0..20 {
+                assert_eq!(head(&server, index).await, 200);
+            }
+            // The node holds k16 to k19; k16, served again, is used after
+            // k19, and k20 then takes k17's place.
+            let fetched = origin.requests.get();
+            assert_eq!(head(&server, 16).await, 200);
+            assert_eq!(origin.requests.get(), fetched);
+            assert_eq!(head(&server, 20).await, 200);
+            server.stop().await;
+            let server = start().await;
+            let fetched = origin.requests.get();
+            assert_eq!(head(&server, 16).await, 200);
+            assert_eq!(origin.requests.get(), fetched);
+            server.stop().await;
+        })
+        .await;
+}
+
 /// After a crash the node verifies each block before serving it. Blocks
 /// that pass come from the disk; one damaged block comes from S3 again.
 #[tokio::test(flavor = "current_thread")]

@@ -178,6 +178,62 @@ async fn blocks_are_synced_before_their_records_and_clears_before_reuse() {
         .await;
 }
 
+/// A purge frees its blocks' storage and syncs the slab file before the
+/// client hears it succeeded, so no crash brings the bytes back.
+#[tokio::test(flavor = "current_thread")]
+async fn a_purge_syncs_its_erased_bytes_before_it_confirms() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            origin.size.set(OBJECT_SIZE);
+            let dir = data_dir();
+            let cluster = Cluster::new(&dir, origin_port, "block_size = 65536");
+            let node = Process::traced(
+                &cluster.node,
+                &dir.join("node.trace"),
+                "fallocate,fdatasync",
+            );
+            common::listening(cluster.node_port).await;
+            let _gateway = cluster.start_gateway().await;
+            let body = origin.object("/bucket/k");
+            assert!(cluster.get("k").await == (200, body));
+            // The blocks' writes finish.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let asked = now();
+            let (status, _) = common::send(
+                cluster.gateway_port,
+                "POST",
+                "/bucket/k",
+                "x-accel-purge=",
+                &[],
+                Vec::new(),
+            )
+            .await;
+            let confirmed = now();
+            assert_eq!(status, 204);
+            node.stop();
+
+            let calls = read_trace(&dir.join("node.trace"), asked, confirmed);
+            let on_slabs =
+                |call: &&Call| call.fds().first().is_some_and(|fd| fd.ends_with("/slabs>"));
+            let punched: Vec<&Call> = calls
+                .iter()
+                .filter(on_slabs)
+                .filter(|call| call.name == "fallocate" && call.result == 0)
+                .collect();
+            assert_eq!(punched.len(), 3, "one hole per block");
+            let last = punched.iter().map(|call| call.end).fold(0.0, f64::max);
+            let synced = calls.iter().filter(on_slabs).any(|call| {
+                call.name == "fdatasync" && call.start >= last && call.end <= confirmed
+            });
+            assert!(
+                synced,
+                "the slab file was not synced after its holes and before the purge confirmed"
+            );
+        })
+        .await;
+}
+
 /// Slots cleared before `time`, by slab offset: when each clear ended, and
 /// the slot's size under its last record.
 fn cleared_slots(

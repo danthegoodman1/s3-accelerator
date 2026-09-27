@@ -62,7 +62,8 @@ MUTANTS = [
     ),
     (
         "doorkeeper admits on the first read",
-        [(NODE, "&& !self.policy(&key.bucket).admit_on_first_read\n            && !self.doorkeeper.contains(hash)", "&& false")],
+        [(NODE, "self.policy(&key.bucket).admit_on_first_read || self.doorkeeper.contains(hash)",
+                "self.policy(&key.bucket).admit_on_first_read || true")],
     ),
     (
         "response leaves its blocks unpinned",
@@ -164,8 +165,8 @@ MUTANTS = [
     ),
     (
         "blocks from a previous owner wait for the doorkeeper",
-        [(NODE, "if let Some(location) = self.admit(key, size, block, peer.is_some() || prefetch) {",
-          "if let Some(location) = self.admit(key, size, block, prefetch) {")],
+        [(NODE, "let skip_doorkeeper = leased || peer.is_some() || prefetch;",
+                "let skip_doorkeeper = leased || prefetch;")],
     ),
     (
         "nodes never announce again to silent seeds",
@@ -333,8 +334,8 @@ MUTANTS = [
     ),
     (
         "the gateway sends preconditions to the home",
-        [(GATEWAY, "if !direct && let Some(cached) = self.cache.fresh(&key, arrived, policy, ttl) {",
-          "if !direct && self.reads[&id].request.if_none_match.is_none() && let Some(cached) = self.cache.fresh(&key, arrived, policy, ttl) {")],
+        [(GATEWAY, "if !direct && let Some(cached) = self.cache.fresh(&key, arrived, policy, ttl, purge_window) {",
+          "if !direct && self.reads[&id].request.if_none_match.is_none() && let Some(cached) = self.cache.fresh(&key, arrived, policy, ttl, purge_window) {")],
     ),
     (
         "a read that keeps finding its object changed never goes direct",
@@ -442,7 +443,7 @@ MUTANTS = [
     ),
     (
         "immutable metadata is not saved",
-        [(NODE, "let (key, meta) = (key.clone(), meta.clone());\n            self.actions.push(Action::Remember { key, meta });", "")],
+        [(NODE, "self.save(Action::Remember { key, meta });", "let _ = (key, meta);")],
     ),
     (
         "a restart brings back metadata a write dropped",
@@ -545,7 +546,8 @@ MUTANTS = [
     ),
     (
         "a lease never runs out",
-        [(NODE, "let busy = hot.reads * window * 2 >= self.config.hot_threshold * period;", "let busy = period > 0;")],
+        [(NODE, "let busy = (hot.reads * reported + hot.replica_reads * period) * window * 2\n                >= self.config.hot_threshold * period * reported;",
+                "let busy = period > 0;")],
     ),
     (
         "a gateway ignores hot hints",
@@ -574,7 +576,8 @@ MUTANTS = [
     ),
     (
         "a spot's blocks wait for the doorkeeper",
-        [(NODE, "&& !at_spot", "&& !(at_spot && false)")],
+        [(NODE, "if at_spot || self.policy(&key.bucket).admit_on_first_read",
+                "if (at_spot && false) || self.policy(&key.bucket).admit_on_first_read")],
     ),
     (
         "a first fetch of a spot stores none of it",
@@ -701,6 +704,51 @@ MUTANTS = [
         "nodes take requests without the cluster's secret",
         [(NODE_ENGINE, "if !given.is_some_and(|given| constant_time_eq(given.as_bytes(), secret.as_bytes())) {",
                        "if false {")],
+    ),
+    (
+        "a refill from S3 skips the doorkeeper",
+        [(NODE, "provisional: owner && peer.is_some() && !prefetch,", "provisional: false,")],
+    ),
+    (
+        "replicas whose owner is gone pass the doorkeeper",
+        [(NODE, "let skip_doorkeeper = leased || peer.is_some() || prefetch;",
+                "let skip_doorkeeper = peer.is_some() || prefetch;")],
+    ),
+    (
+        "lease renewal counts replicas' reads over the whole lease",
+        [(NODE, "let busy = (hot.reads * reported + hot.replica_reads * period) * window * 2",
+                "let busy = (hot.reads * reported + hot.replica_reads * reported) * window * 2")],
+    ),
+    (
+        "the metadata file is never rewritten",
+        [(NODE, "if self.saved_entries > 2 * self.config.metadata_capacity {", "if false {")],
+    ),
+    (
+        "a metadata rewrite keeps the most recently used first",
+        [(NODE, ".filter(|key| self.policy(&key.bucket).freshness == Freshness::Immutable)",
+                ".rev()\n            .filter(|key| self.policy(&key.bucket).freshness == Freshness::Immutable)")],
+    ),
+    (
+        "a clean shutdown leaves the metadata file in fetch order",
+        [(NODE_ENGINE, "this.disk.rewrite_metadata(&this.node.saved_metadata())?;", "")],
+    ),
+    (
+        "a purge confirms before its erased bytes are synced",
+        [(NODE_ENGINE, "disk.sync_slabs()?;", "")],
+    ),
+    (
+        "a start without room for its slab file goes ahead",
+        [(DISK, "fallocate(&slabs, FallocateFlags::empty(), 0, slabs_len).map_err(|error| {",
+                "Ok::<(), io::Error>(()).map_err(|error: io::Error| {")],
+    ),
+    (
+        "gateways keep immutable metadata past the purge window",
+        [(GATEWAY, "Freshness::Immutable => cached.received.0 + purge_window >= arrived.0,",
+                   "Freshness::Immutable => true,")],
+    ),
+    (
+        "an upload with the client's encryption key is warmed",
+        [(PASSTHROUGH, '&& header(&forward.headers, "x-amz-server-side-encryption-customer-key").is_none()', "")],
     ),
     (
         "reads waiting on a newly down node wait out the timeout",

@@ -128,9 +128,9 @@ pub struct NodeEngine {
     events: Events,
     /// Bytes of uploads the node may still keep for warming.
     warm_budget: u64,
-    /// An append to the purge log failed since the last purge, which then
-    /// fails rather than confirm.
-    purge_log_failed: bool,
+    /// An append to the purge log or an erasure failed since the last
+    /// purge, which then fails rather than confirm.
+    purge_failed: bool,
 }
 
 /// Messages from S3's event queue while the core works through their
@@ -200,7 +200,7 @@ impl NodeEngine {
             unsynced_metadata: false,
             events: Events::default(),
             warm_budget: WARM_BUDGET,
-            purge_log_failed: false,
+            purge_failed: false,
         }));
         // A recovering node's first actions clear records it cannot use.
         let work = engine.borrow_mut().pump();
@@ -334,14 +334,17 @@ impl NodeEngine {
             let now = this.now();
             this.node.on_purge(now, key, passed_on);
             let work = this.pump();
-            (work, !std::mem::take(&mut this.purge_log_failed))
+            (work, !std::mem::take(&mut this.purge_failed))
         };
         start(engine, work);
         if !logged {
-            return Err(io::Error::other("the purge log could not be written"));
+            return Err(io::Error::other("the purge could not be logged or erased"));
         }
         let disk = engine.borrow().disk.clone();
         tokio::task::spawn_blocking(move || {
+            // The erased slots' bytes, then the records that no longer
+            // name them.
+            disk.sync_slabs()?;
             disk.sync_table()?;
             disk.sync_metadata()?;
             disk.sync_purges()
@@ -487,9 +490,12 @@ impl NodeEngine {
         engine.borrow().node.is_idle()
     }
 
-    /// Syncs the disk and marks its slot table clean. Call once idle.
+    /// Rewrites the metadata file least recently used first, syncs the
+    /// disk and marks its slot table clean. Call once idle.
     pub fn shut_down(engine: &SharedNode) -> io::Result<()> {
-        engine.borrow().disk.shut_down()
+        let this = engine.borrow();
+        this.disk.rewrite_metadata(&this.node.saved_metadata())?;
+        this.disk.shut_down()
     }
 
     /// Carries out every action until the node has none left, and returns
@@ -589,6 +595,12 @@ impl NodeEngine {
             }
             node::Action::Remember { key, meta } => self.save(&key, Some(&meta)),
             node::Action::Forget { key } => self.save(&key, None),
+            // Rare: once the file holds twice the metadata capacity.
+            node::Action::RewriteMetadata { entries } => {
+                if let Err(error) = self.disk.rewrite_metadata(&entries) {
+                    eprintln!("rewriting the metadata file: {error}");
+                }
+            }
             node::Action::Verify {
                 location,
                 len,
@@ -600,12 +612,13 @@ impl NodeEngine {
             node::Action::Erase { location, len } => {
                 if let Err(error) = self.disk.erase(location, len) {
                     eprintln!("erasing {location:?}: {error}");
+                    self.purge_failed = true;
                 }
             }
             node::Action::SavePurge { key, nodes } => {
                 if let Err(error) = self.disk.save_purge(&key, &nodes) {
                     eprintln!("saving the purge of {key:?}: {error}");
-                    self.purge_log_failed = true;
+                    self.purge_failed = true;
                 }
             }
             node::Action::PassPurge { node, key } => self.work.purges.push((node, key)),

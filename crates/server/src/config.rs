@@ -290,6 +290,9 @@ pub struct CacheConfig {
     /// metadata of objects that may change, in milliseconds.
     pub gateway_metadata_capacity: usize,
     pub gateway_metadata_ttl_ms: u64,
+    /// How long a gateway keeps metadata of immutable buckets, so a purge
+    /// reaches every gateway within it.
+    pub purge_window_ms: u64,
     /// How long a node waits for S3, and a gateway for a node, before
     /// giving up; and how long a gateway routes around a node that timed
     /// out.
@@ -325,6 +328,7 @@ impl Default for CacheConfig {
             metadata_capacity: 100_000,
             gateway_metadata_capacity: 100_000,
             gateway_metadata_ttl_ms: 1_000,
+            purge_window_ms: 3_600_000,
             origin_timeout_ms: 60_000,
             node_timeout_ms: 150_000,
             suspect_ttl_ms: 10_000,
@@ -420,6 +424,7 @@ impl CacheConfig {
             buckets: node.buckets,
             metadata_capacity: self.gateway_metadata_capacity,
             metadata_ttl: self.gateway_metadata_ttl_ms,
+            purge_window: self.purge_window_ms,
             node_timeout: self.node_timeout_ms,
             suspect_ttl: self.suspect_ttl_ms,
         }

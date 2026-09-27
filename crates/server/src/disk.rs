@@ -26,7 +26,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -39,6 +39,8 @@ pub const RECORD_SIZE: u64 = 64;
 const NO_RUN: u64 = u64::MAX;
 
 pub struct Disk {
+    /// The directory the node's files live in.
+    dir: PathBuf,
     slabs: File,
     /// For each span a largest slot covers, the largest slot written there
     /// since its pages were last dropped whole: a folio no larger may
@@ -151,6 +153,16 @@ impl Disk {
         };
         let (slabs, table, mut metadata) = (open("slabs")?, open("slots")?, open("metadata")?);
         let mut purges = open("purges")?;
+        refuse_memory_filesystems(&slabs)?;
+        // Every slot's space, so a full filesystem stops the start rather
+        // than fills.
+        let slabs_len = config.extent_size * u64::from(config.extents);
+        fallocate(&slabs, FallocateFlags::empty(), 0, slabs_len).map_err(|error| {
+            io::Error::other(format!(
+                "reserving {slabs_len} bytes for the slab file in {}: {error}",
+                dir.display()
+            ))
+        })?;
         let slots = config.extent_size * u64::from(config.extents) / config.min_slot;
         let table_len = HEADER_SIZE + slots * RECORD_SIZE;
         let header = read_header(&table)?.filter(|header| same_slots(&header.config, &config));
@@ -167,9 +179,7 @@ impl Disk {
             }
         };
         table.set_len(table_len)?;
-        let slabs_len = config.extent_size * u64::from(config.extents);
         slabs.set_len(slabs_len)?;
-        refuse_memory_filesystems(&slabs)?;
         let page = rustix::param::page_size() as u64;
         if !config.min_slot.is_multiple_of(page) {
             return Err(io::Error::other(format!(
@@ -207,6 +217,7 @@ impl Disk {
         // a largest block's folio from an earlier run.
         let spans = (slabs_len / config.max_slot) as usize;
         let disk = Disk {
+            dir: dir.to_path_buf(),
             written: Mutex::new(vec![config.max_slot; spans]),
             slabs,
             slab_sync: GroupSync::default(),
@@ -334,6 +345,29 @@ impl Disk {
         file.flush()
     }
 
+    /// Replaces the metadata file with `entries`, durably: a crash leaves
+    /// the old file or the new one.
+    pub fn rewrite_metadata(&self, entries: &[(ObjectKey, Meta)]) -> io::Result<()> {
+        let bytes: Vec<u8> = entries
+            .iter()
+            .flat_map(|(key, meta)| encode_entry(key, Some(meta)))
+            .collect();
+        let mut file = self.metadata.lock().expect("metadata lock");
+        let path = self.dir.join("metadata.new");
+        let mut new = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        new.write_all(&bytes)?;
+        new.sync_data()?;
+        std::fs::rename(&path, self.dir.join("metadata"))?;
+        File::open(&self.dir)?.sync_all()?;
+        *file = new;
+        Ok(())
+    }
+
     pub fn sync_metadata(&self) -> io::Result<()> {
         self.metadata.lock().expect("metadata lock").sync_data()
     }
@@ -356,6 +390,11 @@ impl Disk {
 
     pub fn sync_purges(&self) -> io::Result<()> {
         self.purges.lock().expect("purges lock").sync_data()
+    }
+
+    /// Makes erased slots' holes durable.
+    pub fn sync_slabs(&self) -> io::Result<()> {
+        self.slabs.sync_data()
     }
 
     /// Frees the storage behind a slot a purge dropped, so its bytes are
@@ -725,6 +764,61 @@ mod tests {
             min_slot: 4096,
             max_slot: 8192,
         }
+    }
+
+    /// A rewrite replaces every entry appended before it, and later appends
+    /// follow the rewritten ones.
+    #[test]
+    fn a_rewritten_metadata_file_holds_its_entries() {
+        let dir = dir("rewrite");
+        let entry = |name: &str| {
+            let key = ObjectKey {
+                bucket: "b".into(),
+                key: name.into(),
+            };
+            let meta = Meta {
+                etag: ETag(format!("\"{name}\"")),
+                size: 10,
+                headers: Vec::new(),
+            };
+            (key, meta)
+        };
+        {
+            let (disk, _) = Disk::open(&dir, config()).unwrap();
+            for name in ["a", "b", "c"] {
+                let (key, meta) = entry(name);
+                disk.append(&key, Some(&meta)).unwrap();
+            }
+            disk.rewrite_metadata(&[entry("c"), entry("a")]).unwrap();
+            let (key, meta) = entry("d");
+            disk.append(&key, Some(&meta)).unwrap();
+            disk.sync_metadata().unwrap();
+        }
+        let (_, recovery) = Disk::open(&dir, config()).unwrap();
+        let names: Vec<&str> = recovery
+            .metadata
+            .iter()
+            .map(|(key, _)| key.key.as_str())
+            .collect();
+        assert_eq!(names, ["c", "a", "d"]);
+    }
+
+    /// A start whose slab file the filesystem can't hold fails before it
+    /// touches anything else. A file past the filesystem's largest fails
+    /// without allocating a byte.
+    #[test]
+    fn a_slab_file_the_filesystem_can_not_hold_stops_the_start() {
+        let dir = dir("too-large");
+        let config = StoreConfig {
+            extent_size: 1 << 60,
+            extents: 4,
+            min_slot: 4096,
+            max_slot: 8192,
+        };
+        let Err(error) = Disk::open(&dir, config) else {
+            panic!("a start with no room for its slab file");
+        };
+        assert!(error.to_string().contains("reserving"), "{error}");
     }
 
     /// A directory beside the test binary, on a disk-backed filesystem.

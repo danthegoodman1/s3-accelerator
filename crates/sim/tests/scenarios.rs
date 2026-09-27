@@ -785,6 +785,40 @@ fn a_node_down_past_its_grace_period_leaves_every_ring() {
     assert_eq!(sim.summary().ring_fetches, 1);
 }
 
+/// A home rewrites its metadata file, least recently used first, once the
+/// file holds twice the metadata capacity and at a clean shutdown: the
+/// file stays bounded, and a restart keeps the most recently used entries,
+/// such as one served from memory since it was fetched.
+#[test]
+fn the_metadata_file_keeps_the_most_recently_used() {
+    let mut options = Options::scenario();
+    options.nodes = 1;
+    options.metadata_capacity = 4;
+    options.gateway_metadata_capacity = 1;
+    let mut sim = Simulator::new(1, options);
+    let keys: Vec<ObjectKey> = (0..21)
+        .map(|index| key(IMMUTABLE_BUCKET, &format!("k{index}")))
+        .collect();
+    for key in &keys[..20] {
+        sim.put(key, 100);
+        sim.read(Request::head(key.clone())).unwrap();
+        assert!(sim.metadata_file_entries(0) <= 8);
+    }
+    // The home holds k16 to k19; k16, served again, is used after k19,
+    // and k20 then takes k17's place.
+    let before = sim.summary().origin_requests;
+    sim.read(Request::head(keys[16].clone())).unwrap();
+    assert_eq!(sim.summary().origin_requests, before);
+    sim.put(&keys[20], 100);
+    sim.read(Request::head(keys[20].clone())).unwrap();
+    sim.shut_down(0).unwrap();
+    sim.restart(0).unwrap();
+    let before = sim.summary().origin_requests;
+    let (head, _) = sim.read(Request::head(keys[16].clone())).unwrap();
+    assert_eq!(head.status, 200);
+    assert_eq!(sim.summary().origin_requests, before);
+}
+
 /// Runs until `request` is answered, and returns its status and how many
 /// ticks the answer took.
 fn answer_time(sim: &mut Simulator, request: u64) -> (u16, u64) {

@@ -43,6 +43,9 @@ pub struct Config {
     /// How long the gateway keeps metadata of objects that may change, in
     /// milliseconds, however long the bucket's policy would allow.
     pub metadata_ttl: u64,
+    /// How long the gateway keeps metadata of immutable objects, in
+    /// milliseconds, so a purge reaches it within that time.
+    pub purge_window: u64,
     /// Milliseconds a node has to answer before the gateway asks the next
     /// rendezvous candidate.
     pub node_timeout: u64,
@@ -551,8 +554,9 @@ impl Gateway {
         let (arrived, policy) = (read.arrived, self.policy(&key.bucket));
         let detoured = self.detours.get(&key).is_some_and(|until| now < *until);
         let direct = read.retries >= STALE_RETRIES || detoured;
-        let ttl = self.config.metadata_ttl;
-        if !direct && let Some(cached) = self.cache.fresh(&key, arrived, policy, ttl) {
+        let (ttl, purge_window) = (self.config.metadata_ttl, self.config.purge_window);
+        if !direct && let Some(cached) = self.cache.fresh(&key, arrived, policy, ttl, purge_window)
+        {
             let meta = cached.meta.clone();
             return self.plan_with(id, &meta);
         }
@@ -1020,10 +1024,11 @@ impl MetadataCache {
         arrived: Time,
         policy: BucketPolicy,
         ttl: u64,
+        purge_window: u64,
     ) -> Option<&CachedMeta> {
         let cached = self.entries.get(key)?.meta.as_ref()?;
         let fresh = match policy.freshness {
-            Freshness::Immutable => true,
+            Freshness::Immutable => cached.received.0 + purge_window >= arrived.0,
             Freshness::Ttl(bucket_ttl) => {
                 cached.validated.0 + bucket_ttl >= arrived.0 && cached.received.0 + ttl >= arrived.0
             }
@@ -1142,6 +1147,7 @@ mod tests {
             buckets: BTreeMap::new(),
             metadata_capacity: capacity,
             metadata_ttl: 1_000,
+            purge_window: 10_000,
             node_timeout: 1_000,
             suspect_ttl: 100,
         };
