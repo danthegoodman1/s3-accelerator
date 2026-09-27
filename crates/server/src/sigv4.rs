@@ -58,6 +58,9 @@ pub enum AuthError {
     UnknownAccessKey,
     Expired,
     SignatureMismatch,
+    /// An `x-amz-*` header the signature doesn't cover, which the node
+    /// would sign on the client's behalf.
+    UnsignedHeader(String),
 }
 
 impl fmt::Display for AuthError {
@@ -68,6 +71,7 @@ impl fmt::Display for AuthError {
             AuthError::UnknownAccessKey => write!(f, "unknown access key"),
             AuthError::Expired => write!(f, "the request was signed too long ago"),
             AuthError::SignatureMismatch => write!(f, "the signature does not match"),
+            AuthError::UnsignedHeader(name) => write!(f, "the header {name} is not signed"),
         }
     }
 }
@@ -245,6 +249,13 @@ fn check<'c, C: ?Sized>(
         .any(|name| name == "host")
     {
         return Err(AuthError::Malformed("SignedHeaders"));
+    }
+    // S3 takes no x-amz-* header its signature leaves out.
+    if let Some((name, _)) = request.headers.iter().find(|(name, _)| {
+        let name = name.to_ascii_lowercase();
+        name.starts_with("x-amz-") && !authorization.signed_headers.contains(&name)
+    }) {
+        return Err(AuthError::UnsignedHeader(name.to_ascii_lowercase()));
     }
     let (client, secret) =
         lookup(&authorization.access_key_id).ok_or(AuthError::UnknownAccessKey)?;
@@ -608,6 +619,28 @@ mod tests {
             signed,
         );
         assert_eq!(query, PRESIGNED);
+    }
+
+    /// A presigned URL's holder can add no `x-amz-*` header it didn't sign.
+    #[test]
+    fn a_presigned_url_takes_no_unsigned_amz_header() {
+        let headers = headers(&[
+            ("Host", "examplebucket.s3.amazonaws.com"),
+            ("x-amz-copy-source", "examplebucket/private"),
+        ]);
+        let request = Signable {
+            method: "GET",
+            path: "/test.txt",
+            query: PRESIGNED,
+            headers: &headers,
+            payload_hash: UNSIGNED_PAYLOAD,
+        };
+        let lookup = |id: &str| (id == "AKIAIOSFODNN7EXAMPLE").then_some((&(), SECRET));
+        let signed = parse_amz_date("20130524T000000Z").unwrap();
+        assert_eq!(
+            verify(&request, signed + 60, lookup).map(|_| ()),
+            Err(AuthError::UnsignedHeader("x-amz-copy-source".into()))
+        );
     }
 
     #[test]

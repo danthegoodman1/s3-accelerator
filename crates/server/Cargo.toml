@@ -6,6 +6,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+xmlparser = "0.13.6"
 s3-accelerator-core.workspace = true
 bytes = "1.12.1"
 hex = "0.4.3"

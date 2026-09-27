@@ -1373,10 +1373,6 @@ impl Node {
     /// flight may predate the change.
     fn invalidate(&mut self, now: Time, key: &ObjectKey) {
         self.changed(key);
-        if self.policy(&key.bucket).freshness == Freshness::Immutable {
-            let key = key.clone();
-            self.save(Action::Forget { key });
-        }
         match self.objects.get_mut(key) {
             Some(Object::Fetching { superseded, .. }) => *superseded = true,
             Some(Object::Known { .. }) => {
@@ -1391,6 +1387,12 @@ impl Node {
                 }
             }
             None => {}
+        }
+        // After the key is forgotten, so a rewrite this save starts leaves
+        // it out.
+        if self.policy(&key.bucket).freshness == Freshness::Immutable {
+            let key = key.clone();
+            self.save(Action::Forget { key });
         }
     }
 

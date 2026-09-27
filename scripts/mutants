@@ -238,7 +238,7 @@ MUTANTS = [
     ),
     (
         "gateways ignore ring versions",
-        [(GATEWAY, "if (version == self.ring.version() && down == self.down_version) || fetching {",
+        [(GATEWAY, "if (down_only && (down == self.down_version || lately)) || fetching {",
                    "if true {")],
     ),
     (
@@ -247,7 +247,7 @@ MUTANTS = [
     ),
     (
         "DeleteObjects leaves cached metadata",
-        [(SERVER, "let keys = listed_keys(&String::from_utf8_lossy(&body))", "let keys = Vec::<String>::new()")],
+        [(SERVER, "let keys = named\n                    .into_iter()", "let keys = Vec::<String>::new()\n                    .into_iter()")],
     ),
     (
         "the S3 client drops . segments",
@@ -685,8 +685,7 @@ MUTANTS = [
     ),
     (
         "gateways ignore changes in the nodes held down",
-        [(GATEWAY, "(version == self.ring.version() && down == self.down_version)",
-                   "version == self.ring.version()")],
+        [(GATEWAY, "(down_only && (down == self.down_version || lately))", "down_only")],
     ),
     (
         "gateways route through nodes held down",
@@ -812,6 +811,46 @@ MUTANTS = [
     (
         "reads with a customer key are cached",
         [(SERVER, '"x-amz-server-side-encryption-customer-key",\n    ];', "];")],
+    ),
+    (
+        "a purge's forgetting rewrites the file with the purged key",
+        [(NODE, "        // After the key is forgotten, so a rewrite this save starts leaves\n        // it out.\n        if self.policy(&key.bucket).freshness == Freshness::Immutable {\n            let key = key.clone();\n            self.save(Action::Forget { key });\n        }\n", ""),
+         (NODE, "    fn invalidate(&mut self, now: Time, key: &ObjectKey) {\n        self.changed(key);",
+                "    fn invalidate(&mut self, now: Time, key: &ObjectKey) {\n        self.changed(key);\n        if self.policy(&key.bucket).freshness == Freshness::Immutable {\n            self.save(Action::Forget { key: key.clone() });\n        }")],
+    ),
+    (
+        "DeleteObjects keys go unread",
+        [(SERVER, 'open.push(local.as_str() == "Key");', "open.push(false);")],
+    ),
+    (
+        "response overrides take control characters",
+        [(SERVER, "if value.chars().any(char::is_control) {", "if false {")],
+    ),
+    (
+        "unsigned x-amz-* headers are signed for the client",
+        [(SIGV4, 'name.starts_with("x-amz-") && !authorization.signed_headers.contains(&name)', "false")],
+    ),
+    (
+        "an erased slot's space goes back to the filesystem",
+        [(DISK, "if let Err(error) = fallocate(&self.slabs, FallocateFlags::KEEP_SIZE, offset, len) {",
+                "if let Err(error) = Ok::<(), io::Error>(()) {")],
+    ),
+    (
+        "a listing is checked against its first prefix of several",
+        [(SERVER, '"GET" if names.iter().enumerate().any(|(at, name)| names[..at].contains(name)) => {',
+                  '"GET" if false => {')],
+    ),
+    (
+        "nodes report peers they never heard from as down",
+        [(MEMBERSHIP, ".filter(|id| !self.unheard.contains(id))", "")],
+    ),
+    (
+        "gateways avoid a node that answers",
+        [(GATEWAY, "self.down.remove(&from);", "")],
+    ),
+    (
+        "down-only ring fetches go unlimited",
+        [(GATEWAY, ".is_some_and(|at| now.0 < at.0 + self.config.suspect_ttl);", ".is_some_and(|_| false);")],
     ),
     (
         "reads waiting on a newly down node wait out the timeout",

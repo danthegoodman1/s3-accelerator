@@ -414,6 +414,8 @@ fn virtual_bucket(host: Option<&str>, domains: &[String]) -> Option<String> {
 
 /// What a request needs of the client's grants.
 enum Need {
+    /// Nothing grants it: it is malformed, for the reason given.
+    Invalid(&'static str),
     /// Access to its object.
     Object(Access),
     /// Reading the prefix it lists.
@@ -462,6 +464,15 @@ fn need(head: &RequestHead, key: &str) -> Need {
     match head.method.as_str() {
         "HEAD" if names.is_empty() => Need::Part(Access::Read),
         "GET" if names == ["location"] => Need::Part(Access::Read),
+        // Each parameter once, so the prefix checked is the one S3 lists.
+        "GET"
+            if names
+                .iter()
+                .enumerate()
+                .any(|(at, name)| names[..at].contains(name)) =>
+        {
+            Need::Invalid("a listing names a parameter twice")
+        }
         "GET" if names.iter().all(|name| LISTING.contains(name)) => {
             let prefix = parameters
                 .iter()
@@ -479,6 +490,7 @@ fn need(head: &RequestHead, key: &str) -> Need {
 fn authorize(head: &RequestHead, client: &Client) -> Result<(), Response> {
     let (bucket, key) = split_path(&head.path);
     let allowed = match need(head, &key) {
+        Need::Invalid(reason) => return Err(error(400, "InvalidArgument", reason)),
         Need::Object(access) => client.may(access, &bucket, &key),
         Need::List(prefix) => client.may(Access::Read, &bucket, &prefix),
         Need::Part(access) => client.may_reach(access, &bucket),
@@ -536,8 +548,19 @@ async fn handle(
                 .await?;
             return Ok(true);
         }
+        let Some(overrides) = overrides(&head.query) else {
+            let response = error(
+                400,
+                "InvalidArgument",
+                "a response override holds a control character",
+            );
+            connection
+                .write_response(&response, head.keep_alive)
+                .await?;
+            return Ok(true);
+        };
         let presenting = Presenting {
-            overrides: overrides(&head.query),
+            overrides,
             checksums: header(&head.headers, "x-amz-checksum-mode")
                 .is_some_and(|mode| mode.eq_ignore_ascii_case("enabled")),
         };
@@ -755,17 +778,22 @@ const OVERRIDES: [(&str, &str); 6] = [
     ("response-expires", "Expires"),
 ];
 
-/// The headers a read's `response-*` parameters set.
-fn overrides(query: &str) -> Vec<(String, String)> {
-    query
-        .split('&')
-        .filter_map(|pair| {
-            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
-            let (_, header) = OVERRIDES.iter().find(|(parameter, _)| *parameter == name)?;
-            let value = percent_decode_str(value).decode_utf8_lossy().into_owned();
-            Some((header.to_string(), value))
-        })
-        .collect()
+/// The headers a read's `response-*` parameters set, or `None` if a value
+/// holds a control character, which would end the header early.
+fn overrides(query: &str) -> Option<Vec<(String, String)>> {
+    let mut overrides = Vec::new();
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Some((_, header)) = OVERRIDES.iter().find(|(parameter, _)| *parameter == name) else {
+            continue;
+        };
+        let value = percent_decode_str(value).decode_utf8_lossy().into_owned();
+        if value.chars().any(char::is_control) {
+            return None;
+        }
+        overrides.push((header.to_string(), value));
+    }
+    Some(overrides)
 }
 
 /// How the gateway presents a read's answer: with the headers its
@@ -854,7 +882,17 @@ async fn pass(
                 return Ok(true);
             }
             // The grants must cover every key the list deletes.
-            let named = listed_keys(&String::from_utf8_lossy(&body));
+            let Some(named) = listed_keys(&String::from_utf8_lossy(&body)) else {
+                let response = error(
+                    400,
+                    "MalformedXML",
+                    "the key list is not XML the gateway reads",
+                );
+                connection
+                    .write_response(&response, head.keep_alive)
+                    .await?;
+                return Ok(true);
+            };
             if !named
                 .iter()
                 .all(|key| request.client.may(Access::Write, request.bucket, key))
@@ -865,7 +903,7 @@ async fn pass(
                     .await?;
                 return Ok(true);
             }
-            Some(body)
+            Some((body, named))
         }
         false => None,
     };
@@ -903,7 +941,7 @@ async fn pass(
         return Ok(listed.is_some());
     };
     let body_read = match &listed {
-        Some(body) => to_node.write_all(body).await.is_ok(),
+        Some((body, _)) => to_node.write_all(body).await.is_ok(),
         None => {
             let stream = to_node.stream();
             let digest = request.digest.as_deref();
@@ -965,8 +1003,8 @@ async fn pass(
     };
     if status < 300 {
         match listed {
-            Some(body) => {
-                let keys = listed_keys(&String::from_utf8_lossy(&body))
+            Some((_, named)) => {
+                let keys = named
                     .into_iter()
                     .map(|key| ObjectKey {
                         bucket: request.bucket.to_string(),
@@ -1036,18 +1074,94 @@ fn hash_mismatch() -> Response {
 }
 
 /// The `<Key>` elements of a `DeleteObjects` request body.
-fn listed_keys(xml: &str) -> Vec<String> {
-    xml.split("<Key>")
-        .skip(1)
-        .filter_map(|rest| rest.split_once("</Key>"))
-        .map(|(key, _)| {
-            key.replace("&lt;", "<")
-                .replace("&gt;", ">")
-                .replace("&quot;", "\"")
-                .replace("&apos;", "'")
-                .replace("&amp;", "&")
-        })
-        .collect()
+///
+/// Every element named `Key`, in any namespace and however its tag is
+/// written, counts, with CDATA and character references in its text: the
+/// keys S3 reads. `None` for a body that isn't XML, or that holds a DTD,
+/// whose entities could name keys the gateway never sees.
+fn listed_keys(xml: &str) -> Option<Vec<String>> {
+    use xmlparser::{ElementEnd, Token, Tokenizer};
+    let mut keys = Vec::new();
+    // Whether each open element is a `Key`, and the text of the one read.
+    let mut open: Vec<bool> = Vec::new();
+    let mut key: Option<String> = None;
+    for token in Tokenizer::from(xml) {
+        match token.ok()? {
+            Token::ElementStart { local, .. } => {
+                // A key holds only text.
+                if key.is_some() {
+                    return None;
+                }
+                open.push(local.as_str() == "Key");
+            }
+            Token::ElementEnd { end, .. } => match end {
+                ElementEnd::Open => {
+                    if open.last() == Some(&true) {
+                        key = Some(String::new());
+                    }
+                }
+                ElementEnd::Empty => {
+                    if open.pop()? {
+                        keys.push(String::new());
+                    }
+                }
+                ElementEnd::Close(_, local) => {
+                    if open.pop()? != (local.as_str() == "Key") {
+                        return None;
+                    }
+                    if let Some(read) = key.take() {
+                        keys.push(read);
+                    }
+                }
+            },
+            Token::Text { text } => {
+                if let Some(key) = key.as_mut() {
+                    key.push_str(&unescape(text.as_str())?);
+                }
+            }
+            Token::Cdata { text, .. } => {
+                if let Some(key) = key.as_mut() {
+                    key.push_str(text.as_str());
+                }
+            }
+            Token::DtdStart { .. }
+            | Token::EmptyDtd { .. }
+            | Token::EntityDeclaration { .. }
+            | Token::DtdEnd { .. } => return None,
+            _ => {}
+        }
+    }
+    open.is_empty().then_some(keys)
+}
+
+/// `text` with XML's predefined entities and character references
+/// replaced; `None` if it names any other entity.
+fn unescape(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let end = rest[at..].find(';')? + at;
+        let name = &rest[at + 1..end];
+        let decoded = match name {
+            "lt" => '<',
+            "gt" => '>',
+            "amp" => '&',
+            "quot" => '"',
+            "apos" => '\'',
+            _ => {
+                let code = match name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                    None => name.strip_prefix('#')?.parse().ok()?,
+                };
+                char::from_u32(code)?
+            }
+        };
+        out.push(decoded);
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// The bucket and key an `x-amz-copy-source` names.
@@ -1063,6 +1177,7 @@ fn auth_error(failure: AuthError) -> Response {
         AuthError::UnknownAccessKey => "InvalidAccessKeyId",
         AuthError::Expired => "RequestTimeTooSkewed",
         AuthError::SignatureMismatch => "SignatureDoesNotMatch",
+        AuthError::UnsignedHeader(_) => "AccessDenied",
     };
     error(403, code, &failure.to_string())
 }
@@ -1134,6 +1249,30 @@ mod tests {
     fn lists_deleted_keys() {
         let xml =
             "<Delete><Object><Key>a&amp;b</Key></Object><Object><Key>c/d</Key></Object></Delete>";
-        assert_eq!(listed_keys(xml), ["a&b", "c/d"]);
+        assert_eq!(listed_keys(xml), Some(vec!["a&b".into(), "c/d".into()]));
+    }
+
+    /// However a key is written, the gateway reads the key S3 would.
+    #[test]
+    fn lists_keys_however_they_are_written() {
+        let keys = |xml: &str| listed_keys(xml).map(|keys| keys.join(","));
+        let written = [
+            "<Delete><Object><Key >s/1</Key ></Object></Delete>",
+            r#"<Delete><Object><Key xmlns="">s/1</Key></Object></Delete>"#,
+            r#"<d:Delete xmlns:d="x"><d:Object><d:Key>s/1</d:Key></d:Object></d:Delete>"#,
+            "<Delete><Object><Key><![CDATA[s/1]]></Key></Object></Delete>",
+            "<Delete><Object><Key>s<!-- -->/&#x31;</Key></Object></Delete>",
+        ];
+        for xml in written {
+            assert_eq!(keys(xml), Some("s/1".into()), "{xml}");
+        }
+        let refused = [
+            r#"<!DOCTYPE d [<!ENTITY e "s/1">]><Delete><Object><Key>&e;</Key></Object></Delete>"#,
+            "<Delete><Object><Key>s/1</Object></Delete>",
+            "<Delete><Object><Key><Key>s/1</Key></Key></Object></Delete>",
+        ];
+        for xml in refused {
+            assert_eq!(keys(xml), None, "{xml}");
+        }
     }
 }

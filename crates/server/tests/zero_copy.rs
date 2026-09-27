@@ -216,13 +216,22 @@ async fn a_purge_syncs_its_erased_bytes_before_it_confirms() {
             let calls = read_trace(&dir.join("node.trace"), asked, confirmed);
             let on_slabs =
                 |call: &&Call| call.fds().first().is_some_and(|fd| fd.ends_with("/slabs>"));
-            let punched: Vec<&Call> = calls
+            // Each block's hole, and its space reserved again.
+            let allocations: Vec<&Call> = calls
                 .iter()
                 .filter(on_slabs)
                 .filter(|call| call.name == "fallocate" && call.result == 0)
                 .collect();
-            assert_eq!(punched.len(), 3, "one hole per block");
-            let last = punched.iter().map(|call| call.end).fold(0.0, f64::max);
+            let holes = allocations
+                .iter()
+                .filter(|call| call.args.contains("PUNCH_HOLE"))
+                .count();
+            assert_eq!(
+                (holes, allocations.len()),
+                (3, 6),
+                "a hole and a reservation per block"
+            );
+            let last = allocations.iter().map(|call| call.end).fold(0.0, f64::max);
             let synced = calls.iter().filter(on_slabs).any(|call| {
                 call.name == "fdatasync" && call.start >= last && call.end <= confirmed
             });

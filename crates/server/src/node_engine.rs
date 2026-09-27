@@ -128,9 +128,11 @@ pub struct NodeEngine {
     events: Events,
     /// Bytes of uploads the node may still keep for warming.
     warm_budget: u64,
-    /// An append to the purge log or an erasure failed since the last
-    /// purge, which then fails rather than confirm.
+    /// An append to the purge log or an erasure failed during the purge
+    /// under way, which then fails rather than confirm.
     purge_failed: bool,
+    /// A purge's actions are being carried out.
+    purging: bool,
 }
 
 /// Messages from S3's event queue while the core works through their
@@ -172,6 +174,8 @@ struct Work {
     verifies: Vec<(Location, u64, u64)>,
     /// Spots to read: a version and the slot bytes that hold its spot.
     spots: Vec<(VersionId, SpotParts)>,
+    /// Slots were erased outside a purge, so the slab file needs a sync.
+    erased: bool,
 }
 
 impl NodeEngine {
@@ -201,6 +205,7 @@ impl NodeEngine {
             events: Events::default(),
             warm_budget: WARM_BUDGET,
             purge_failed: false,
+            purging: false,
         }));
         // A recovering node's first actions clear records it cannot use.
         let work = engine.borrow_mut().pump();
@@ -332,8 +337,10 @@ impl NodeEngine {
         let (work, logged) = {
             let mut this = engine.borrow_mut();
             let now = this.now();
+            this.purging = true;
             this.node.on_purge(now, key, passed_on);
             let work = this.pump();
+            this.purging = false;
             (work, !std::mem::take(&mut this.purge_failed))
         };
         start(engine, work);
@@ -609,12 +616,15 @@ impl NodeEngine {
             node::Action::ReadSpot { version, parts } => self.work.spots.push((version, parts)),
             // Erasing in order with the node's actions finishes before any
             // later write can reuse the slot.
-            node::Action::Erase { location, len } => {
-                if let Err(error) = self.disk.erase(location, len) {
+            // A purge syncs its own erasures before it confirms; a slot a
+            // purged block held until now is synced on its own.
+            node::Action::Erase { location, len } => match self.disk.erase(location, len) {
+                Ok(()) => self.work.erased |= !self.purging,
+                Err(error) => {
                     eprintln!("erasing {location:?}: {error}");
-                    self.purge_failed = true;
+                    self.purge_failed |= self.purging;
                 }
-            }
+            },
             node::Action::SavePurge { key, nodes } => {
                 if let Err(error) = self.disk.save_purge(&key, &nodes) {
                     eprintln!("saving the purge of {key:?}: {error}");
@@ -781,6 +791,14 @@ fn slice(bytes: &Bytes, offset: u64, len: u64) -> Option<Bytes> {
 /// Starts S3 requests on this thread, and block writes and verifications
 /// on worker threads, each feeding its result back to the node.
 fn start(engine: &SharedNode, work: Work) {
+    if work.erased {
+        let disk = engine.borrow().disk.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = disk.sync_slabs() {
+                eprintln!("syncing erased slots: {error}");
+            }
+        });
+    }
     for (origin, request, streams) in work.fetches {
         let task = tokio::task::spawn_local(fetch(engine.clone(), origin, request, streams));
         engine

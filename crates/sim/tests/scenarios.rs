@@ -825,6 +825,34 @@ fn the_metadata_file_keeps_the_most_recently_used() {
     assert_eq!(sim.summary().origin_requests, before);
 }
 
+/// A purge whose forgetting fills the metadata file past twice the
+/// capacity rewrites the file without the purged key, so no restart brings
+/// its metadata back.
+#[test]
+fn a_purge_that_rewrites_the_metadata_file_stays_purged() {
+    let mut options = Options::scenario();
+    options.nodes = 1;
+    options.metadata_capacity = 4;
+    options.gateway_metadata_capacity = 1;
+    let mut sim = Simulator::new(1, options);
+    let keys: Vec<ObjectKey> = (0..8)
+        .map(|index| key(IMMUTABLE_BUCKET, &format!("k{index}")))
+        .collect();
+    for key in &keys {
+        sim.put(key, 100);
+        sim.read(Request::head(key.clone())).unwrap();
+    }
+    assert_eq!(sim.metadata_file_entries(0), 8);
+    sim.purge(&keys[7]).unwrap();
+    // The gateway, which keeps one object's metadata, keeps k0's instead.
+    sim.read(Request::head(keys[0].clone())).unwrap();
+    sim.crash(0).unwrap();
+    sim.restart(0).unwrap();
+    let before = sim.summary().origin_requests;
+    sim.read(Request::head(keys[7].clone())).unwrap();
+    assert_eq!(sim.summary().origin_requests, before + 1);
+}
+
 /// Runs until `request` is answered, and returns its status and how many
 /// ticks the answer took.
 fn answer_time(sim: &mut Simulator, request: u64) -> (u16, u64) {

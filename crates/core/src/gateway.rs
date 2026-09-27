@@ -110,6 +110,8 @@ pub struct Gateway {
     /// around, and their version.
     down: BTreeSet<NodeId>,
     down_version: u64,
+    /// When the gateway last fetched a ring only for its down nodes.
+    down_fetched: Option<Time>,
     /// Keys written through a node other than their home, and until when
     /// the gateway reads them directly from S3: the home may keep metadata
     /// from before the write until the bucket's TTL runs out.
@@ -239,6 +241,7 @@ impl Gateway {
             suspects: BTreeMap::new(),
             down: BTreeSet::new(),
             down_version: 0,
+            down_fetched: None,
             fetching_ring: None,
             actions: Vec::new(),
         }
@@ -288,11 +291,22 @@ impl Gateway {
     /// ring from that node, one fetch at a time.
     pub fn on_ring_version(&mut self, now: Time, from: NodeId, version: u64, down: u64) {
         self.now = self.now.max(now);
+        // A node that answers is up, whatever a ring said.
+        self.down.remove(&from);
         let fetching = self
             .fetching_ring
             .is_some_and(|since| now.0 < since.0 + self.config.node_timeout);
-        if (version == self.ring.version() && down == self.down_version) || fetching {
+        // Nodes' views of who is down differ while membership settles, so
+        // a change in them alone fetches the ring once a suspect window.
+        let down_only = version == self.ring.version();
+        let lately = self
+            .down_fetched
+            .is_some_and(|at| now.0 < at.0 + self.config.suspect_ttl);
+        if (down_only && (down == self.down_version || lately)) || fetching {
             return;
+        }
+        if down_only {
+            self.down_fetched = Some(now);
         }
         self.fetching_ring = Some(now);
         self.actions.push(Action::FetchRing { node: from });
@@ -1211,6 +1225,19 @@ mod tests {
             key: "k".into(),
         };
         assert_eq!(gateway.pass_candidates(&key).last(), Some(&NodeId(2)));
+        // Node 2 answers, so it is up, whatever the ring said.
+        gateway.on_ring_version(Time(40), NodeId(2), ring.version(), down_version(&down));
+        assert_eq!(
+            gateway.pass_candidates(&key),
+            ring.candidates(Placement::Home(&key).hash())
+        );
+        // Another view of who is down fetches the ring once a suspect
+        // window, 100 ms here.
+        let other = down_version(&[NodeId(0)]);
+        gateway.on_ring_version(Time(50), NodeId(1), ring.version(), other);
+        assert_eq!(fetches(&mut gateway), 0);
+        gateway.on_ring_version(Time(120), NodeId(1), ring.version(), other);
+        assert_eq!(fetches(&mut gateway), 1);
     }
 
     /// An answer to a read sent before a write through the gateway never

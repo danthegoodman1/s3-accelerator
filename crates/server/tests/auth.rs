@@ -172,6 +172,14 @@ async fn a_presigned_url_reads_and_writes_without_credentials() {
             );
             let altered = get.replace("/bucket/k?", "/bucket/other?");
             assert_eq!(status(altered, reqwest::Method::GET).await, 403);
+            // Its holder adds no header the signer didn't sign.
+            let copy = client
+                .put(&put)
+                .header("x-amz-copy-source", "bucket/private")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(copy.status().as_u16(), 403);
             let expired = presigned(port, &host, ("GET", "/bucket/k", ""), 120, 60);
             assert_eq!(status(expired, reqwest::Method::GET).await, 403);
         })
@@ -203,6 +211,10 @@ async fn response_overrides_set_a_reads_headers() {
                 );
             }
             assert_eq!(origin.requests.get(), 1);
+            // A value that would end its header early is refused.
+            let query = "response-content-disposition=x%0D%0ASet-Cookie:%20a=1";
+            let read = send(port, "GET", "/bucket/k", query, &[], Vec::new()).await;
+            assert_eq!(read.0, 400);
         })
         .await;
 }
@@ -273,6 +285,8 @@ async fn grants_give_each_level_of_access_to_their_prefix() {
             assert_eq!(status("GET", "/bucket", "list-type=2&prefix=shared%2Fx").await, 200);
             assert_eq!(status("GET", "/bucket", "list-type=2").await, 403);
             assert_eq!(status("GET", "/bucket", "list-type=2&prefix=secret%2F").await, 403);
+            let twice = "list-type=2&prefix=public%2F&prefix=";
+            assert_eq!(status("GET", "/bucket", twice).await, 400);
             assert_eq!(status("HEAD", "/bucket", "").await, 200);
             assert_eq!(status("PUT", "/bucket", "policy").await, 403);
             assert_eq!(status("DELETE", "/bucket", "").await, 403);
@@ -285,6 +299,11 @@ async fn grants_give_each_level_of_access_to_their_prefix() {
                 async move { send(port, "POST", "/bucket", "delete", &[], body).await.0 }
             };
             assert_eq!(delete(&["shared/a", "secret/b"]).await, 403);
+            // However its tag is written, a key is checked.
+            let body = b"<Delete><Object><Key >secret/b</Key ></Object></Delete>".to_vec();
+            assert_eq!(send(port, "POST", "/bucket", "delete", &[], body).await.0, 403);
+            let body = b"<!DOCTYPE d><Delete></Delete>".to_vec();
+            assert_eq!(send(port, "POST", "/bucket", "delete", &[], body).await.0, 400);
             assert_eq!(delete(&["shared/a", "public/a"]).await, 403);
             assert_eq!(delete(&["shared/a"]).await, 200);
             // Changing the bucket takes an admin grant, even beside a write

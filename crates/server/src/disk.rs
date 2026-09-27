@@ -400,8 +400,13 @@ impl Disk {
     /// Frees the storage behind a slot a purge dropped, so its bytes are
     /// gone from the disk.
     pub fn erase(&self, location: Location, len: u64) -> io::Result<()> {
+        let offset = self.offset(location);
         let flags = FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE;
-        fallocate(&self.slabs, flags, self.offset(location), len)?;
+        fallocate(&self.slabs, flags, offset, len)?;
+        // The slot's space again, empty, so the file stays preallocated.
+        if let Err(error) = fallocate(&self.slabs, FallocateFlags::KEEP_SIZE, offset, len) {
+            eprintln!("reserving an erased slot's space: {error}");
+        }
         Ok(())
     }
 
@@ -801,6 +806,25 @@ mod tests {
             .map(|(key, _)| key.key.as_str())
             .collect();
         assert_eq!(names, ["c", "a", "d"]);
+    }
+
+    /// Erasing a slot frees its bytes and reserves its space again, so the
+    /// slab file stays preallocated.
+    #[test]
+    fn an_erased_slot_is_empty_and_still_reserved() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = dir("erase");
+        let (disk, _) = Disk::open(&dir, config()).unwrap();
+        let at = Location {
+            extent: 1,
+            offset: 0,
+        };
+        assert!(disk.write(at, &[7; 8192]).unwrap());
+        let blocks = || std::fs::metadata(dir.join("slabs")).unwrap().blocks();
+        let reserved = blocks();
+        disk.erase(at, 8192).unwrap();
+        assert_eq!(blocks(), reserved);
+        assert_eq!(disk.read(at, 0, 8192).unwrap(), vec![0; 8192]);
     }
 
     /// A start whose slab file the filesystem can't hold fails before it

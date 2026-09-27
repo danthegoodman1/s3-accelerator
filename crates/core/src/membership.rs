@@ -14,7 +14,7 @@ use foca::{
     PostcardCodec, Runtime, Timer,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::num::{NonZeroU8, NonZeroU32, NonZeroUsize};
 use std::time::Duration;
@@ -103,6 +103,10 @@ pub struct Membership {
     up: BTreeMap<u64, Peer>,
     /// Members declared down, or not yet heard from, and since when.
     down: BTreeMap<u64, (Peer, Time)>,
+    /// Members of `down` not yet heard from: they hold their placements,
+    /// but no node reports them down, since a node that just started has
+    /// heard from none.
+    unheard: BTreeSet<u64>,
     ring: Ring,
     /// The down members the last `Action::Down` named.
     reported_down: Vec<NodeId>,
@@ -130,6 +134,11 @@ impl Membership {
             .filter(|peer| peer.id != me.id)
             .map(|peer| (peer.id, (peer.clone(), now)))
             .collect();
+        let unheard = known
+            .iter()
+            .filter(|peer| peer.id != me.id)
+            .map(|peer| peer.id)
+            .collect();
         let mut membership = Membership {
             foca,
             me,
@@ -137,6 +146,7 @@ impl Membership {
             now,
             up: BTreeMap::new(),
             down,
+            unheard,
             ring: Ring::new(0, Vec::new()),
             reported_down: Vec::new(),
             seeds: Vec::new(),
@@ -155,10 +165,13 @@ impl Membership {
         &self.me
     }
 
-    /// Members declared down within the down grace period, or not yet
-    /// heard from, in order.
+    /// Members declared down within the down grace period, in order.
     pub fn down(&self) -> Vec<NodeId> {
-        self.down.keys().map(|&id| NodeId(id)).collect()
+        self.down
+            .keys()
+            .filter(|id| !self.unheard.contains(id))
+            .map(|&id| NodeId(id))
+            .collect()
     }
 
     /// Where each node in the ring is reached.
@@ -275,6 +288,10 @@ impl Membership {
             });
         }
         for note in runtime.notes {
+            let heard = match &note {
+                Note::Up(peer) | Note::Down(peer) | Note::Renamed(peer) => peer.id,
+            };
+            self.unheard.remove(&heard);
             match note {
                 Note::Up(peer) => {
                     self.down.remove(&peer.id);
@@ -300,6 +317,8 @@ impl Membership {
         let grace = self.config.down_grace;
         let now = self.now;
         self.down.retain(|_, (_, since)| now.0 < since.0 + grace);
+        let down = &self.down;
+        self.unheard.retain(|id| down.contains_key(id));
         let ring = self.derive_ring();
         if ring != self.ring {
             self.ring = ring.clone();
@@ -583,6 +602,28 @@ mod tests {
         cluster.run(3_000);
         assert_eq!(cluster.members(1), [1, 2]);
         assert_eq!(cluster.members(2), [1, 2]);
+    }
+
+    /// A node declared down is reported down; nodes a starting node hasn't
+    /// heard from hold their placements but aren't, since it has heard from
+    /// none of them yet.
+    #[test]
+    fn only_nodes_declared_down_are_reported_down() {
+        let known = [peer(2), peer(3)];
+        let fresh = Membership::new(Time(0), peer(1), &known, config(), 1);
+        let members: Vec<u64> = fresh
+            .ring()
+            .members()
+            .iter()
+            .map(|member| member.id.0)
+            .collect();
+        assert_eq!(members, [1, 2, 3]);
+        assert_eq!(fresh.down(), []);
+        let mut cluster = Cluster::new(&[1, 2, 3]);
+        cluster.run(1_000);
+        cluster.cut.insert(3);
+        cluster.run(1_800);
+        assert_eq!(cluster.nodes[&1].down(), [NodeId(3)]);
     }
 
     /// A leaving node leaves every ring at once, and goes on gossiping.

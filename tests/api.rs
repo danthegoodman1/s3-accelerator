@@ -240,5 +240,6 @@ async fn a_hit_carries_the_checksums_a_miss_did() {
         checksums.push(output.checksum_crc32().map(str::to_string));
         output.body.collect().await.unwrap();
     }
+    assert!(checksums[0].is_some(), "the upload's checksum comes back");
     assert_eq!(checksums[0], checksums[1]);
 }
