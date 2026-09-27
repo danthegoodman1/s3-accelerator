@@ -168,6 +168,78 @@ The system is written in Rust.
 - **Kernel:** kernel TLS needs Linux 7.0 or later, or a 6.18 or 6.19 release with the fix for 6.17's receive-buffer checks. Those checks drop any segment that would push a receive queue past its buffer, and a kernel TLS socket leaves a partial record in the queue until the rest arrives, so the link stalls. Kernels before 7.1 also skip bytes when a `splice` from a kernel TLS socket fills its pipe partway through a record. A relay's 256 KiB pipe takes any record whole, but once a user's pipes pass `fs.pipe-user-pages-soft`, new pipes get two pages, so raise that limit on those kernels.
 - **Reference designs:** TAG and ocache (Go) implement versioned block caching, request coalescing, SigV4 validation, warming on write and Parquet footer prefetch. Read them before building those parts.
 
+## Observability
+
+Gateways and nodes report what they do through metrics, health checks and logs.
+
+- **Admin listener:** `[admin] listen` names an address where the process serves plaintext HTTP/1.1: `GET /metrics`, `/healthz` and `/readyz`. It checks no credentials, so bind it to a private address.
+- **Health:** `/healthz` answers 200 while the process's event loop runs.
+- **Readiness:** `/readyz` answers 200 once each role the process runs is ready, and otherwise 503 with a body naming what it waits for. A node is ready once it has recovered its store and its ring includes it; a gateway, once a node has answered it. Both turn unready when the process starts to stop or its node starts to leave, so load balancers drain them first.
+- **Metrics:** Prometheus's text format, each name prefixed `s3accel_`. Counters end in `_total`; latencies are histograms in seconds, with buckets from 100 µs to 10 s. Label values come from fixed sets or HTTP status codes, and none names a bucket, key or client.
+- **Where counts live:** the core counts what it decides in its own state, and its owner reads the counts at each scrape. The server counts what it measures on the event loop, where every worker's result arrives: latencies, transport outcomes and failures. No count is shared between threads, so counting takes no lock and no atomic instruction, and a scrape renders on the event loop between events.
+- **Cost:** a hit pays a few increments on its own thread. Benchmarks scraped every second stay within 2% of the same runs without the admin listener.
+
+Gateway metrics:
+
+| Metric | Type | Labels | Counts |
+| --- | --- | --- | --- |
+| `gateway_requests_total` | counter | `operation`, `code` | Client requests, by S3 operation and response status. |
+| `gateway_first_byte_seconds` | histogram | `operation` | From a request's head arriving to its response's head leaving. |
+| `gateway_response_bytes_total` | counter | `operation` | Body bytes sent to clients. |
+| `gateway_node_failures_total` | counter | `reason`: `refused`, `timeout`, `error` | Requests to nodes that got no usable answer. |
+| `gateway_relays_cut_total` | counter | `side`: `node`, `client` | Responses cut short after their head: the node's body ended early, or the client left. |
+
+`operation` is one of `GetObject`, `HeadObject`, `PutObject`, `CopyObject`, `DeleteObject`, `DeleteObjects`, `ListObjects`, `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload` or `Other`.
+
+Node metrics the core counts:
+
+| Metric | Type | Labels | Counts |
+| --- | --- | --- | --- |
+| `node_reads_total` | counter | | Requests from gateways for objects. |
+| `node_block_reads_total` | counter | `result`: `hit`, `fetched` | Blocks those requests read: from the store, or from a fetch from S3 or a previous owner. |
+| `node_block_misses_total` | counter | `reason`: `evicted`, `unadmitted`, `new` | Blocks an owner or leased replica fetched and could store, by what it remembers of them: the ghost queue holds them, the doorkeeper turned them away, or neither. |
+| `node_body_bytes_total` | counter | `source`: `cache`, `s3`, `previous_owner` | Body bytes sent to gateways. |
+| `node_admissions_total` | counter | `result`: `stored`, `doorkeeper`, `budget`, `full` | The same blocks: stored, or turned away by the doorkeeper, the fill budget, or a store whose eviction candidates are all in use. |
+| `node_blocks_dropped_total` | counter | `cause`: `evicted`, `disowned`, `purged`, `corrupt`, `unfilled` | Blocks the store let go: to make room, cold or no longer owned; by purge; failing their checksums; or a fill that ended without them. |
+| `node_fill_bytes`, `node_fill_budget_bytes` | gauge | | Fill budget in use, and the budget. |
+| `node_store_blocks`, `node_store_extents` | gauge | `class`: slot size in bytes | Blocks and extents of each size class. |
+| `node_store_capacity_bytes` | gauge | | The slab file's size. |
+| `node_objects` | gauge | | Objects whose metadata the node holds. |
+| `node_written_bytes_total` | counter | | Block bytes written to the slab file. |
+| `node_verified_blocks_total` | counter | `result`: `intact`, `corrupt` | Recovered blocks checked against their checksums. |
+| `node_fallback_reads_total`, `node_fallback_timeouts_total` | counter | | Reads asked of previous owners, and those left unanswered. |
+| `node_fallback_metadata_total` | counter | | Objects whose metadata a previous home supplied. |
+| `node_leases_granted_total`, `node_leased_reads_total` | counter | | Leases the node granted as owner, and reads it served as a replica. |
+| `node_warmed_uploads_total`, `node_prefetched_blocks_total` | counter | | Uploads warmed as they passed, and blocks of format metadata filled before a reader asked. |
+| `node_purges_total`, `node_purges_pending` | counter, gauge | | Purges carried out, and purges waiting on other nodes to confirm. |
+
+Node metrics the server measures:
+
+| Metric | Type | Labels | Counts |
+| --- | --- | --- | --- |
+| `s3_requests_total` | counter | `kind`: `read`, `forward`; `code`: status, or `none` | Requests to S3: the core's reads and passed-through requests, by status, or `none` when S3 sent no answer. |
+| `s3_first_byte_seconds` | histogram | `kind` | From sending a request to S3 to its response's head. |
+| `node_sync_seconds` | histogram | | Each sync of the slab file, shared by the blocks it makes durable. |
+| `events_received_total` | counter | | Event messages taken from the queue. |
+| `events_lag_seconds` | histogram | | From S3's event time to the node taking the message. |
+
+Metrics of every process:
+
+| Metric | Type | Labels | Counts |
+| --- | --- | --- | --- |
+| `ring_changes_total` | counter | | Rings the process adopted. |
+| `ring_info` | gauge | `version` | 1, labeled with the current ring's version in hex. |
+| `ring_nodes` | gauge | `state`: `up`, `down` | Nodes in the current ring, by whether the process routes around them. |
+| `tls_sessions_total` | counter | `link`: `client`, `cluster`; `mode`: `kernel`, `userspace` | TLS sessions established, and whether the kernel carries them. |
+| `tls_handshake_failures_total` | counter | `link` | Handshakes that failed or timed out. |
+| `event_loop_delay_seconds` | histogram | | How late the event loop runs a 100 ms timer. |
+| `build_info` | gauge | `version` | 1, labeled with the binary's version. |
+
+Each process also exports `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds` and `process_start_time_seconds`, read from `/proc/self` at each scrape.
+
+- **Logs:** one line per event on standard error, in logfmt: `ts`, `level` and `msg`, then fields. `[log] level` sets the least severe level written: `error`, `warn`, `info` (the default) or `debug`. Failures log at `warn`; starts, recoveries, ring changes and departures at `info`; at `debug`, gateways and nodes also log each request they answer.
+- **Request IDs:** a gateway gives each client request a random 64-bit ID and sends it to nodes in `x-accel-request-id`. Every response carries it in `x-accel-request-id`, and a response the cache serves also carries it as `x-amz-request-id`, the header S3 clients print; a passed-through response keeps S3's. Log lines about a request carry its ID as `request`. When S3 fails a request, the node logs S3's `x-amz-request-id` and `x-amz-id-2`, beside the client's request ID when it passed the client's request through.
+
 ## Open questions
 
 - **Workload targets:** object-size mix, request rate, working-set size, and hit-rate and latency goals. These set the chunk size, block size and hot-key thresholds.

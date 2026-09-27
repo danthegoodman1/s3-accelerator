@@ -439,7 +439,7 @@ Scope:
 - 8B Core counters: the core counts what it decides (hits, misses by reason, admissions and doorkeeper rejections, evictions by cause, fill budget in use, leases, ring changes, fallback reads, purges) in its state, and its owner reads them. The server measures latency, so the core still reads no clocks.
 - 8C Server metrics in Prometheus's text format on an admin listener: requests and latency histograms by operation and outcome; bytes by source (cache, S3, previous owner); S3 latency and errors; peer failures; store occupancy by size class; sync latency; relay errors; TLS sessions by kind; event queue lag; membership and ring version. Each thread keeps its own counters and histograms, merged on scrape.
 - 8D `/healthz` and `/readyz` on the admin listener; a node is ready once its store has recovered and it knows the ring.
-- 8E Structured logs with levels set in config, and a request ID that follows a read from the gateway through the nodes to S3.
+- 8E Structured logs with levels set in config, and a request ID that follows a request from the gateway through the nodes, logged beside S3's own request IDs when S3 fails it.
 
 Out of scope:
 - Distributed tracing.
@@ -456,6 +456,7 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
+| Complete | Scope | 8A Spec section | `spec.md` Observability: the admin listener, health and readiness, the metrics with their types and labels, where counts live, the cost rule, logs and request IDs. |
 
 ## Phase 9: Metadata Service
 
