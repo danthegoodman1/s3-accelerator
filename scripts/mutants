@@ -898,6 +898,11 @@ MUTANTS = [
         [(NODE_ENGINE, "let inline = !connection.kernel_tls()", "let inline = true")],
     ),
     (
+        "the metadata file is rewritten on the event loop",
+        [(NODE_ENGINE, "self.rewriting_metadata = true;\n                    self.work.rewrite = Some(entries);",
+                       "let _ = self.disk.rewrite_metadata(&entries);")],
+    ),
+    (
         "reads waiting on a newly down node wait out the timeout",
         [(GATEWAY, "for id in waiting {\n            self.fail_over(now, id, None, false);\n        }", "")],
     ),

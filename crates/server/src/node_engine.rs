@@ -122,6 +122,12 @@ pub struct NodeEngine {
     tasks: BTreeMap<OriginRequestId, tokio::task::AbortHandle>,
     /// Entries appended to the metadata file since it was last synced.
     unsynced_metadata: bool,
+    /// A rewrite of the metadata file runs on a blocking thread. Entries
+    /// saved meanwhile wait here, and a rewrite asked for meanwhile waits
+    /// in `next_rewrite`, in place of those before it.
+    rewriting_metadata: bool,
+    saved_meanwhile: Vec<(ObjectKey, Option<node::Meta>)>,
+    next_rewrite: Option<Vec<(ObjectKey, node::Meta)>>,
     /// Where each node in the ring is reached, for answering ring requests.
     addresses: BTreeMap<NodeId, String>,
     /// The nodes membership holds down, which answers tell gateways of.
@@ -177,6 +183,8 @@ struct Work {
     spots: Vec<(VersionId, SpotParts)>,
     /// Slots were erased outside a purge, so the slab file needs a sync.
     erased: bool,
+    /// A rewrite of the metadata file to start.
+    rewrite: Option<Vec<(ObjectKey, node::Meta)>>,
 }
 
 impl NodeEngine {
@@ -203,6 +211,9 @@ impl NodeEngine {
             work: Work::default(),
             tasks: BTreeMap::new(),
             unsynced_metadata: false,
+            rewriting_metadata: false,
+            saved_meanwhile: Vec::new(),
+            next_rewrite: None,
             events: Events::default(),
             warm_budget: WARM_BUDGET,
             purge_failed: false,
@@ -495,7 +506,8 @@ impl NodeEngine {
     }
 
     pub fn is_idle(engine: &SharedNode) -> bool {
-        engine.borrow().node.is_idle()
+        let this = engine.borrow();
+        this.node.is_idle() && !this.rewriting_metadata
     }
 
     /// Rewrites the metadata file least recently used first, syncs the
@@ -605,8 +617,12 @@ impl NodeEngine {
             node::Action::Forget { key } => self.save(&key, None),
             // Rare: once the file holds twice the metadata capacity.
             node::Action::RewriteMetadata { entries } => {
-                if let Err(error) = self.disk.rewrite_metadata(&entries) {
-                    eprintln!("rewriting the metadata file: {error}");
+                if self.rewriting_metadata {
+                    self.saved_meanwhile.clear();
+                    self.next_rewrite = Some(entries);
+                } else {
+                    self.rewriting_metadata = true;
+                    self.work.rewrite = Some(entries);
                 }
             }
             node::Action::Verify {
@@ -757,6 +773,10 @@ impl NodeEngine {
     }
 
     fn save(&mut self, key: &ObjectKey, meta: Option<&node::Meta>) {
+        if self.rewriting_metadata {
+            self.saved_meanwhile.push((key.clone(), meta.cloned()));
+            return;
+        }
         match self.disk.append(key, meta) {
             Ok(()) => self.unsynced_metadata = true,
             Err(error) => eprintln!("saving metadata of {key:?}: {error}"),
@@ -791,7 +811,37 @@ fn slice(bytes: &Bytes, offset: u64, len: u64) -> Option<Bytes> {
 
 /// Starts S3 requests on this thread, and block writes and verifications
 /// on worker threads, each feeding its result back to the node.
+/// Rewrites the metadata file on a blocking thread, then any rewrite asked
+/// for meanwhile, then appends the entries saved meanwhile.
+async fn rewrite_metadata(engine: SharedNode, entries: Vec<(ObjectKey, node::Meta)>) {
+    let mut entries = entries;
+    loop {
+        let disk = engine.borrow().disk.clone();
+        let rewritten = tokio::task::spawn_blocking(move || disk.rewrite_metadata(&entries)).await;
+        if let Err(error) = rewritten
+            .map_err(io::Error::other)
+            .and_then(|result| result)
+        {
+            eprintln!("rewriting the metadata file: {error}");
+        }
+        let mut this = engine.borrow_mut();
+        match this.next_rewrite.take() {
+            Some(next) => entries = next,
+            None => {
+                this.rewriting_metadata = false;
+                for (key, meta) in std::mem::take(&mut this.saved_meanwhile) {
+                    this.save(&key, meta.as_ref());
+                }
+                return;
+            }
+        }
+    }
+}
+
 fn start(engine: &SharedNode, work: Work) {
+    if let Some(entries) = work.rewrite {
+        tokio::task::spawn_local(rewrite_metadata(engine.clone(), entries));
+    }
     if work.erased {
         let disk = engine.borrow().disk.clone();
         tokio::task::spawn_blocking(move || {

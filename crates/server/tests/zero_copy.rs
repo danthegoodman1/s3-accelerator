@@ -292,6 +292,49 @@ async fn a_cached_hit_is_sent_from_the_event_loop() {
         .await;
 }
 
+/// A home rewrites its metadata file on a blocking thread, off the event
+/// loop that owns its core: the rename that swaps in the new file runs on
+/// another thread.
+#[tokio::test(flavor = "current_thread")]
+async fn the_metadata_file_is_rewritten_off_the_event_loop() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, _origin) = start_origin().await;
+            let dir = data_dir();
+            let cache = "block_size = 65536\nmetadata_capacity = 4\ngateway_metadata_capacity = 1";
+            let cluster = Cluster::new(&dir, origin_port, cache);
+            let calls = "rename,renameat,renameat2";
+            let node = Process::traced(&cluster.node, &dir.join("node.trace"), calls);
+            common::listening(cluster.node_port).await;
+            let _gateway = cluster.start_gateway().await;
+            // Twelve saves, past twice the capacity.
+            for index in 0..12 {
+                let path = format!("/bucket/k{index}");
+                let (status, _) =
+                    common::send(cluster.gateway_port, "HEAD", &path, "", &[], Vec::new()).await;
+                assert_eq!(status, 200);
+            }
+            let event_loop = node.server_pid();
+            node.stop();
+
+            let renames: Vec<u32> = read_trace(&dir.join("node.trace"), 0.0, f64::MAX)
+                .iter()
+                .filter(|call| call.result == 0)
+                .filter(|call| String::from_utf8_lossy(&call.data()).contains("metadata.new"))
+                .map(|call| call.thread)
+                .collect();
+            // The clean shutdown's rewrite runs on the event loop, once idle.
+            let (during, at_shutdown) = renames.split_at(renames.len().saturating_sub(1));
+            assert!(!during.is_empty(), "{renames:?}");
+            assert!(
+                during.iter().all(|&thread| thread != event_loop),
+                "{renames:?}"
+            );
+            assert_eq!(at_shutdown, [event_loop]);
+        })
+        .await;
+}
+
 /// A first read's bytes move on worker threads: the node receives S3's
 /// body and writes it to the gateway off its event loop, the thread that
 /// owns its core, which handles only heads.
