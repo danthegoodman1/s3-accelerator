@@ -195,6 +195,119 @@ fn a_write_since_the_previous_home_knew_the_object_wins() {
     assert_eq!(body.len(), 999);
 }
 
+/// The previous home is cut off while a write passes through the new home,
+/// so the write never reaches it, and it still offers its older metadata
+/// once back. The new home knows of the write and drops what the previous
+/// home offers: the next read returns the written version.
+#[test]
+fn a_write_the_previous_home_missed_still_wins() {
+    let keys = keys(0, TTL_BUCKET);
+    let mut options = cluster(0, 5_000);
+    // The previous home's metadata stays fresh, so only the write says it
+    // is out of date.
+    options.ttl = 1_000_000;
+    let mut sim = Simulator::new(0, options);
+    run(&mut sim, 300);
+    for (key, size) in &keys {
+        sim.put(key, *size);
+        sim.read(Request::get(key.clone())).unwrap();
+    }
+    let homes: Vec<usize> = keys.iter().map(|(key, _)| sim.home(key)).collect();
+    let node = sim.add_node().unwrap();
+    settle_ring(&mut sim, &keys[0].0);
+    let (index, (key, _)) = keys
+        .iter()
+        .enumerate()
+        .find(|(_, (key, _))| sim.home(key) == node)
+        .expect("an object whose home moved");
+    let before = sim.summary();
+    sim.partition(homes[index], 20);
+    sim.write_through(key, 999).unwrap();
+    run(&mut sim, 30);
+    let (head, body) = sim.read(Request::get(key.clone())).unwrap();
+    let current = sim.origin().current(key).unwrap();
+    assert_eq!(head.etag.as_ref(), Some(&current.etag));
+    assert_eq!(body.len(), 999);
+    // The new home asked the previous home, and used none of what it
+    // offered.
+    let after = sim.summary();
+    assert!(after.peer_requests > before.peer_requests);
+    assert_eq!(after.peer_metadata, before.peer_metadata);
+}
+
+/// The new home learns from S3 that an object is gone, while the previous
+/// home, revalidated since through a gateway on the old ring, still offers
+/// its fresh metadata. The new home drops it: it knows the object changed
+/// after that metadata was validated, and answers 404 at once rather than
+/// once the metadata ages out.
+#[test]
+fn a_change_the_new_home_saw_outweighs_the_previous_homes_metadata() {
+    let keys = keys(0, TTL_BUCKET);
+    let mut options = cluster(0, 50_000);
+    options.gateways = 2;
+    options.ttl = 2_000;
+    let mut sim = Simulator::new(0, options);
+    run(&mut sim, 300);
+    for (key, size) in &keys {
+        sim.put(key, *size);
+        sim.read(Request::get(key.clone())).unwrap();
+    }
+    let node = sim.add_node().unwrap();
+    settle_ring(&mut sim, &keys[0].0);
+    let (key, _) = keys
+        .iter()
+        .find(|(key, _)| sim.home(key) == node)
+        .expect("an object whose home moved");
+    let other = &keys.iter().find(|(other, _)| other != key).unwrap().0;
+    // The new home copies the metadata from the previous home.
+    sim.read(Request::get(key.clone())).unwrap();
+    assert_ne!(sim.gateway_ring(1), sim.gateway_ring(0));
+    // Past the TTL, a read through gateway 1, still on the old ring, makes
+    // the previous home revalidate. Its answer shows gateway 1 the new ring,
+    // so this is its only read.
+    run(&mut sim, 2_100);
+    sim.read_through(1, Request::get(key.clone())).unwrap();
+    // The object goes; the new home, revalidating, learns it.
+    sim.delete(key);
+    sim.read(Request::get(other.clone())).unwrap();
+    let (head, _) = sim.read(Request::get(key.clone())).unwrap();
+    assert_eq!(head.status, 404);
+    // The next read finds no metadata on the new home, which asks the
+    // previous home and drops what it offers.
+    sim.read(Request::get(other.clone())).unwrap();
+    let before = sim.summary().peer_requests;
+    let (head, _) = sim.read(Request::get(key.clone())).unwrap();
+    assert_eq!(head.status, 404);
+    assert!(
+        sim.summary().peer_requests > before,
+        "the new home asked the previous home"
+    );
+}
+
+/// Objects read once before a node joins leave only their homes' blocks
+/// stored, so a new owner of another chunk finds its previous owner lacks
+/// the blocks. It fills them from S3 into the slots it reserved, and the
+/// next reread costs no S3 request.
+#[test]
+fn blocks_a_previous_owner_lacks_come_from_s3() {
+    let keys = keys(0, IMMUTABLE_BUCKET);
+    let mut sim = Simulator::new(0, cluster(0, 50_000));
+    run(&mut sim, 300);
+    for (key, size) in &keys {
+        sim.put(key, *size);
+        sim.read(Request::get(key.clone())).unwrap();
+    }
+    sim.add_node().unwrap();
+    settle_ring(&mut sim, &keys[0].0);
+    let before = sim.summary();
+    let first = reread(&mut sim, &keys);
+    let after = sim.summary();
+    assert!(first.origin_requests > 0);
+    assert!(after.peer_requests > before.peer_requests);
+    let second = reread(&mut sim, &keys);
+    assert_eq!(second.origin_requests, 0);
+}
+
 /// Blocks a new owner reads from a previous owner skip the doorkeeper: the
 /// next read finds them on the new owner's disk.
 #[test]

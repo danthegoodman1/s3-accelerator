@@ -48,13 +48,17 @@ fn an_upload_through_its_home_is_read_from_disk() {
 /// the version S3 holds.
 #[test]
 fn an_upload_replaced_before_its_check_is_not_stored() {
-    let mut sim = Simulator::new(1, options());
-    let key = key();
-    sim.write_before_next_answer(&key, 100);
-    sim.write_through(&key, 600).unwrap();
-    assert_eq!(sim.summary().warmed_uploads, 0);
-    let (head, body) = sim.read(Request::get(key.clone())).unwrap();
-    let current = sim.origin().current(&key).unwrap();
-    assert_eq!(head.etag.as_ref(), Some(&current.etag));
-    assert_eq!(body.len(), 100);
+    // A replacement of another size, and one of the same size, which only
+    // its ETag tells apart.
+    for size in [100, 600] {
+        let mut sim = Simulator::new(1, options());
+        let key = key();
+        sim.write_before_next_answer(&key, size);
+        sim.write_through(&key, 600).unwrap();
+        assert_eq!(sim.summary().warmed_uploads, 0, "{size}");
+        let (head, body) = sim.read(Request::get(key.clone())).unwrap();
+        let current = sim.origin().current(&key).unwrap();
+        assert_eq!(head.etag.as_ref(), Some(&current.etag), "{size}");
+        assert_eq!(body.len(), size as usize, "{size}");
+    }
 }

@@ -176,12 +176,6 @@ MUTANTS = [
         [(GATEWAY, "self.actions.push(Action::FindRing);", "")],
     ),
     (
-        "a first fetch lets an eviction drop its version",
-        [(NODE, "self.refer(version);\n        let layout = self.config.layout;\n        for index in layout.blocks_covering(first, last) {",
-          "let layout = self.config.layout;\n        for index in layout.blocks_covering(first, last) {"),
-         (NODE, "self.unref(version);\n    }\n\n    fn revalidated(", "self.forget_if_unused(version);\n    }\n\n    fn revalidated(")],
-    ),
-    (
         "a starting node takes no ring from its seeds",
         [(MEMBERSHIP_ENGINE, "NodeEngine::on_joined(&node, ring);", "let _ = ring;")],
     ),
@@ -317,7 +311,7 @@ MUTANTS = [
     ),
     (
         "nodes store blocks they do not own",
-        [(NODE, "if self.ring.owner(placement) != Some(self.id) {", "if false {")],
+        [(NODE, "if self.ring.owner(placement) != Some(self.id) && !self.leased(placement) {", "if false {")],
     ),
     (
         "gateway metadata used past the bucket's ttl",
@@ -566,7 +560,8 @@ MUTANTS = [
     ),
     (
         "a kept upload is stored without the ETag check",
-        [(NODE, "let current = head.status == 200\n            && head.etag.as_ref() == Some(&etag)", "let current = head.status == 200")],
+        [(NODE, "head.status == 200 && head.etag.as_ref() == Some(&etag) && head.content_length == size",
+          "head.status == 200 && head.content_length == size")],
     ),
     (
         "the home keeps no upload",
