@@ -289,6 +289,22 @@ impl Disk {
         zero_copy::send_file(socket, &self.slabs, offset, len)
     }
 
+    /// Whether the page cache holds every byte of the slab file from
+    /// `offset`, `len` of them.
+    pub fn cached(&self, offset: u64, len: u64) -> bool {
+        self.pages.resident(offset..offset + len).unwrap_or(false)
+    }
+
+    /// Sends bytes the page cache holds on this thread's event loop.
+    pub async fn send_cached(
+        &self,
+        socket: &tokio::net::TcpStream,
+        offset: u64,
+        len: u64,
+    ) -> io::Result<()> {
+        zero_copy::send_cached(socket, &self.slabs, offset, len).await
+    }
+
     /// Records the block in `location`'s slot, with the checksum of the
     /// bytes last written or verified there.
     pub fn record(&self, location: Location, record: SlotRecord) -> io::Result<()> {

@@ -130,7 +130,34 @@ pub fn workers() -> &'static tokio::runtime::Runtime {
 
 /// Bodies smaller than this go out on the event loop: waking a worker
 /// costs more than the copy.
-pub const INLINE_WRITE: usize = 64 << 10;
+pub const INLINE_WRITE: usize = 256 << 10;
+
+/// Runs of at most this many bytes, all in the page cache, go out on the
+/// event loop, which `sendfile` then never blocks: waking a worker costs
+/// more than the send.
+pub const INLINE_SEND: u64 = 1 << 20;
+
+/// Sends `len` bytes of `file` from `offset` to `socket` on this thread's
+/// event loop, waiting for room as the socket fills. Only for bytes the
+/// page cache holds, which `sendfile` reads without blocking.
+pub async fn send_cached(socket: &TcpStream, file: &File, offset: u64, len: u64) -> io::Result<()> {
+    let (mut offset, end) = (offset, offset + len);
+    while offset < end {
+        let count = usize::try_from(end - offset).unwrap_or(usize::MAX);
+        let send = || {
+            Ok(rustix::fs::sendfile(
+                socket,
+                file,
+                Some(&mut offset),
+                count,
+            )?)
+        };
+        if idle(socket.async_io(Interest::WRITABLE, send)).await? == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+    }
+    Ok(())
+}
 
 /// Writes `bytes` to `socket` from a worker, through a duplicate of the
 /// socket.
@@ -315,11 +342,26 @@ impl PageCache {
             return Ok(false);
         };
         fadvise(file, span.start, Some(span_len), Advice::DontNeed)?;
+        Ok(self.pages(range)?.iter().any(|page| page & 1 == 1))
+    }
+
+    /// Whether the page cache holds every page of `range`.
+    pub fn resident(&self, range: Range<u64>) -> io::Result<bool> {
+        Ok(self.pages(range)?.iter().all(|page| page & 1 == 1))
+    }
+
+    /// `mincore`'s report on the pages of `range`: a byte for each, whose
+    /// lowest bit says the page cache holds it.
+    fn pages(&self, range: Range<u64>) -> io::Result<Vec<u8>> {
         let page = rustix::param::page_size() as u64;
         let first = range.start / page * page;
         let end = range.end.div_ceil(page) * page;
-        if first >= end || end as usize > self.len {
-            return Ok(first < end);
+        if first >= end {
+            return Ok(Vec::new());
+        }
+        if end as usize > self.len {
+            // Past the mapping: reported as held, so the slot waits.
+            return Ok(vec![1]);
         }
         let mut pages = vec![0u8; ((end - first) / page) as usize];
         // SAFETY: `first..end` lies within the mapping, and `pages` holds a
@@ -334,7 +376,7 @@ impl PageCache {
         if status != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(pages.iter().any(|page| page & 1 == 1))
+        Ok(pages)
     }
 }
 

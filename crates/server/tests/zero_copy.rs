@@ -243,6 +243,55 @@ async fn a_purge_syncs_its_erased_bytes_before_it_confirms() {
         .await;
 }
 
+/// A hit whose bytes the page cache holds goes out with `sendfile` from
+/// the node's event loop, which it then never blocks; once the pages are
+/// gone, the same hit's `sendfile` runs on a worker, which may wait on
+/// the drive.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cached_hit_is_sent_from_the_event_loop() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            origin.size.set(OBJECT_SIZE);
+            let dir = data_dir();
+            let cluster = Cluster::new(&dir, origin_port, "block_size = 65536");
+            let node = Process::traced(&cluster.node, &dir.join("node.trace"), "sendfile");
+            common::listening(cluster.node_port).await;
+            let _gateway = cluster.start_gateway().await;
+            let body = origin.object("/bucket/k");
+            assert!(cluster.get("k").await == (200, body.clone()));
+            // The blocks' writes finish, and their pages stay cached.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let cached = now();
+            assert!(cluster.get("k").await == (200, body.clone()));
+            let dropped = now();
+            let slabs = std::fs::File::open(dir.join("disk-0/slabs")).unwrap();
+            rustix::fs::fadvise(&slabs, 0, None, rustix::fs::Advice::DontNeed).unwrap();
+            assert!(cluster.get("k").await == (200, body));
+            let event_loop = node.server_pid();
+            node.stop();
+
+            let threads = |from: f64, until: f64| -> Vec<bool> {
+                read_trace(&dir.join("node.trace"), from, until)
+                    .iter()
+                    .filter(|call| call.name == "sendfile" && call.result > 0)
+                    .map(|call| call.thread == event_loop)
+                    .collect()
+            };
+            let hit = threads(cached, dropped);
+            assert!(
+                !hit.is_empty() && hit.iter().all(|&on_loop| on_loop),
+                "{hit:?}"
+            );
+            let uncached = threads(dropped, f64::MAX);
+            assert!(
+                !uncached.is_empty() && uncached.iter().all(|&on_loop| !on_loop),
+                "{uncached:?}"
+            );
+        })
+        .await;
+}
+
 /// A first read's bytes move on worker threads: the node receives S3's
 /// body and writes it to the gateway off its event loop, the thread that
 /// owns its core, which handles only heads.

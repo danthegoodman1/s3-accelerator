@@ -886,6 +886,18 @@ MUTANTS = [
                        "let mut chunks = chunks; let mut arrived = 0u64; while arrived < len && let Some(chunk) = chunks.recv().await { connection.write_all(&chunk).await?; arrived += chunk.len() as u64; }")],
     ),
     (
+        "cached hits wake a worker",
+        [(NODE_ENGINE, "let inline = !connection.kernel_tls()", "let inline = false && !connection.kernel_tls()")],
+    ),
+    (
+        "hits the page cache lacks are sent from the event loop",
+        [(NODE_ENGINE, "&& run.iter().all(|&(offset, len)| disk.cached(offset, len));", ";")],
+    ),
+    (
+        "kernel TLS hits are sent from the event loop",
+        [(NODE_ENGINE, "let inline = !connection.kernel_tls()", "let inline = true")],
+    ),
+    (
         "reads waiting on a newly down node wait out the timeout",
         [(GATEWAY, "for id in waiting {\n            self.fail_over(now, id, None, false);\n        }", "")],
     ),

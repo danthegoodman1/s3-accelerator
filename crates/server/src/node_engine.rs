@@ -1362,6 +1362,17 @@ async fn serve_connection(
         let (status, headers) = protocol::encode_answer(&reply.answer, versions);
         let framing = Framing::Length(reply.len);
         let sent = async {
+            // A small body the node holds goes out with the head.
+            if let [Part::Held { bytes, len }] = reply.body.as_slice()
+                && bytes.len() as u64 == *len
+                && bytes.len() < zero_copy::INLINE_WRITE
+            {
+                let keep_alive = head.keep_alive;
+                connection
+                    .write_head_and_body(status, &headers, framing, keep_alive, bytes)
+                    .await?;
+                return Ok(*len);
+            }
             connection
                 .write_response_head(status, &headers, framing, head.keep_alive)
                 .await?;
@@ -1488,9 +1499,22 @@ async fn send_body(
                     run.push((offset, len));
                     parts.next();
                 }
-                let socket = connection.stream().as_fd().try_clone_to_owned()?;
                 let disk = engine.borrow().disk.clone();
                 let total: u64 = run.iter().map(|(_, len)| len).sum();
+                // Bytes the page cache holds go out from the event loop.
+                // Kernel TLS encrypts as it sends, so its sends stay on
+                // workers.
+                let inline = !connection.kernel_tls()
+                    && total <= zero_copy::INLINE_SEND
+                    && run.iter().all(|&(offset, len)| disk.cached(offset, len));
+                if inline {
+                    for (offset, len) in run {
+                        disk.send_cached(connection.stream(), offset, len).await?;
+                    }
+                    sent += total;
+                    continue;
+                }
+                let socket = connection.stream().as_fd().try_clone_to_owned()?;
                 tokio::task::spawn_blocking(move || {
                     run.into_iter()
                         .try_for_each(|(offset, len)| disk.send(&socket, offset, len))

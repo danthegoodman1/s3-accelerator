@@ -303,9 +303,28 @@ impl Connection {
         keep_alive: bool,
     ) -> io::Result<()> {
         let framing = Framing::Length(response.content_length);
-        self.write_response_head(response.status, &response.headers, framing, keep_alive)
-            .await?;
-        self.write_all(&response.body).await
+        let (status, headers) = (response.status, &response.headers);
+        self.write_head_and_body(status, headers, framing, keep_alive, &response.body)
+            .await
+    }
+
+    /// Writes a response's head and the start of its body, in one write
+    /// when the body is small, since each write costs a system call.
+    pub async fn write_head_and_body(
+        &mut self,
+        status: u16,
+        headers: &[(String, String)],
+        framing: Framing,
+        keep_alive: bool,
+        body: &[u8],
+    ) -> io::Result<()> {
+        let mut head = response_head(status, headers, framing, keep_alive).into_bytes();
+        if body.len() > COALESCED_BODY {
+            self.write_all(&head).await?;
+            return self.write_all(body).await;
+        }
+        head.extend_from_slice(body);
+        self.write_all(&head).await
     }
 
     /// Writes a response's status line and headers; the body follows.
@@ -316,18 +335,7 @@ impl Connection {
         framing: Framing,
         keep_alive: bool,
     ) -> io::Result<()> {
-        let mut head = format!("HTTP/1.1 {status} {}\r\n", reason(status));
-        for (name, value) in headers {
-            head.push_str(&format!("{name}: {value}\r\n"));
-        }
-        match framing {
-            Framing::Length(len) => head.push_str(&format!("Content-Length: {len}\r\n")),
-            Framing::Chunked => head.push_str("Transfer-Encoding: chunked\r\n"),
-        }
-        if !keep_alive {
-            head.push_str("Connection: close\r\n");
-        }
-        head.push_str("\r\n");
+        let head = response_head(status, headers, framing, keep_alive);
         self.write_all(head.as_bytes()).await
     }
 
@@ -425,6 +433,31 @@ pub fn split_path(path: &str) -> (String, String) {
     let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
     let decode = |part: &str| percent_decode_str(part).decode_utf8_lossy().into_owned();
     (decode(bucket), decode(key))
+}
+
+/// Bodies at most this long go out in the same write as their head.
+const COALESCED_BODY: usize = 64 << 10;
+
+/// A response's status line and headers, ending with the blank line.
+fn response_head(
+    status: u16,
+    headers: &[(String, String)],
+    framing: Framing,
+    keep_alive: bool,
+) -> String {
+    let mut head = format!("HTTP/1.1 {status} {}\r\n", reason(status));
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    match framing {
+        Framing::Length(len) => head.push_str(&format!("Content-Length: {len}\r\n")),
+        Framing::Chunked => head.push_str("Transfer-Encoding: chunked\r\n"),
+    }
+    if !keep_alive {
+        head.push_str("Connection: close\r\n");
+    }
+    head.push_str("\r\n");
+    head
 }
 
 /// A complete request head at the start of `buffer`, and its length.
