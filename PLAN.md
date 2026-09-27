@@ -17,7 +17,7 @@ Non-goals until a phase names them: POSIX access, multipart-upload warming, SSE-
 ## Testing Strategy
 
 - **Unit tests** for pure logic: layout math, placement, eviction and admission policy.
-- **Simulator:** `cargo test` runs a fixed seed range; CI runs the commit hash as a seed; a phase ends with a local sweep of at least 10,000 seeds and no failures.
+- **Simulator:** `cargo test` runs a fixed seed range; CI runs the commit hash as a seed; a phase ends, just before the next begins, with a local sweep of 100,000 seeds and no failures. Latent bugs surface when a change shifts the seeds' runs, which a 10,000-seed sweep of the code before the change can miss.
 - **Planted bugs:** `scripts/mutants` applies known bugs to a scratch copy and reports how many seeds catch each. Every phase adds its own and must catch all of them.
 - **Regression tests:** a bug the simulator finds becomes a test in `crates/sim/tests` that runs its seed, with the seed and failing commit in the commit message.
 - **Conformance:** the suite in `tests/` passes against s3proxy, and against the accelerator once S1 lands.
@@ -374,7 +374,7 @@ Out of scope:
 - Kernel version checks: the spec states the kernel requirement.
 
 Completion gate:
-Each audit finding is resolved in the ledger; conformance passes against s3proxy and through the accelerator in each CI configuration; a 10,000-seed sweep passes; planted bugs are caught; `/code-review` findings are resolved.
+Each audit finding is resolved in the ledger; conformance passes against s3proxy and through the accelerator in each CI configuration; a 100,000-seed sweep passes; planted bugs are caught; `/code-review` findings are resolved.
 
 Testing plan:
 - Simulator: after a node dies, a gateway's reads pay at most one timeout per suspect window; a scan inside the fallback window gets past the doorkeeper no more than outside it; leases renew with reads spread across replicas at 55% of the promotion rate.
@@ -395,6 +395,7 @@ Status ledger:
 | Complete | Gate | Audit findings | All 33 resolved. Code: dead nodes (6B); gossip tags and the constant-time secret check (6C); purge durability and gateway metadata, the metadata file, preallocation, doorkeeper skips, lease renewal and SSE-C warming (6D); grants, checksums, presigned URLs, overrides and virtual hosts (6E); conformance and server tests for the gateway's own behavior (6F); the stale config comment (6A). Spec corrections (6A): `versionId` and other pass-through reads, per-bucket policies, replica invalidation, node weights, and the nine descriptions in section C. Carried to Phase 9 with the spec describing today's behavior: per-gateway identity (the shared secret) and S3 credentials from roles (the static `[origin]` key). Left out on purpose: kernel version checks, since the spec states the kernel requirement; and a write that misses an immutable key's home, which `immutable` rules out. |
 | Complete | Gate | Code review | `/code-review high` found 10 issues. Nine are fixed: a purge's forgetting saved before it forgot, so a rewrite it started put the purged metadata back (`a_purge_that_rewrites_the_metadata_file_stays_purged`, which fails on the old order); `DeleteObjects` keys were found by the literal text `<Key>`, and now come from an XML tokenizer that refuses DTDs (`lists_keys_however_they_are_written`); response overrides could carry CR/LF into the head (now 400); a presigned URL's holder, or any client, could add unsigned `x-amz-*` headers that the node would sign (now 403, `a_presigned_url_takes_no_unsigned_amz_header`); an erase failing long after its purge failed the next purge (only erases during a purge count, and later ones are synced); a starting node reported every peer down and gateways took any node's view (nodes report only peers declared down, a node that answers is up, and a change in views alone fetches the ring once a suspect window); punched holes gave preallocated space back (each erased slot is reserved again, `an_erased_slot_is_empty_and_still_reserved`); a listing with its `prefix` twice was checked against one (now 400); the checksum conformance test passed without checksums (it now requires one, which s3proxy returns). The tenth, the metadata rewrite on the node's thread, is 7H. Ten new planted bugs and three repointed ones follow the fixes. |
 | Pending | Gate | Planted-bug sweep | Running over every planted bug at the Phase 6 review's code state. |
+| Pending | Gate | 100,000-seed sweep | |
 
 ## Phase 7: Bottlenecks
 
@@ -412,7 +413,7 @@ Scope:
 - 7H Metadata-file rewrites off the node's thread: a rewrite encodes and writes the file and syncs it twice on the thread that owns the core, once per `metadata_capacity` saves. Move it to a worker thread, with later appends kept after it.
 
 Completion gate:
-The rerun shows a node filling past 2.1 GiB/s until the drive, the network or the stand-in limits it, with every admitted byte written; a miss holds at most the window of the fill budget; hits' p99 first byte under concurrent fills improves; a 4 TB node meets 7F's targets for start time and index memory; a 10,000-seed sweep passes; planted bugs are caught; `/code-review` findings are resolved.
+The rerun shows a node filling past 2.1 GiB/s until the drive, the network or the stand-in limits it, with every admitted byte written; a miss holds at most the window of the fill budget; hits' p99 first byte under concurrent fills improves; a 4 TB node meets 7F's targets for start time and index memory; a 100,000-seed sweep passes; planted bugs are caught; `/code-review` findings are resolved.
 
 Testing plan:
 - Simulator: a property that a gateway's outstanding chunks per response stay within the window; a scenario where a large miss under a small fill budget is admitted in full.
@@ -432,6 +433,7 @@ Status ledger:
 | Complete | Gate | Code review | `/code-review high` over `f5e7389^..HEAD`, Phases 7 and 8 together, found 10 issues, all fixed. A window whose runs had one owner went out as one part, so the next window waited for the whole part (parts now take at most half the window, `one_owners_window_goes_out_in_halves`). A read whose first window covered its body kept an empty read-ahead state and could hang if its parts fell short (`plan_with` keeps it only with runs left). A cancelled S3 read left its worker waiting on S3 (`Cancelling` aborts it; `a_cancelled_s3_read_closes_its_connection`). A multi-byte `eventTime` fraction panicked the event task (`a_malformed_event_time_is_none`). The admin listener spun on accept errors (it now pauses). An unheard gateway asked for a ring every tick (`an_unheard_gateway_asks_for_a_ring_once_a_suspect_window`). Warmed and prefetched blocks counted as misses (`an_upload_through_its_home_is_read_from_disk` checks), and a purged corrupt block counted under two drop causes. Gateway failure logs now name the request, and two doc comments were rewritten. |
 | Pending | Work | 7D: Hit latency under fills | Needs benchmarks on an idle machine. |
 | Pending | Work | 7G: Rerun the benchmarks | Needs an idle machine. |
+| Pending | Gate | 100,000-seed sweep | |
 
 ## Phase 8: Observability
 
@@ -449,7 +451,7 @@ Out of scope:
 - Distributed tracing.
 
 Completion gate:
-Metrics agree with outside observations in server tests; benchmarks with metrics on stay within 2% of Phase 7's results; a 10,000-seed sweep with the counter property passes; planted bugs are caught; `/code-review` findings are resolved.
+Metrics agree with outside observations in server tests; benchmarks with metrics on stay within 2% of Phase 7's results; a 100,000-seed sweep with the counter property passes; planted bugs are caught; `/code-review` findings are resolved.
 
 Testing plan:
 - Simulator property: the core's hit and miss counts agree with the model's record of which reads reached S3.
@@ -466,6 +468,7 @@ Status ledger:
 | Complete | Scope | 8D Health and readiness | Recovery runs on a blocking thread, so `/healthz` answers meanwhile. A node is ready once recovered and joined; a gateway once a node answered, and a starting gateway asks for a ring until one does (`Gateway::has_heard`, scenario `a_starting_gateway_asks_for_a_ring_before_any_read`). Tests `readiness_waits_for_the_node_to_join` (a seed that never answers holds readiness for the ring wait) and `a_process_is_ready_once_each_role_is`. Planted bugs caught: a node ready before it joins, and before it recovers; a starting gateway waiting for a read to ask for a ring. |
 | Complete | Gate | Bugs the new trajectories found | Seed 16648030974266863723: a clean stop read a node's counters before its last writes answered requests (simulator bookkeeping). Seed 16648030974266864628, failing at `da877e3`: with both nodes down and no network delay, clients retried 503s within one tick; simulated clients now back off a tick, as SDKs do. Seed 6707258591206456590: a purged block found corrupt was freed twice. Seed 14674409610259123330: an event under way skipped the home a newly adopted ring named. Each is a test in `crates/sim/tests/seeds.rs`; planted bugs undoing the two core fixes are caught. Two sweeps of 10,000 seeds then passed, and another after the review's fixes. |
 | Complete | Scope | 8E Logs and request IDs | `crates/server/src/log.rs`: logfmt lines (`ts`, `level`, `msg`, fields) written whole to standard error, with `[log] level`; every server message moved to it at `warn` for failures and `info` for starts, recoveries, rings and departures. The gateway gives each client request a random ID, sends it to nodes in `x-accel-request-id` (the core's `Send` names the client read it serves), and names it on every response, as `x-amz-request-id` too when S3 gave none. Nodes log S3's `x-amz-request-id` and `x-amz-id-2` when S3 fails a read or a forwarded request. Tests: `a_line_is_logfmt`, `responses_name_their_request_ids`, `a_reads_id_follows_it_to_the_node` (the gateway's and the node's debug lines name the ID the client got). Planted bugs caught, after a baseline run: request IDs never reaching nodes, responses S3 did not give lacking an S3 request ID, log values with spaces unquoted. |
+| Pending | Gate | 100,000-seed sweep | |
 | Pending | Gate | Cost of metrics | Benchmarks scraped every second within 2% of runs without the admin listener; needs an idle machine. |
 | Complete | Gate | Code review | The review of Phases 7 and 8 together; see Phase 7's ledger. |
 
@@ -490,7 +493,7 @@ Out of scope:
 - A replicated service, and tenants.
 
 Completion gate:
-A revoked credential stops working at every gateway within the bound the spec sets; gateways and nodes keep serving through an outage of the service and fail closed after the bound; a gateway reaches only what its grants allow; conformance passes with credentials from the service; planted bugs are caught; `/code-review` findings are resolved.
+A revoked credential stops working at every gateway within the bound the spec sets; gateways and nodes keep serving through an outage of the service and fail closed after the bound; a gateway reaches only what its grants allow; conformance passes with credentials from the service; a 100,000-seed sweep passes; planted bugs are caught; `/code-review` findings are resolved.
 
 Testing plan:
 - Integration tests over loopback, after netfence's: reconnect and resume; a delayed ACK from an older stream; a NACKed set left unapplied; a proxy that blackholes the stream, which keepalives detect; mutual TLS failures.
