@@ -748,7 +748,7 @@ MUTANTS = [
     ),
     (
         "an upload with the client's encryption key is warmed",
-        [(PASSTHROUGH, '&& header(&forward.headers, "x-amz-server-side-encryption-customer-key").is_none()', "")],
+        [(PASSTHROUGH, '&& header(&forward.headers, "x-amz-server-side-encryption-customer-key",).is_none()', "")],
     ),
     (
         "reads waiting on a newly down node wait out the timeout",

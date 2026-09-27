@@ -788,7 +788,8 @@ fn a_node_down_past_its_grace_period_leaves_every_ring() {
 /// A home rewrites its metadata file, least recently used first, once the
 /// file holds twice the metadata capacity and at a clean shutdown: the
 /// file stays bounded, and a restart keeps the most recently used entries,
-/// such as one served from memory since it was fetched.
+/// such as one served from memory since it was fetched, in the order it
+/// used them, so new keys push out the least recently used first.
 #[test]
 fn the_metadata_file_keeps_the_most_recently_used() {
     let mut options = Options::scenario();
@@ -796,7 +797,7 @@ fn the_metadata_file_keeps_the_most_recently_used() {
     options.metadata_capacity = 4;
     options.gateway_metadata_capacity = 1;
     let mut sim = Simulator::new(1, options);
-    let keys: Vec<ObjectKey> = (0..21)
+    let keys: Vec<ObjectKey> = (0..23)
         .map(|index| key(IMMUTABLE_BUCKET, &format!("k{index}")))
         .collect();
     for key in &keys[..20] {
@@ -813,6 +814,11 @@ fn the_metadata_file_keeps_the_most_recently_used() {
     sim.read(Request::head(keys[20].clone())).unwrap();
     sim.shut_down(0).unwrap();
     sim.restart(0).unwrap();
+    // k18 and k19, used longest ago, make room for k21 and k22.
+    for key in &keys[21..] {
+        sim.put(key, 100);
+        sim.read(Request::head(key.clone())).unwrap();
+    }
     let before = sim.summary().origin_requests;
     let (head, _) = sim.read(Request::head(keys[16].clone())).unwrap();
     assert_eq!(head.status, 200);
