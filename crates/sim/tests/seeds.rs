@@ -221,3 +221,15 @@ fn a_response_from_fresh_but_replaced_metadata_can_end_early() {
         panic!("{failure}");
     }
 }
+
+/// Seed 97727: a home heard of a write through it and passed it to the
+/// previous home, which never got the notice; the home then restarted,
+/// forgetting the write, and took the previous home's metadata from
+/// before it. `a_restarted_node_takes_no_metadata_validated_before_it_restarted`
+/// pins it.
+#[test]
+fn a_restarted_home_takes_no_metadata_from_before_it_restarted() {
+    if let Err(failure) = Simulator::from_seed(97727).run() {
+        panic!("{failure}");
+    }
+}

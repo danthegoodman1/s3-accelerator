@@ -1707,7 +1707,12 @@ impl Simulator {
             }
             false => self.ring.clone(),
         };
-        self.nodes[node] = Some(Node::recover(id, ring, config, records, metadata, purges));
+        let mut recovered = Node::recover(id, ring, config, records, metadata, purges);
+        // A node that stopped forgot the changes it had learned of.
+        if self.runs[node] > 0 {
+            recovered.restarted(Time(self.now));
+        }
+        self.nodes[node] = Some(recovered);
         self.drain_node(node)?;
         self.start_joining(node);
         Ok(())

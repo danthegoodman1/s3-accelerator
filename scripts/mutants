@@ -163,7 +163,7 @@ MUTANTS = [
     ),
     (
         "a previous home's metadata outlives a write",
-        [(NODE, "(!written).then_some((meta, validated))", "Some((meta, validated)).filter(|_| written || !written)")],
+        [(NODE, "(!written && !forgotten).then_some((meta, validated))", "(!forgotten).then_some((meta, validated))")],
     ),
     (
         "blocks a previous owner lacks are not read from S3",
@@ -1011,6 +1011,10 @@ MUTANTS = [
         "writes that overtake a metadata fetch starve its read",
         [(NODE, "Some(meta) if superseded => {\n                    let shared = shared(&meta, sent, now);\n                    self.plan(request, &key, &meta, shared);\n                }",
                 "Some(_) if superseded => self.serve(now, request),")],
+    ),
+    (
+        "a restarted node trusts metadata from before its restart",
+        [(NODE, "(!written && !forgotten).then_some((meta, validated))", "(!written).then_some((meta, validated))")],
     ),
     (
         "request IDs never reach nodes",

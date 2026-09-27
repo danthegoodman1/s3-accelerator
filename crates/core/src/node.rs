@@ -448,6 +448,10 @@ pub struct Node {
     /// answer or S3's event: metadata validated before one, a previous
     /// home's or S3's, is stale.
     written: BTreeMap<ObjectKey, Time>,
+    /// When this node restarted, if it ran before: it forgot the changes
+    /// it had learned of, so a previous home's metadata validated before
+    /// then may be stale.
+    restarted: Option<Time>,
     /// Events passed to other homes, until each hears.
     events: BTreeMap<EventId, PassedEvent>,
     /// Reads of each placement this node owns in its current hot window:
@@ -676,6 +680,7 @@ impl Node {
             previous: None,
             unreachable: BTreeSet::new(),
             written: BTreeMap::new(),
+            restarted: None,
             events: BTreeMap::new(),
             read_counts: BTreeMap::new(),
             hot: BTreeMap::new(),
@@ -779,6 +784,14 @@ impl Node {
 
     pub fn stats(&self) -> Stats {
         self.stats
+    }
+
+    /// The node ran before and restarted at `now`. It forgot the changes it
+    /// had learned of, so it uses no metadata a previous home validated
+    /// before now.
+    pub fn restarted(&mut self, now: Time) {
+        self.now = self.now.max(now);
+        self.restarted = Some(now);
     }
 
     pub fn usage(&self) -> Usage {
@@ -2254,7 +2267,12 @@ impl Node {
                 .written
                 .get(&key)
                 .is_some_and(|&written| written >= validated);
-            (!written).then_some((meta, validated))
+            // Validated before a restart, which forgot the changes this
+            // node had learned of.
+            let forgotten = self
+                .restarted
+                .is_some_and(|restarted| sent.0 < restarted.0 + meta.age);
+            (!written && !forgotten).then_some((meta, validated))
         });
         let Some((meta, validated)) = usable else {
             let client = self.object_request(id);
@@ -3527,6 +3545,72 @@ mod tests {
             |action| matches!(action, Action::Fetch { request, .. } if request.key == key("k")),
         );
         assert!(fetches, "the home kept the replaced version's metadata");
+    }
+
+    /// A restarted node forgot the writes it had heard of, so it takes no
+    /// metadata from a previous home validated before its restart, and
+    /// takes metadata validated since.
+    #[test]
+    fn a_restarted_node_takes_no_metadata_validated_before_it_restarted() {
+        let member = |id| Member {
+            id: NodeId(id),
+            weight: NonZeroU32::MIN,
+        };
+        let policy = BucketPolicy {
+            freshness: Freshness::Ttl(1_000_000),
+            admit_on_first_read: false,
+            warm_on_write: false,
+        };
+        let config = Config {
+            default_policy: policy,
+            ..config(16)
+        };
+        let both = Ring::new(1, vec![member(0), member(1)]);
+        // A key whose home was node 1, and is node 0 once node 1 leaves.
+        let key = (0..)
+            .map(|index| key(&format!("k{index}")))
+            .find(|key| both.owner(Placement::Home(key).hash()) == Some(NodeId(1)))
+            .expect("a key node 1 was home to");
+        let asks = |age: u64| {
+            let mut node = Node::recover(
+                NodeId(0),
+                both.clone(),
+                config.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
+            node.restarted(Time(100));
+            node.on_ring(Time(100), Ring::new(2, vec![member(0)]));
+            let read = Read::Object {
+                request: Request::head(key.clone()),
+                stale: None,
+                direct: false,
+            };
+            node.on_request(Time(150), GatewayRequestId(1), read);
+            let asked = node.drain().into_iter().find_map(|action| match action {
+                Action::PeerFetch { origin, .. } => Some(origin),
+                _ => None,
+            });
+            let meta = ObjectMeta {
+                etag: ETag("\"v1\"".into()),
+                size: 10,
+                headers: Vec::new(),
+                age,
+            };
+            node.on_peer_metadata(
+                Time(160),
+                asked.expect("the previous home is asked"),
+                Some(meta),
+            );
+            node.drain()
+                .into_iter()
+                .any(|action| matches!(action, Action::Fetch { .. }))
+        };
+        // Validated at 90, before the restart: S3 is asked instead.
+        assert!(asks(60));
+        // Validated at 140, since the restart: the metadata answers.
+        assert!(!asks(10));
     }
 
     /// A coordinator tells the nodes of its rings of a purge again until

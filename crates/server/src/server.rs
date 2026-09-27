@@ -204,7 +204,7 @@ pub async fn run_with(
                     ..peer
                 })
                 .expect("a node is in cluster.nodes");
-            let recovered = Node::recover(
+            let mut recovered = Node::recover(
                 id,
                 config.ring(),
                 node_config,
@@ -212,6 +212,11 @@ pub async fn run_with(
                 recovery.metadata,
                 recovery.purges,
             );
+            // A node whose disk shows an earlier run forgot the changes it
+            // had learned of then.
+            if disk.run() > 1 {
+                recovered.restarted(Time(0));
+            }
             let engine = NodeEngine::new(
                 recovered,
                 origin,
