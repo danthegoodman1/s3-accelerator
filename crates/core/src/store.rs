@@ -8,7 +8,9 @@
 //! evicted blocks so they go straight to the main queue when they return.
 
 use crate::placement::PlacementHash;
+use crate::s3::{ETag, ObjectKey};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use xxhash_rust::xxh3::{xxh3_64, xxh3_128};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreConfig {
@@ -27,9 +29,50 @@ pub struct Location {
     pub offset: u64,
 }
 
-/// An object version, numbered by the node that stores its blocks.
+/// An object version, named by hashes: one of its bucket and key, which
+/// groups an object's versions, and a 128-bit one of its bucket, key and
+/// ETag. Records on disk hold it, so they have one size whatever the key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct VersionId(pub u64);
+pub struct VersionId {
+    pub key: u64,
+    pub version: u128,
+}
+
+impl VersionId {
+    pub fn of(key: &ObjectKey, etag: &ETag) -> VersionId {
+        let mut bytes = named(key);
+        let key = xxh3_64(&bytes);
+        push(&mut bytes, &etag.0);
+        VersionId {
+            key,
+            version: xxh3_128(&bytes),
+        }
+    }
+
+    /// The hash of `key` that every version of it shares.
+    pub fn key_hash(key: &ObjectKey) -> u64 {
+        xxh3_64(&named(key))
+    }
+
+    /// Every version of the object whose key hashes to `key`, in order.
+    pub fn all_of(key: u64) -> std::ops::RangeInclusive<VersionId> {
+        let bound = |version| VersionId { key, version };
+        bound(0)..=bound(u128::MAX)
+    }
+}
+
+/// Bucket and key, each prefixed with its length.
+fn named(key: &ObjectKey) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(key.bucket.len() + key.key.len() + 8);
+    push(&mut bytes, &key.bucket);
+    push(&mut bytes, &key.key);
+    bytes
+}
+
+fn push(bytes: &mut Vec<u8>, part: &str) {
+    bytes.extend_from_slice(&(part.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(part.as_bytes());
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockKey {
@@ -517,7 +560,7 @@ mod tests {
 
     fn key(index: u64) -> BlockKey {
         BlockKey {
-            version: VersionId(1),
+            version: VersionId { key: 1, version: 1 },
             index,
         }
     }

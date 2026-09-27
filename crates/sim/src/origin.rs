@@ -7,6 +7,7 @@ use crate::prng::{Prng, splitmix64};
 use s3_accelerator_core::s3::{
     ByteRange, ContentRange, ETag, Method, ObjectKey, Request, ResponseHead,
 };
+use s3_accelerator_core::store::VersionId;
 use std::collections::BTreeMap;
 use std::ops::Range;
 
@@ -41,6 +42,8 @@ struct State {
 pub struct Origin {
     history: BTreeMap<ObjectKey, Vec<State>>,
     versions: BTreeMap<ETag, Object>,
+    /// Each version's ETag by the hash nodes know it by.
+    ids: BTreeMap<VersionId, ETag>,
     requests: u64,
 }
 
@@ -67,6 +70,7 @@ impl Origin {
             seed,
         };
         self.versions.insert(etag.clone(), object);
+        self.ids.insert(VersionId::of(key, &etag), etag.clone());
         self.record(now, key, Some(etag));
     }
 
@@ -90,6 +94,11 @@ impl Origin {
 
     pub fn version(&self, etag: &ETag) -> Option<&Object> {
         self.versions.get(etag)
+    }
+
+    /// The version nodes know by `id`.
+    pub fn version_by_id(&self, id: VersionId) -> Option<&Object> {
+        self.ids.get(&id).map(|etag| &self.versions[etag])
     }
 
     /// Requests S3 has answered.

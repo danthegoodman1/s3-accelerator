@@ -177,7 +177,9 @@ impl Engine {
     fn node_action(&mut self, action: node::Action) {
         let now = self.now();
         match action {
-            node::Action::Fetch { origin, request } => self.fetches.push((origin, request)),
+            node::Action::Fetch {
+                origin, request, ..
+            } => self.fetches.push((origin, request)),
             node::Action::Respond {
                 request,
                 head,
@@ -219,9 +221,13 @@ impl Engine {
                     .copy_from_slice(source);
                 self.node.on_written(location);
             }
-            // Blocks live in memory and leave with the process, so there is
-            // no slot table to keep and nothing recovered to verify.
-            node::Action::Record { .. } | node::Action::Clear { .. } => {}
+            // Blocks and metadata live in memory and leave with the process,
+            // so there is no slot table or metadata file to keep, and
+            // nothing recovered to verify.
+            node::Action::Record { .. }
+            | node::Action::Clear { .. }
+            | node::Action::Remember { .. }
+            | node::Action::Forget { .. } => {}
             node::Action::Verify { .. } => unreachable!("a node started empty verifies nothing"),
             node::Action::Release { origin } => {
                 self.bodies.remove(&origin);

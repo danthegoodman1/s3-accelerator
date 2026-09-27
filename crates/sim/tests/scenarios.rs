@@ -687,3 +687,58 @@ fn a_cut_s3_body_stores_nothing_and_the_read_resumes() {
     sim.read(Request::get(key)).unwrap();
     assert_eq!(sim.summary().written_bytes, 100);
 }
+
+/// The home saves an immutable object's metadata, so after a restart, clean
+/// or not, a gateway that never saw the object reads it without any S3
+/// request.
+#[test]
+fn an_immutable_object_read_after_a_restart_costs_no_s3_request() {
+    for crash in [false, true] {
+        let mut options = Options::scenario();
+        options.gateways = 2;
+        options.immutable_admit_on_first_read = true;
+        let mut sim = Simulator::new(1, options);
+        let key = key(IMMUTABLE_BUCKET, "k");
+        sim.put(&key, 200);
+        sim.read(Request::get(key.clone())).unwrap();
+        // The metadata file syncs within a disk delay.
+        for _ in 0..10 {
+            sim.step().unwrap();
+        }
+        match crash {
+            true => sim.crash(0).unwrap(),
+            false => sim.shut_down(0).unwrap(),
+        }
+        sim.restart(0).unwrap();
+        let before = sim.summary();
+        let (_, body) = sim.read_through(1, Request::get(key)).unwrap();
+        let after = sim.summary();
+        assert_eq!(body.len(), 200, "crash: {crash}");
+        assert_eq!(
+            after.origin_requests - before.origin_requests,
+            0,
+            "crash: {crash}"
+        );
+        assert_eq!(after.hit_bytes - before.hit_bytes, 200, "crash: {crash}");
+    }
+}
+
+/// A write through the home drops the metadata it saved, so a restart does
+/// not bring the old version back. The old version's blocks stay stored,
+/// so no `If-Match` fill would notice.
+#[test]
+fn a_write_through_the_home_outlasts_a_restart() {
+    let mut options = Options::scenario();
+    options.immutable_admit_on_first_read = true;
+    let mut sim = Simulator::new(1, options);
+    let key = key(IMMUTABLE_BUCKET, "k");
+    sim.put(&key, 100);
+    sim.read(Request::get(key.clone())).unwrap();
+    sim.write_through(&key, 120).unwrap();
+    sim.shut_down(0).unwrap();
+    sim.restart(0).unwrap();
+    let (head, body) = sim.read(Request::get(key.clone())).unwrap();
+    let current = sim.origin().current(&key).unwrap();
+    assert_eq!(head.etag.as_ref(), Some(&current.etag));
+    assert_eq!(body.len(), 120);
+}

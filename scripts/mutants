@@ -54,13 +54,9 @@ MUTANTS = [
         "write leaves its body unheld",
         [
             (NODE, 'self.origins.get_mut(&origin).expect("written body exists").readers += 1;', ""),
-            (NODE, "self.unref(block.version);\n        }\n        self.stop_reading(origin);\n    }\n\n    /// The block at `location` was checked",
-             "self.unref(block.version);\n        }\n    }\n\n    /// The block at `location` was checked"),
+            (NODE, "self.stop_reading(origin);\n        for waiter in self.awaiting_writes.remove(&location).unwrap_or_default() {",
+             "for waiter in self.awaiting_writes.remove(&location).unwrap_or_default() {"),
         ],
-    ),
-    (
-        "first fetch body read from the wrong offset",
-        [(NODE, 'self.origins.get_mut(&origin).expect("answered origin").body_start = first;', "")],
     ),
     (
         "416 relayed despite preconditions",
@@ -222,12 +218,12 @@ MUTANTS = [
     ),
     (
         "a restarted home fetches whole objects it holds blocks of",
-        [(NODE, "if self.recovered.remove(&key) && self.holds_blocks_of(&key) {",
-          "if self.recovered.remove(&key) && self.holds_blocks_of(&key) && false {")],
+        [(NODE, "if self.recovered.remove(&VersionId::key_hash(&key)) && self.holds_blocks_of(&key) {",
+          "if self.recovered.remove(&VersionId::key_hash(&key)) && self.holds_blocks_of(&key) && false {")],
     ),
     (
         "a home that holds old blocks fetches a HEAD before every first read",
-        [(NODE, "if self.recovered.remove(&key) && self.holds_blocks_of(&key) {",
+        [(NODE, "if self.recovered.remove(&VersionId::key_hash(&key)) && self.holds_blocks_of(&key) {",
           "if self.holds_blocks_of(&key) {")],
     ),
     (
@@ -257,6 +253,39 @@ MUTANTS = [
     (
         "a write from a cut S3 body is kept",
         [(NODE, "pub fn on_write_failed(&mut self, location: Location) {", "pub fn on_write_failed(&mut self, location: Location) {\n        if location.offset < u64::MAX { return self.on_written(location); }")],
+    ),
+    (
+        "immutable metadata is not saved",
+        [(NODE, "let (key, meta) = (key.clone(), meta.clone());\n            self.actions.push(Action::Remember { key, meta });", "")],
+    ),
+    (
+        "a restart brings back metadata a write dropped",
+        [(NODE, "None => {\n                    node.forget(&key);\n                }", "None => {}")],
+    ),
+    (
+        "a replayed key keeps a stale entry",
+        [(NODE, "self.forget(&key);\n        let used = self.next_use;", "let used = self.next_use;")],
+    ),
+    (
+        "a late reader joins a streaming body",
+        [(NODE, "if let Some(location) = self.admit(key, meta.size, block) {\n                self.write(location, origin, span.start - first, span.end - span.start);",
+          "self.track_in_flight(block, origin);\n            if let Some(location) = self.admit(key, meta.size, block) {\n                self.write(location, origin, span.start - first, span.end - span.start);")],
+    ),
+    (
+        "a fill spans more than a chunk",
+        [(NODE, ".take(chunk_blocks)", "")],
+    ),
+    (
+        "a reader waiting on a first fetch's write is never told",
+        [(NODE, "for waiter in self.awaiting_writes.remove(&location).unwrap_or_default() {\n            self.arrived(waiter, Await::Written(location));\n        }", "")],
+    ),
+    (
+        "queued readers never share an arriving body",
+        [(NODE, "self.arriving = Some((origin, version, first, last));", "let _ = (version, first, last);")],
+    ),
+    (
+        "a queued reader shares an arriving body that lacks its bytes",
+        [(NODE, "&& start <= first\n            && last <= end", "")],
     ),
 ]
 

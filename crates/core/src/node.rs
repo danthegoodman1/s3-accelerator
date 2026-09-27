@@ -106,10 +106,9 @@ pub struct Config {
 
 /// What the slot table records about a stored block: enough to put it back
 /// in the index after a restart.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotRecord {
-    pub key: ObjectKey,
-    pub etag: ETag,
+    pub version: VersionId,
     pub index: u64,
     pub len: u64,
     pub placement: PlacementHash,
@@ -145,10 +144,14 @@ pub enum Segment {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Send `request` to S3.
+    /// Send `request` to S3. A streaming body has every reader it will
+    /// have by the time its head arrives, so it may pass through without
+    /// being held. Otherwise it is a fill of at most one chunk, and the
+    /// node may read any of it until it releases it.
     Fetch {
         origin: OriginRequestId,
         request: Request,
+        streams: bool,
     },
     /// Answer the gateway with `head`, then `body`. Call `on_sent` once the
     /// body is sent. A home that knows the object's metadata includes it.
@@ -187,6 +190,12 @@ pub enum Action {
     /// Erase the slot table's record for `location`. The erasure must be
     /// durable before a later `Write` over any of the slot's bytes begins.
     Clear { location: Location },
+    /// Append `key`'s metadata to the metadata file. A home saves the
+    /// metadata of immutable buckets, which stays valid across restarts.
+    Remember { key: ObjectKey, meta: Meta },
+    /// Append to the metadata file that `key`'s saved metadata no longer
+    /// holds.
+    Forget { key: ObjectKey },
     /// Check the `len` bytes of the block at `location` against the
     /// checksum its record held, then call `on_verified`.
     Verify {
@@ -232,10 +241,9 @@ impl std::ops::AddAssign for Stats {
 }
 
 /// A stored block, as the node's index describes it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoredBlock<'a> {
-    pub key: &'a ObjectKey,
-    pub etag: &'a ETag,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredBlock {
+    pub version: VersionId,
     pub index: u64,
     pub location: Location,
     pub len: u64,
@@ -251,9 +259,7 @@ pub struct Node {
     /// Known objects by when they were last used, oldest first.
     recency: BTreeMap<u64, ObjectKey>,
     next_use: u64,
-    versions: BTreeMap<(ObjectKey, ETag), Version>,
-    version_names: BTreeMap<VersionId, (ObjectKey, ETag)>,
-    next_version: u64,
+    versions: BTreeMap<VersionId, Version>,
     store: Store,
     doorkeeper: Doorkeeper,
     origins: BTreeMap<OriginRequestId, OriginRequest>,
@@ -262,9 +268,15 @@ pub struct Node {
     in_flight: BTreeMap<BlockKey, OriginRequestId>,
     /// Slots being written, and the response bodies they copy from.
     writes: BTreeMap<Location, OriginRequestId>,
-    /// Keys whose blocks the node recovered at startup and whose metadata
-    /// it has not fetched since.
-    recovered: BTreeSet<ObjectKey>,
+    /// Requests that read slots a first fetch is writing.
+    awaiting_writes: BTreeMap<Location, Vec<GatewayRequestId>>,
+    /// While the node handles a first fetch's head: its streaming body's
+    /// version and span. Requests queued behind the fetch may read the
+    /// body only then, since it streams through.
+    arriving: Option<(OriginRequestId, VersionId, u64, u64)>,
+    /// Hashes of keys whose blocks the node recovered at startup and whose
+    /// metadata it has not fetched since.
+    recovered: BTreeSet<u64>,
     /// Recovered blocks being verified, and the requests that wait for them.
     verifying: BTreeMap<Location, (BlockKey, Vec<GatewayRequestId>)>,
     /// Bytes of stored blocks that are filling.
@@ -295,17 +307,20 @@ enum Object {
     },
 }
 
-#[derive(Clone, Debug)]
-struct Meta {
-    etag: ETag,
-    size: u64,
-    headers: Vec<(String, String)>,
+/// An object's metadata, as a home keeps it and saves it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Meta {
+    pub etag: ETag,
+    pub size: u64,
+    pub headers: Vec<(String, String)>,
 }
 
 struct Version {
-    id: VersionId,
-    /// Stored and in-flight blocks that name this version.
+    /// Stored and in-flight blocks of this version.
     refs: u64,
+    /// Its key and ETag, once a read names it: a version recovered from
+    /// the slot table is known only by its hash until then.
+    name: Option<(ObjectKey, ETag)>,
 }
 
 struct OriginRequest {
@@ -369,6 +384,8 @@ struct Plan {
 enum Await {
     Fill(OriginRequestId),
     Verify(Location),
+    /// A first fetch's write into this slot.
+    Written(Location),
 }
 
 /// What a response keeps in place until its body is sent.
@@ -397,12 +414,13 @@ impl Node {
             recency: BTreeMap::new(),
             next_use: 0,
             versions: BTreeMap::new(),
-            version_names: BTreeMap::new(),
-            next_version: 0,
+
             origins: BTreeMap::new(),
             next_origin: 0,
             in_flight: BTreeMap::new(),
             writes: BTreeMap::new(),
+            awaiting_writes: BTreeMap::new(),
+            arriving: None,
             recovered: BTreeSet::new(),
             verifying: BTreeMap::new(),
             filling_bytes: 0,
@@ -413,17 +431,28 @@ impl Node {
         }
     }
 
-    /// A node restarting over the slot table's records. It serves trusted
+    /// A node restarting over the slot table's records and the metadata
+    /// file's entries, in the order they were appended. It serves trusted
     /// blocks as they are and verifies each other block on its first read.
     /// Records that no slot of this store can hold, or that clash with
-    /// others, are cleared.
+    /// others, are cleared. The latest saved metadata is kept, up to
+    /// capacity.
     pub fn recover(
         id: NodeId,
         ring: Ring,
         config: Config,
         records: impl IntoIterator<Item = Recovered>,
+        metadata: impl IntoIterator<Item = (ObjectKey, Option<Meta>)>,
     ) -> Node {
         let mut node = Node::new(id, ring, config);
+        for (key, meta) in metadata {
+            match meta {
+                Some(meta) => node.keep(key, meta, Time::default()),
+                None => {
+                    node.forget(&key);
+                }
+            }
+        }
         let block_size = node.config.layout.block_size();
         for recovered in records {
             let Recovered {
@@ -432,12 +461,16 @@ impl Node {
                 checksum,
                 trusted,
             } = recovered;
-            let version = node.version(&record.key, &record.etag);
+            let version = record.version;
+            node.versions.entry(version).or_insert(Version {
+                refs: 0,
+                name: None,
+            });
             let block = BlockKey {
                 version,
                 index: record.index,
             };
-            let hash = block_hash(&record.key, &record.etag, block_size, record.index);
+            let hash = block_hash(version, block_size, record.index);
             let verify = (!trusted).then_some(checksum);
             let restored = record.len <= block_size
                 && node
@@ -445,7 +478,7 @@ impl Node {
                     .restore(block, location, record.len, hash, record.placement, verify);
             if restored {
                 node.refer(version);
-                node.recovered.insert(record.key);
+                node.recovered.insert(version.key);
             } else {
                 node.forget_if_unused(version);
                 node.actions.push(Action::Clear { location });
@@ -459,34 +492,28 @@ impl Node {
     }
 
     /// Every stored block the node would serve without verifying it first.
-    pub fn stored_blocks(&self) -> impl Iterator<Item = StoredBlock<'_>> {
+    pub fn stored_blocks(&self) -> impl Iterator<Item = StoredBlock> {
         self.store
             .blocks()
             .filter(|(_, entry)| entry.state == BlockState::Ready && entry.verify.is_none())
-            .map(|(block, entry)| {
-                let (key, etag) = &self.version_names[&block.version];
-                StoredBlock {
-                    key,
-                    etag,
-                    index: block.index,
-                    location: entry.location,
-                    len: entry.len,
-                }
+            .map(|(block, entry)| StoredBlock {
+                version: block.version,
+                index: block.index,
+                location: entry.location,
+                len: entry.len,
             })
     }
 
     /// The block stored at `location`, if the node would serve it without
     /// verifying it first.
-    pub fn stored_block_at(&self, location: Location) -> Option<StoredBlock<'_>> {
+    pub fn stored_block_at(&self, location: Location) -> Option<StoredBlock> {
         let block = self.store.block_at(location)?;
         let entry = self.store.get(&block)?;
         if entry.state != BlockState::Ready || entry.verify.is_some() {
             return None;
         }
-        let (key, etag) = &self.version_names[&block.version];
         Some(StoredBlock {
-            key,
-            etag,
+            version: block.version,
             index: block.index,
             location,
             len: entry.len,
@@ -522,7 +549,8 @@ impl Node {
             .iter()
             .map(|(origin, request)| {
                 format!(
-                    "{origin:?} answered {} cancelled {} readers {} waiters {}",
+                    "{origin:?} sent {} answered {} cancelled {} readers {} waiters {}",
+                    request.sent.0,
                     request.answered,
                     request.cancelled,
                     request.readers,
@@ -627,10 +655,8 @@ impl Node {
 
     fn slot_record(&self, block: BlockKey) -> SlotRecord {
         let entry = self.store.get(&block).expect("recorded block exists");
-        let (key, etag) = self.version_names[&block.version].clone();
         SlotRecord {
-            key,
-            etag,
+            version: block.version,
             index: block.index,
             len: entry.len,
             placement: entry.placement,
@@ -638,10 +664,8 @@ impl Node {
     }
 
     fn holds_blocks_of(&self, key: &ObjectKey) -> bool {
-        self.versions
-            .range((key.clone(), ETag(String::new()))..)
-            .next()
-            .is_some_and(|((held, _), _)| held == key)
+        let key = VersionId::key_hash(key);
+        self.versions.range(VersionId::all_of(key)).next().is_some()
     }
 
     fn is_home(&self, key: &ObjectKey) -> bool {
@@ -689,6 +713,10 @@ impl Node {
     /// metadata no longer holds.
     pub fn on_write(&mut self, now: Time, key: &ObjectKey) {
         self.now = self.now.max(now);
+        if self.policy(&key.bucket).freshness == Freshness::Immutable {
+            let key = key.clone();
+            self.actions.push(Action::Forget { key });
+        }
         match self.objects.get_mut(key) {
             Some(Object::Fetching { superseded, .. }) => *superseded = true,
             Some(Object::Known { .. }) => {
@@ -747,6 +775,9 @@ impl Node {
             self.unref(block.version);
         }
         self.stop_reading(origin);
+        for waiter in self.awaiting_writes.remove(&location).unwrap_or_default() {
+            self.arrived(waiter, Await::Written(location));
+        }
     }
 
     /// S3's response body ended before the bytes for the slot at
@@ -761,6 +792,13 @@ impl Node {
             .block_at(location)
             .expect("a written slot holds a block");
         let len = self.store.get(&block).expect("written block exists").len;
+        let waiters: Vec<GatewayRequestId> = self
+            .awaiting_writes
+            .remove(&location)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|&waiter| self.abandon_plan(waiter))
+            .collect();
         self.store.remove(block);
         self.filling_bytes -= len;
         self.unref(block.version);
@@ -770,6 +808,10 @@ impl Node {
             self.unref(block.version);
         }
         self.stop_reading(origin);
+        let now = self.now;
+        for waiter in waiters {
+            self.replan(now, waiter);
+        }
     }
 
     /// The block at `location` was checked against its checksum. An intact
@@ -821,7 +863,7 @@ impl Node {
         if !self.objects.contains_key(&key) {
             // After a restart, a home that still holds blocks of the
             // object fetches only its metadata, then serves the blocks.
-            if self.recovered.remove(&key) && self.holds_blocks_of(&key) {
+            if self.recovered.remove(&VersionId::key_hash(&key)) && self.holds_blocks_of(&key) {
                 return self.first_fetch(now, id, Request::head(key), Vec::new(), false);
             }
         }
@@ -913,12 +955,12 @@ impl Node {
     fn fetch(&mut self, purpose: Purpose, request: Request) -> OriginRequestId {
         let origin = OriginRequestId(self.next_origin);
         self.next_origin += 1;
-        let body_start = match &purpose {
+        let (body_start, streams) = match &purpose {
             Purpose::Fill { .. } => match request.range {
-                Some(ByteRange::Inclusive { first, .. }) => first,
+                Some(ByteRange::Inclusive { first, .. }) => (first, false),
                 _ => unreachable!("fills ask for inclusive ranges"),
             },
-            _ => 0,
+            _ => (0, true),
         };
         self.origins.insert(
             origin,
@@ -935,7 +977,11 @@ impl Node {
             },
         );
         self.stats.origin_requests += 1;
-        self.actions.push(Action::Fetch { origin, request });
+        self.actions.push(Action::Fetch {
+            origin,
+            request,
+            streams,
+        });
         origin
     }
 
@@ -1027,10 +1073,14 @@ impl Node {
         if let Some(meta) = meta
             && !superseded
             && self.origins[&origin].method == Method::Get
+            && let Some((first, last)) = body_span(&head, meta.size)
         {
-            self.store_first_fetch(origin, &key, &meta, &head);
+            self.store_first_fetch(origin, &key, &meta, first, last);
+            let version = VersionId::of(&key, &meta.etag);
+            self.arriving = Some((origin, version, first, last));
         }
         self.resume(now, waiters, sent, &head, has_meta);
+        self.arriving = None;
     }
 
     /// Serves the requests that waited on a first fetch sent at `sent`. A
@@ -1057,24 +1107,16 @@ impl Node {
         }
     }
 
-    /// Makes the whole blocks in a first fetch's body available to other
-    /// readers, and stores those the admission policy accepts.
+    /// Stores the whole blocks in a first fetch's body that the admission
+    /// policy accepts.
     fn store_first_fetch(
         &mut self,
         origin: OriginRequestId,
         key: &ObjectKey,
         meta: &Meta,
-        head: &ResponseHead,
+        first: u64,
+        last: u64,
     ) {
-        let (first, last) = match head.content_range {
-            Some(range) => (range.first, range.last),
-            None if meta.size > 0 => (0, meta.size - 1),
-            None => return,
-        };
-        self.origins
-            .get_mut(&origin)
-            .expect("answered origin")
-            .body_start = first;
         let version = self.version(key, &meta.etag);
         let layout = self.config.layout;
         for index in layout.blocks_covering(first, last) {
@@ -1087,8 +1129,9 @@ impl Node {
             {
                 continue;
             }
-            self.track_in_flight(block, origin);
-            if let Some(location) = self.admit(key, &meta.etag, meta.size, block) {
+            // The body streams, so later readers wait for the block's write
+            // and read its slot instead of joining the body.
+            if let Some(location) = self.admit(key, meta.size, block) {
                 self.write(location, origin, span.start - first, span.end - span.start);
             }
         }
@@ -1183,8 +1226,26 @@ impl Node {
         let version = self.version(key, etag);
         let mut body = Vec::new();
         let mut holds = Holds::default();
+        // A request queued behind a first fetch reads its body while the
+        // body arrives, if the body holds every byte it asks for.
+        if let Some((origin, arriving, start, end)) = self.arriving
+            && arriving == version
+            && start <= first
+            && last <= end
+        {
+            body.push(Segment::Origin {
+                origin,
+                offset: first - start,
+                len: last - first + 1,
+            });
+            self.read(origin, &mut holds);
+            self.forget_if_unused(version);
+            self.waiting.remove(&id);
+            return self.respond(id, head, body, holds, meta);
+        }
         let mut awaiting = BTreeSet::new();
         let layout = self.config.layout;
+        let chunk_blocks = (layout.chunk_size() / layout.block_size()) as usize;
         let blocks: Vec<u64> = layout.blocks_covering(first, last).collect();
         let mut next = 0;
         while next < blocks.len() {
@@ -1193,13 +1254,24 @@ impl Node {
             let span = layout.block_span(size, index);
             let piece = span.start.max(first)..span.end.min(last + 1);
             let len = piece.end - piece.start;
-            let ready = self
+            let stored = self
                 .store
                 .get(&block)
-                .filter(|entry| entry.state == BlockState::Ready)
-                .map(|entry| (entry.location, entry.verify.is_some()));
-            if let Some((location, unverified)) = ready {
-                self.store.hit(block);
+                .map(|entry| (entry.location, entry.state, entry.verify.is_some()));
+            let in_flight = self.in_flight.get(&block).copied();
+            // A stored block is read from its slot once it is ready, or,
+            // while a first fetch's streaming body writes it, once written.
+            let slot = match (stored, in_flight) {
+                (Some((location, BlockState::Ready, unverified)), _) => {
+                    self.store.hit(block);
+                    Some((location, unverified.then_some(Await::Verify(location))))
+                }
+                (Some((location, BlockState::Filling, _)), None) => {
+                    Some((location, Some(Await::Written(location))))
+                }
+                _ => None,
+            };
+            if let Some((location, awaited)) = slot {
                 self.store.pin(block);
                 holds.pins.push(block);
                 let offset = piece.start - span.start;
@@ -1208,22 +1280,22 @@ impl Node {
                     offset,
                     len,
                 });
-                if unverified {
-                    awaiting.insert(Await::Verify(location));
-                }
+                awaiting.extend(awaited);
                 next += 1;
                 continue;
             }
-            let origin = match self.in_flight.get(&block) {
-                Some(&origin) => origin,
+            let origin = match in_flight {
+                Some(origin) => origin,
                 None => {
-                    // Fetch this block and every missing block after it in one range GET.
+                    // Fetch this block and every missing block after it,
+                    // up to a chunk, in one range GET.
                     let run_end = blocks[next..]
                         .iter()
                         .take_while(|&&index| {
                             let block = BlockKey { version, index };
                             self.store.get(&block).is_none() && !self.in_flight.contains_key(&block)
                         })
+                        .take(chunk_blocks)
                         .count();
                     let run = blocks[next]..=blocks[next + run_end - 1];
                     self.fill(key, etag, size, version, run)
@@ -1253,6 +1325,9 @@ impl Node {
                     request.waiters.push(id);
                 }
                 Await::Verify(location) => self.verify(location, id),
+                Await::Written(location) => {
+                    self.awaiting_writes.entry(location).or_default().push(id);
+                }
             }
         }
         let waiting = self
@@ -1301,7 +1376,7 @@ impl Node {
         for index in run {
             let block = BlockKey { version, index };
             self.track_in_flight(block, origin);
-            if let Some(location) = self.admit(key, etag, size, block) {
+            if let Some(location) = self.admit(key, size, block) {
                 stored.push((block, location));
             }
         }
@@ -1324,7 +1399,7 @@ impl Node {
             unreachable!("fill_answered on a fill");
         };
         let (version, stored) = (*version, stored.clone());
-        let (_, etag) = &self.version_names[&version];
+        let (_, etag) = self.name(version);
         let expected = Some((request.body_start, *last_byte));
         let valid = head.status == 206
             && head.etag.as_ref() == Some(etag)
@@ -1353,7 +1428,7 @@ impl Node {
         // the waiting requests pass on.
         let changed = matches!(head.status, 206 | 404 | 412);
         let mut revalidating = Vec::new();
-        let (key, etag) = self.version_names[&version].clone();
+        let (key, etag) = self.name(version).clone();
         let known =
             matches!(self.objects.get(&key), Some(Object::Known { meta, .. }) if meta.etag == etag);
         if changed
@@ -1438,6 +1513,11 @@ impl Node {
                 }
                 Await::Verify(location) => {
                     if let Some((_, waiters)) = self.verifying.get_mut(&location) {
+                        waiters.retain(|&waiter| waiter != id);
+                    }
+                }
+                Await::Written(location) => {
+                    if let Some(waiters) = self.awaiting_writes.get_mut(&location) {
                         waiters.retain(|&waiter| waiter != id);
                     }
                 }
@@ -1588,19 +1668,13 @@ impl Node {
     }
 
     /// Reserves a slot if the admission policy stores this block.
-    fn admit(
-        &mut self,
-        key: &ObjectKey,
-        etag: &ETag,
-        size: u64,
-        block: BlockKey,
-    ) -> Option<Location> {
+    fn admit(&mut self, key: &ObjectKey, size: u64, block: BlockKey) -> Option<Location> {
         let layout = self.config.layout;
         let placement = layout.placement(key, size, block.index).hash();
         if self.ring.owner(placement) != Some(self.id) {
             return None;
         }
-        let hash = block_hash(key, etag, layout.block_size(), block.index);
+        let hash = block_hash(block.version, layout.block_size(), block.index);
         if !self.policy(&key.bucket).admit_on_first_read && !self.doorkeeper.contains(hash) {
             self.doorkeeper.insert(hash);
             return None;
@@ -1611,6 +1685,11 @@ impl Node {
             return None;
         }
         let location = self.store.reserve(block, len, hash, placement);
+        // The new block refers to its version before evictions may drop
+        // their versions' last references, which can include this one.
+        if location.is_some() {
+            self.refer(block.version);
+        }
         for (evicted, location) in self.store.drain_evicted() {
             self.stats.evicted_blocks += 1;
             self.actions.push(Action::Clear { location });
@@ -1618,7 +1697,6 @@ impl Node {
         }
         let location = location?;
         self.filling_bytes += len;
-        self.refer(block.version);
         Some(location)
     }
 
@@ -1637,40 +1715,55 @@ impl Node {
     }
 
     fn version(&mut self, key: &ObjectKey, etag: &ETag) -> VersionId {
-        let name = (key.clone(), etag.clone());
-        if let Some(version) = self.versions.get(&name) {
-            return version.id;
-        }
-        let id = VersionId(self.next_version);
-        self.next_version += 1;
-        self.version_names.insert(id, name.clone());
-        self.versions.insert(name, Version { id, refs: 0 });
+        let id = VersionId::of(key, etag);
+        let version = self.versions.entry(id).or_insert(Version {
+            refs: 0,
+            name: None,
+        });
+        version
+            .name
+            .get_or_insert_with(|| (key.clone(), etag.clone()));
         id
     }
 
+    /// The key and ETag of a version a read named.
+    fn name(&self, id: VersionId) -> &(ObjectKey, ETag) {
+        self.versions[&id].name.as_ref().expect("a named version")
+    }
+
     fn refer(&mut self, id: VersionId) {
-        let name = &self.version_names[&id];
-        self.versions.get_mut(name).expect("named version").refs += 1;
+        self.versions.get_mut(&id).expect("a known version").refs += 1;
     }
 
     fn unref(&mut self, id: VersionId) {
-        let name = &self.version_names[&id];
-        let version = self.versions.get_mut(name).expect("named version");
-        version.refs -= 1;
+        self.versions.get_mut(&id).expect("a known version").refs -= 1;
         self.forget_if_unused(id);
     }
 
     fn forget_if_unused(&mut self, id: VersionId) {
-        let name = &self.version_names[&id];
-        if self.versions[name].refs == 0 {
-            let name = self.version_names.remove(&id).expect("named version");
-            self.versions.remove(&name);
+        if self
+            .versions
+            .get(&id)
+            .is_some_and(|version| version.refs == 0)
+        {
+            self.versions.remove(&id);
         }
     }
 
-    /// Records metadata the home just validated, then drops the least
-    /// recently used metadata past capacity.
+    /// Keeps metadata the home just validated, and saves it if its bucket
+    /// is immutable.
     fn know(&mut self, key: ObjectKey, meta: Meta, validated: Time) {
+        if self.policy(&key.bucket).freshness == Freshness::Immutable {
+            let (key, meta) = (key.clone(), meta.clone());
+            self.actions.push(Action::Remember { key, meta });
+        }
+        self.keep(key, meta, validated);
+    }
+
+    /// Keeps metadata in place of any the key had, then drops the least
+    /// recently used past capacity.
+    fn keep(&mut self, key: ObjectKey, meta: Meta, validated: Time) {
+        self.forget(&key);
         let used = self.next_use;
         self.next_use += 1;
         self.recency.insert(used, key.clone());
@@ -1745,6 +1838,15 @@ fn shared(meta: &Meta, validated: Time, now: Time) -> ObjectMeta {
     }
 }
 
+/// The object's bytes a successful GET's body holds, first and last.
+fn body_span(head: &ResponseHead, size: u64) -> Option<(u64, u64)> {
+    match head.content_range {
+        Some(range) => Some((range.first, range.last)),
+        None if size > 0 => Some((0, size - 1)),
+        None => None,
+    }
+}
+
 /// The metadata a successful response carries.
 fn metadata(head: &ResponseHead) -> Option<Meta> {
     let size = match head.status {
@@ -1761,14 +1863,86 @@ fn metadata(head: &ResponseHead) -> Option<Meta> {
     })
 }
 
-/// A block's identity: bucket, key, ETag, block size and index.
-fn block_hash(key: &ObjectKey, etag: &ETag, block_size: u64, index: u64) -> u64 {
-    let mut bytes = Vec::with_capacity(key.bucket.len() + key.key.len() + etag.0.len() + 28);
-    for part in [&key.bucket, &key.key, &etag.0] {
-        bytes.extend_from_slice(&(part.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(part.as_bytes());
-    }
-    bytes.extend_from_slice(&block_size.to_le_bytes());
-    bytes.extend_from_slice(&index.to_le_bytes());
+/// A block's identity: its version, the block size and its index.
+fn block_hash(version: VersionId, block_size: u64, index: u64) -> u64 {
+    let mut bytes = [0; 32];
+    bytes[..16].copy_from_slice(&version.version.to_le_bytes());
+    bytes[16..24].copy_from_slice(&block_size.to_le_bytes());
+    bytes[24..].copy_from_slice(&index.to_le_bytes());
     xxh3_64(&bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::placement::Member;
+    use std::num::NonZeroU32;
+
+    fn config(metadata_capacity: usize) -> Config {
+        let policy = BucketPolicy {
+            freshness: Freshness::Immutable,
+            admit_on_first_read: false,
+        };
+        Config {
+            layout: Layout::new(64, 1),
+            store: StoreConfig {
+                extent_size: 256,
+                extents: 4,
+                min_slot: 16,
+                max_slot: 64,
+            },
+            doorkeeper_window: 16,
+            fill_budget: 1_024,
+            metadata_capacity,
+            origin_timeout: 1_000,
+            default_policy: policy,
+            buckets: BTreeMap::new(),
+        }
+    }
+
+    fn key(name: &str) -> ObjectKey {
+        ObjectKey {
+            bucket: "b".into(),
+            key: name.into(),
+        }
+    }
+
+    fn meta(tag: &str) -> Meta {
+        Meta {
+            etag: ETag(format!("\"{tag}\"")),
+            size: 10,
+            headers: Vec::new(),
+        }
+    }
+
+    /// The metadata file holds an entry each time the home learned a key,
+    /// so a replay keeps some keys twice. The later entry replaces the
+    /// earlier, and both stay within capacity.
+    #[test]
+    fn a_replayed_key_keeps_one_entry() {
+        let member = Member {
+            id: NodeId(0),
+            weight: NonZeroU32::MIN,
+        };
+        let ring = Ring::new(1, vec![member]);
+        let saved = vec![
+            (key("a"), Some(meta("a"))),
+            (key("b"), Some(meta("b"))),
+            (key("a"), Some(meta("a"))),
+        ];
+        let mut node = Node::recover(NodeId(0), ring, config(2), Vec::new(), saved);
+        for (id, name) in ["a", "b"].into_iter().enumerate() {
+            let read = Read::Object {
+                request: Request::head(key(name)),
+                stale: None,
+                direct: false,
+            };
+            node.on_request(Time(1), GatewayRequestId(id as u64), read);
+            let actions = node.drain();
+            assert!(
+                matches!(actions.as_slice(), [Action::Respond { head, .. }] if head.status == 200),
+                "{name}: {actions:?}"
+            );
+        }
+    }
 }

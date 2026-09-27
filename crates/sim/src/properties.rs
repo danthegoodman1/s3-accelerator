@@ -74,24 +74,24 @@ pub fn check_block(
     block: &StoredBlock,
     bytes: &[u8],
 ) -> Result<(), String> {
-    let Some(object) = origin.version(block.etag) else {
-        return Err(format!("stored block of unknown version {:?}", block.etag));
+    let Some(object) = origin.version_by_id(block.version) else {
+        return Err(format!(
+            "stored block of unknown version {:?}",
+            block.version
+        ));
     };
-    if object.key != *block.key {
-        return Err(format!("{:?} stored under {:?}", block.etag, block.key));
-    }
     let start = block.index * block_size;
     let end = (start + block_size).min(object.size);
     if start >= end || end - start != block.len {
         return Err(format!(
             "block {} of {:?} stored as {} bytes",
-            block.index, block.etag, block.len
+            block.index, object.etag, block.len
         ));
     }
     if object.bytes(start..end) != bytes {
         return Err(format!(
             "block {} of {:?} at {:?} holds the wrong bytes",
-            block.index, block.etag, block.location
+            block.index, object.etag, block.location
         ));
     }
     Ok(())
@@ -102,7 +102,7 @@ mod tests {
     use super::*;
     use crate::prng::Prng;
     use s3_accelerator_core::s3::{ByteRange, ETag, ObjectKey};
-    use s3_accelerator_core::store::Location;
+    use s3_accelerator_core::store::{Location, VersionId};
 
     fn key() -> ObjectKey {
         ObjectKey {
@@ -174,10 +174,8 @@ mod tests {
     fn checks_stored_blocks_against_their_version() {
         let origin = origin();
         let first = origin.states_during(&key(), 0, 0)[0].unwrap();
-        let etag = first.etag.clone();
         let block = |index, len| StoredBlock {
-            key: &first.key,
-            etag: &etag,
+            version: VersionId::of(&first.key, &first.etag),
             index,
             location: Location {
                 extent: 0,
@@ -190,7 +188,7 @@ mod tests {
         assert!(check_block(&origin, 32, &block(2, 4), &bytes).is_err());
         let unknown = ETag("\"missing\"".into());
         let orphan = StoredBlock {
-            etag: &unknown,
+            version: VersionId::of(&first.key, &unknown),
             ..block(3, 4)
         };
         assert!(check_block(&origin, 32, &orphan, &bytes).is_err());

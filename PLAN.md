@@ -212,13 +212,14 @@ Status ledger:
 ## Phase S2: Real Block Store and Zero-Copy
 
 Goal:
-Storage nodes keep blocks on disk and serve hits with `sendfile`, and gateways relay with `splice`.
+Storage nodes keep blocks and immutable-bucket metadata on disk and serve hits with `sendfile`, and gateways relay with `splice`.
 
 Scope:
-- S2A Slab files, extents and the slot table on disk, executing the core's storage actions.
-- S2B `fdatasync` ordering: a block's bytes before its record, and a cleared record before any write over its slot. Restart recovery through `Node::recover`, runs in records, and the clean-shutdown mark; the table's header names the layout, and a changed layout discards the table. Checksums of block bytes for records and `Verify`.
-- S2C `sendfile` for hits and `splice` for relays, on worker threads off the event loop. Bodies stream end to end: S3 responses, relays and uploads never sit whole in memory, and `max_body` stops limiting object size. The origin client sends paths as written, so keys with `.` and `..` segments work.
-- S2D Separate gateway and storage-node processes, and a restart test that keeps the cache warm.
+- S2A Core changes, through the simulator first. Slot records have a fixed size: each names its block's version by a 128-bit hash of bucket, key and ETag. Homes save immutable-bucket metadata to a metadata file and load it at startup; the simulated disk models the file, and a crash loses entries not yet synced. A reader joins an S3 body only before the body's response arrives; a later reader waits for the block's write and reads its slot, so the server can stream bodies.
+- S2B On disk: slab files, extents, the slot table and the metadata file, carrying out the core's storage actions. `fdatasync` ordering: a block's bytes before its record, and a cleared record before any write over its slot. Restart recovery through `Node::recover`, runs in records, and the clean-shutdown mark; the table's header names the layout, and a changed layout discards the table. Checksums of block bytes for records and `Verify`.
+- S2C Separate gateway and storage-node processes that speak HTTP/1.1 to each other; a restart test that keeps the cache warm, and a crash test that kills a node during fills.
+- S2D `sendfile` for hits and `splice` for relays, on worker threads off the event loop. Bodies stream end to end: S3 responses, relays and uploads never sit whole in memory, and `max_body` stops limiting object size. The origin client sends paths as written, so keys with `.` and `..` segments work.
+- S2E Zero-copy verified from outside the server.
 
 Out of scope:
 - kTLS (S3).
@@ -227,6 +228,7 @@ Completion gate:
 Conformance passes through a multi-process cluster; a restart test shows hits after restart; zero-copy is verified from outside the server; `/code-review` findings are resolved.
 
 Testing plan:
+- S2A: simulator scenarios for an immutable object read after a restart with no S3 request, and for a write through the home that a restart must not undo; a simulator property that a streaming body is read only as its head arrives; planted bugs for metadata the home never saves, a restart that brings back metadata a write dropped, a replayed key with a stale entry, a late reader that joins a streaming body, a fill larger than a chunk, and queued readers that never share an arriving body.
 - Conformance through the accelerator; restart integration test; crash test that kills the process during fills.
 - Zero-copy verification: an integration test runs the storage node and gateway under `strace` and asserts that hit bodies leave through `sendfile` (storage node) and `splice` (gateway) system calls covering at least the body's bytes, and that no `write`, `writev` or `sendmsg` carries body bytes. The server's own counters are not evidence. A planted bug that forces the copying path must fail the test. CI installs `strace` and runs it.
 
@@ -234,10 +236,11 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | S2A: On-disk slab files and slot table | Missing: implementation. |
-| Incomplete | Work | S2B: Sync ordering and recovery | Missing: implementation and crash test. |
-| Incomplete | Work | S2C: `sendfile` and `splice` | Missing: implementation. |
-| Incomplete | Work | S2D: Multi-process cluster and restart test | Missing: test. |
+| Complete | Work | S2A: Hashed slot records, saved metadata, late readers | `VersionId` is a hash of bucket and key plus a 128-bit hash of bucket, key and ETag, so `SlotRecord` has a fixed size; a version recovered from the slot table is known by its hash until a read names it. Homes save immutable-bucket metadata (`Action::Remember`, `Action::Forget`), and `Node::recover` replays the metadata file, keeping the latest entries up to capacity (unit test `a_replayed_key_keeps_one_entry`). `Action::Fetch` says whether a body streams: fills span at most a chunk and may be read until released; a first fetch's body is read only by the requests queued behind it as its head arrives, and a later reader waits for the block's write (`Await::Written`) or fetches it again. The simulator's disk models the metadata file, whose unsynced tail a crash may lose, and checks every saved entry against the model of S3; it fails a run in which a node reads a streaming body after its head's arrival or holds a fill of more than a chunk. Scenarios: `an_immutable_object_read_after_a_restart_costs_no_s3_request`, `a_write_through_the_home_outlasts_a_restart`, `concurrent_first_reads_share_one_fetch`. Seed 59 found a replayed key whose stale recency entry later evicted its own metadata, so a read fetched it forever; `seeds_pass` runs it. |
+| Complete | Test | Planted bugs for S2A | Caught by the simulator's tests: immutable metadata never saved, a restart that brings back metadata a write dropped (first missed: the scenario's old blocks were not stored, so an `If-Match` fill caught the change; they now are), a late reader that joins a streaming body, a fill larger than a chunk, a reader waiting on a first fetch's write never told, queued readers that never share an arriving body, and a queued reader that shares a body lacking its bytes. A replayed key with a stale entry is caught by the unit test `a_replayed_key_keeps_one_entry`, and by seed 59 in `seeds_pass`. |
+| Incomplete | Work | S2B: On-disk store, sync ordering and recovery | Missing: implementation and crash test. |
+| Incomplete | Work | S2C: Multi-process cluster and restart test | Missing: implementation and tests. |
+| Incomplete | Work | S2D: Streaming bodies, `sendfile` and `splice` | Missing: implementation. |
 | Incomplete | Test | S2E: `sendfile` and `splice` verified under `strace` | Missing: integration test, planted copying-path bug, CI job. |
 | Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
 
@@ -283,13 +286,15 @@ Scope:
 - 5C Hot-key leases: rate tracking, leases to the next K candidates, hot hints, renewal above half the promotion threshold, expiry.
 - 5D Warming on write with the HEAD check, and metadata prefetch for Parquet, ORC and safetensors; the simulator's model generates objects with valid trailers and headers.
 - 5E Properties: read-after-write through the writing gateway; hot-key load spread; prefetch removes the second miss.
+- 5F Purge: the home drops an object's metadata and has every chunk owner drop its blocks. Each node makes the purge durable before it confirms, and the home keeps unconfirmed purges on disk and resends them to owners that were down.
 
 Completion gate:
 A 10,000-seed sweep with writes passes; planted bugs are caught; `/code-review` findings are resolved.
 
 Testing plan:
 - Simulator seeds with writes through the cache, event delivery faults and hot keys.
-- Planted bugs: a first fetch that started before a write still indexed; warmed blocks indexed without the ETag check; a lease that never expires.
+- Scripted scenario: a chunk owner is down during a purge and restarts afterward.
+- Planted bugs: a first fetch that started before a write still indexed; warmed blocks indexed without the ETag check; a lease that never expires; a purge that an owner missed while down.
 
 Status ledger:
 
@@ -300,6 +305,7 @@ Status ledger:
 | Incomplete | Work | 5C: Hot-key leases | Missing: implementation. |
 | Incomplete | Work | 5D: Warming on write and metadata prefetch | Missing: implementation and format-aware object model. |
 | Incomplete | Test | 5E: Write, hot-key and prefetch properties | Missing: properties. |
+| Incomplete | Work | 5F: Durable purge | Missing: implementation and scenario. |
 | Incomplete | Gate | 10,000-seed sweep with writes | Missing: sweep output. |
 | Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |
 

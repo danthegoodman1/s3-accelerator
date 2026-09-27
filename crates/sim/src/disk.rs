@@ -1,8 +1,9 @@
 //! A storage node's disk: extents of bytes that start as filler, so a read
 //! of a slot nobody wrote returns bytes no object holds, and the slot
-//! table that survives the node's restarts.
+//! table and metadata file that survive the node's restarts.
 
-use s3_accelerator_core::node::{Recovered, SlotRecord};
+use s3_accelerator_core::node::{Meta, Recovered, SlotRecord};
+use s3_accelerator_core::s3::ObjectKey;
 use s3_accelerator_core::store::Location;
 use std::collections::{BTreeMap, BTreeSet};
 use xxhash_rust::xxh3::xxh3_64;
@@ -21,6 +22,10 @@ pub struct Disk {
     started_from: Option<u64>,
     /// Recorded slots whose bytes a fault damaged after they were durable.
     pub damaged: BTreeSet<Location>,
+    /// The metadata file's durable entries, oldest first, and those
+    /// appended since, with the tick each becomes durable.
+    pub metadata: Vec<(ObjectKey, Option<Meta>)>,
+    unsynced: Vec<(u64, ObjectKey, Option<Meta>)>,
 }
 
 const FILLER: u8 = 0xa5;
@@ -36,7 +41,47 @@ impl Disk {
             trusted_from: None,
             started_from: None,
             damaged: BTreeSet::new(),
+            metadata: Vec::new(),
+            unsynced: Vec::new(),
         }
+    }
+
+    /// Appends to the metadata file; the entry is durable from tick `due`.
+    pub fn append(&mut self, due: u64, key: ObjectKey, meta: Option<Meta>) {
+        self.unsynced.push((due, key, meta));
+    }
+
+    /// Makes durable the appended entries due by `now`, in order.
+    pub fn sync(&mut self, now: u64) {
+        let due = self
+            .unsynced
+            .iter()
+            .take_while(|(due, _, _)| *due <= now)
+            .count();
+        self.keep_appended(due);
+    }
+
+    /// Makes durable the first `count` entries appended since the last
+    /// sync.
+    pub fn keep_appended(&mut self, count: usize) {
+        let kept: Vec<_> = self.unsynced.drain(..).collect();
+        let (durable, lost) = kept.split_at(count.min(kept.len()));
+        self.metadata.extend(
+            durable
+                .iter()
+                .map(|(_, key, meta)| (key.clone(), meta.clone())),
+        );
+        self.unsynced = lost.to_vec();
+    }
+
+    /// Entries appended but not yet durable.
+    pub fn unsynced(&self) -> usize {
+        self.unsynced.len()
+    }
+
+    /// Loses the entries not yet durable, as a crash does.
+    pub fn lose_unsynced(&mut self) {
+        self.unsynced.clear();
     }
 
     pub fn read(&self, location: Location, offset: u64, len: u64) -> &[u8] {
@@ -76,7 +121,7 @@ impl Disk {
             .iter()
             .map(|(&location, (record, checksum, run))| Recovered {
                 location,
-                record: record.clone(),
+                record: *record,
                 checksum: *checksum,
                 trusted: trusted_from.is_some_and(|from| *run >= from),
             })

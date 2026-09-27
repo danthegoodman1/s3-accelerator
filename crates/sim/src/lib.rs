@@ -29,7 +29,7 @@ use s3_accelerator_core::node::{
 };
 use s3_accelerator_core::placement::{Member, NodeId, Placement, Ring};
 use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
-use s3_accelerator_core::store::{Location, StoreConfig};
+use s3_accelerator_core::store::{Location, StoreConfig, VersionId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroU32;
@@ -496,6 +496,11 @@ pub struct Simulator {
     sending: BTreeMap<(usize, GatewayRequestId), Sending>,
     /// S3 requests a node gave up on, whose responses it drops.
     cancelled: BTreeSet<(usize, OriginRequestId)>,
+    /// S3 bodies that stream through a node: those it asked for, and
+    /// those whose head has arrived, which only the node's actions on
+    /// that arrival may read.
+    streaming: BTreeSet<(usize, OriginRequestId)>,
+    started: BTreeSet<(usize, OriginRequestId)>,
     /// Print client attempts and answers to stderr.
     trace: bool,
     summary: Summary,
@@ -592,6 +597,8 @@ impl Simulator {
             writes: BTreeMap::new(),
             sending: BTreeMap::new(),
             cancelled: BTreeSet::new(),
+            streaming: BTreeSet::new(),
+            started: BTreeSet::new(),
             trace: false,
             summary: Summary {
                 seed,
@@ -638,13 +645,6 @@ impl Simulator {
                     Some(_) => "after every request was issued and faults stopped",
                     None => "while clients were issuing",
                 };
-                if self.trace {
-                    for (index, node) in self.nodes.iter().enumerate() {
-                        if let Some(node) = node {
-                            eprintln!("node {index}: {}", node.describe());
-                        }
-                    }
-                }
                 return Err(self.failure(format!("{unanswered} requests unanswered {phase}")));
             }
             self.tick()?;
@@ -702,6 +702,18 @@ impl Simulator {
     /// is answered and the cluster is idle.
     pub fn read(&mut self, read: Request) -> Result<(ResponseHead, Vec<u8>), Failure> {
         let request = self.start(read);
+        self.finish(request)
+    }
+
+    /// Sends one request from client 0 through `gateway` and runs until it
+    /// is answered and the cluster is idle.
+    pub fn read_through(
+        &mut self,
+        gateway: usize,
+        read: Request,
+    ) -> Result<(ResponseHead, Vec<u8>), Failure> {
+        let request = self.issue(0, gateway, read);
+        self.watched.insert(request, None);
         self.finish(request)
     }
 
@@ -767,9 +779,11 @@ impl Simulator {
     pub fn restart(&mut self, node: usize) -> Result<(), Failure> {
         self.down.remove(&node);
         let records = self.disks[node].start();
+        let metadata = self.disks[node].metadata.clone();
         let config = self.options.node_config();
         let id = NodeId(node as u64);
-        self.nodes[node] = Some(Node::recover(id, self.ring.clone(), config, records));
+        let ring = self.ring.clone();
+        self.nodes[node] = Some(Node::recover(id, ring, config, records, metadata));
         self.drain_node(node)
     }
 
@@ -826,7 +840,9 @@ impl Simulator {
         let found = disk
             .records
             .iter()
-            .find(|(_, (record, _, _))| record.key == *key && record.index == index)
+            .find(|(_, (record, _, _))| {
+                record.version.key == VersionId::key_hash(key) && record.index == index
+            })
             .map(|(&location, _)| location);
         if let Some(location) = found {
             disk.damage(location, 0);
@@ -884,6 +900,9 @@ impl Simulator {
         for gateway in 0..self.gateways.len() {
             self.gateways[gateway].on_tick(now);
             self.drain_gateway(gateway)?;
+        }
+        for disk in &mut self.disks {
+            disk.sync(self.now);
         }
         if self.now.is_multiple_of(64) {
             self.check_disks()?;
@@ -981,7 +1000,9 @@ impl Simulator {
             for location in writes {
                 self.written(node, location)?;
             }
-            self.disks[node].shut_down();
+            let disk = &mut self.disks[node];
+            disk.keep_appended(disk.unsynced());
+            disk.shut_down();
             self.summary.clean_shutdowns += 1;
         } else {
             for location in writes {
@@ -992,6 +1013,9 @@ impl Simulator {
                 let torn = self.tears.range(0..=(end - start) as u64) as usize;
                 self.disks[node].write(location, &body[start..start + torn]);
             }
+            let synced = self.tears.range(0..=self.disks[node].unsynced() as u64);
+            self.disks[node].keep_appended(synced as usize);
+            self.disks[node].lose_unsynced();
             if damage && self.tears.percent(self.options.damage_percent) {
                 for _ in 0..self.tears.range(1..=3) {
                     let disk = &self.disks[node];
@@ -1017,6 +1041,8 @@ impl Simulator {
         self.sending.retain(|&(owner, _), _| owner != node);
         self.origin_bodies.retain(|&(owner, _), _| owner != node);
         self.cancelled.retain(|&(owner, _)| owner != node);
+        self.streaming.retain(|&(owner, _)| owner != node);
+        self.started.retain(|&(owner, _)| owner != node);
         self.node_requests.retain(|&(owner, _), _| owner != node);
         self.check_table(node)
     }
@@ -1292,7 +1318,11 @@ impl Simulator {
                 }
                 self.origin_bodies.insert((node, origin), body);
                 self.node(node).on_origin_response(now, origin, head);
-                self.drain_node(node)
+                self.drain_node(node)?;
+                if self.streaming.remove(&(node, origin)) {
+                    self.started.insert((node, origin));
+                }
+                Ok(())
             }
             (
                 Address::Origin,
@@ -1446,6 +1476,17 @@ impl Simulator {
         Ok(())
     }
 
+    /// A streaming S3 body passes through as it arrives, so once its head's
+    /// arrival has been handled, nothing more may read it.
+    fn check_streaming(&self, node: usize, origin: OriginRequestId) -> Result<(), Failure> {
+        if self.started.contains(&(node, origin)) {
+            return Err(self.failure(format!(
+                "node {node} read S3's streaming body to {origin:?} after it started"
+            )));
+        }
+        Ok(())
+    }
+
     /// A gateway copied `bytes` of a node's body into a client's response,
     /// which goes to the client once complete.
     fn forwarded(
@@ -1486,7 +1527,24 @@ impl Simulator {
         let run = self.runs[node];
         for action in self.node(node).drain() {
             match action {
-                node::Action::Fetch { origin, request } => {
+                node::Action::Fetch {
+                    origin,
+                    request,
+                    streams,
+                } => {
+                    let chunk = self.options.block_size * self.options.chunk_blocks;
+                    match (streams, request.range) {
+                        (true, _) => {
+                            self.streaming.insert((node, origin));
+                        }
+                        (false, Some(ByteRange::Inclusive { first, last }))
+                            if last - first < chunk => {}
+                        (false, range) => {
+                            return Err(self.failure(format!(
+                                "node {node} held a fill of {range:?}, more than a chunk"
+                            )));
+                        }
+                    }
                     let message = Message::OriginRequest {
                         node,
                         run,
@@ -1501,6 +1559,11 @@ impl Simulator {
                     body,
                     meta,
                 } => {
+                    for segment in &body {
+                        if let Segment::Origin { origin, .. } = segment {
+                            self.check_streaming(node, *origin)?;
+                        }
+                    }
                     let delay = self.send_delays.range(0..=self.options.send_delay_max);
                     self.sending
                         .insert((node, request), Sending { head, body, meta });
@@ -1537,6 +1600,7 @@ impl Simulator {
                     offset,
                     len,
                 } => {
+                    self.check_streaming(node, origin)?;
                     let write = Write {
                         origin,
                         offset,
@@ -1559,6 +1623,14 @@ impl Simulator {
                     self.disks[node].record(location, record);
                 }
                 node::Action::Clear { location } => self.disks[node].clear(location),
+                node::Action::Remember { key, meta } => {
+                    let delay = self.disk_delays.range(0..=self.options.disk_delay_max);
+                    self.disks[node].append(self.now + delay, key, Some(meta));
+                }
+                node::Action::Forget { key } => {
+                    let delay = self.disk_delays.range(0..=self.options.disk_delay_max);
+                    self.disks[node].append(self.now + delay, key, None);
+                }
                 node::Action::Verify {
                     location,
                     len,
@@ -1579,8 +1651,10 @@ impl Simulator {
                         eprintln!("{} node {node} cancelled {origin:?}", self.now);
                     }
                     self.cancelled.insert((node, origin));
+                    self.streaming.remove(&(node, origin));
                 }
                 node::Action::Release { origin } => {
+                    self.started.remove(&(node, origin));
                     if self.origin_bodies.remove(&(node, origin)).is_none() {
                         return Err(self.failure(format!("node {node} released {origin:?} twice")));
                     }
@@ -1781,6 +1855,26 @@ impl Simulator {
         for node in 0..self.nodes.len() {
             self.check_disk(node, None)?;
             self.check_table(node)?;
+            self.check_metadata_file(node)?;
+        }
+        Ok(())
+    }
+
+    /// Every entry a node saved in its metadata file describes a version
+    /// its key had.
+    fn check_metadata_file(&self, node: usize) -> Result<(), Failure> {
+        for (key, meta) in &self.disks[node].metadata {
+            let Some(meta) = meta else {
+                continue;
+            };
+            let matches = self.origin.version(&meta.etag).is_some_and(|object| {
+                object.key == *key && object.size == meta.size && object.headers == meta.headers
+            });
+            if !matches {
+                return Err(self.failure(format!(
+                    "node {node} saved metadata {meta:?} for {key:?}, which no version of it had"
+                )));
+            }
         }
         Ok(())
     }
@@ -1812,8 +1906,7 @@ impl Simulator {
                 continue;
             }
             let block = StoredBlock {
-                key: &record.key,
-                etag: &record.etag,
+                version: record.version,
                 index: record.index,
                 location,
                 len: record.len,
@@ -1833,16 +1926,18 @@ impl Simulator {
         let Some(block) = up.stored_block_at(location) else {
             return Ok(());
         };
-        let Some(object) = self.origin.version(block.etag) else {
+        let Some(object) = self.origin.version_by_id(block.version) else {
             return Ok(());
         };
         let layout = Layout::new(self.options.block_size, self.options.chunk_blocks);
-        let placement = layout.placement(block.key, object.size, block.index).hash();
+        let placement = layout
+            .placement(&object.key, object.size, block.index)
+            .hash();
         let owner = self.ring.owner(placement).map(|id| id.0 as usize);
         if owner != Some(node) {
             return Err(self.failure(format!(
                 "node {node} stored block {} of {:?}, which node {owner:?} owns",
-                block.index, block.key
+                block.index, object.key
             )));
         }
         Ok(())
@@ -1878,6 +1973,13 @@ impl Simulator {
     }
 
     fn failure(&self, message: String) -> Failure {
+        if self.trace {
+            for (index, node) in self.nodes.iter().enumerate() {
+                if let Some(node) = node {
+                    eprintln!("node {index}: {}", node.describe());
+                }
+            }
+        }
         Failure {
             seed: self.seed,
             tick: self.now,
