@@ -679,8 +679,10 @@ impl Gateway {
         };
         let mut runs: VecDeque<Run> = self.runs(&request.key, meta.size, first, last).into();
         let now = self.window(&mut runs, 0);
-        let Some(parts) = self.dispatch_runs(id, &request.key, &meta.etag, meta.size, now, &[])
-        else {
+        let split = !runs.is_empty();
+        let dispatched =
+            self.dispatch_runs(id, &request.key, &meta.etag, meta.size, now, &[], split);
+        let Some(parts) = dispatched else {
             let now = self.now;
             self.find_ring(now);
             return self.respond(id, ResponseHead::status(503));
@@ -737,9 +739,13 @@ impl Gateway {
             return;
         };
         let runs = self.window(&mut ahead.runs, asked);
+        let split = !ahead.runs.is_empty();
         let dispatched = match runs.is_empty() {
             true => Some(VecDeque::new()),
-            false => self.dispatch_runs(id, &ahead.key, &ahead.etag, ahead.size, runs, &[]),
+            false => {
+                let (key, etag, size) = (&ahead.key, &ahead.etag, ahead.size);
+                self.dispatch_runs(id, key, etag, size, runs, &[], split)
+            }
         };
         let Some(dispatched) = dispatched else {
             return self.abort(id);
@@ -765,9 +771,11 @@ impl Gateway {
     }
 
     /// Sends runs of a version's bytes to their targets, one part per run
-    /// of runs with one target, each part at most half the read-ahead
-    /// window, so the next part is asked for while one streams; `None` if
-    /// some run has no candidate left.
+    /// of runs with one target; `None` if some run has no candidate left.
+    /// While runs remain beyond the window, the read `split`s its parts at
+    /// half the read-ahead window, so the next part is asked for while one
+    /// streams.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_runs(
         &mut self,
         id: ClientRequestId,
@@ -776,8 +784,12 @@ impl Gateway {
         size: u64,
         runs: Vec<Run>,
         tried: &[NodeId],
+        split: bool,
     ) -> Option<VecDeque<NodeRequestId>> {
-        let most = self.config.read_ahead / 2;
+        let most = match split {
+            true => self.config.read_ahead / 2,
+            false => u64::MAX,
+        };
         let mut groups: Vec<(NodeId, Vec<Run>)> = Vec::new();
         for run in runs {
             let node = self.spread(run.0, tried)?;
@@ -914,7 +926,7 @@ impl Gateway {
                 etag,
                 size,
                 runs,
-            } => self.dispatch_runs(part.read, &key, &etag, size, runs, &tried),
+            } => self.dispatch_runs(part.read, &key, &etag, size, runs, &tried, false),
         };
         let Some(replacements) = replacements else {
             self.find_ring(now);
@@ -1046,7 +1058,7 @@ impl Gateway {
         let mut tried = part.tried;
         tried.push(part.node);
         let parts = rest.and_then(|(key, etag, size, runs)| {
-            self.dispatch_runs(id, &key, &etag, size, runs, &tried)
+            self.dispatch_runs(id, &key, &etag, size, runs, &tried, false)
         });
         let Some(parts) = parts else {
             return self.abort(id);
@@ -1581,9 +1593,10 @@ mod tests {
     }
 
     /// With one owner, a read-ahead window goes out as parts of at most half
-    /// the window, so the next part is asked for while one streams.
+    /// the window while more remains beyond it, so the next part is asked
+    /// for while one streams; a body the window holds goes out whole.
     #[test]
-    fn one_owners_window_goes_out_in_halves() {
+    fn one_owners_window_goes_out_in_halves_while_more_remains() {
         let member = Member {
             id: NodeId(0),
             weight: NonZeroU32::MIN,
@@ -1650,6 +1663,23 @@ mod tests {
             .map(|(_, first, last)| (first, last))
             .collect();
         assert_eq!(next, [(256, 383)]);
+        // A body the window holds whole goes out as one part.
+        let request = Request {
+            range: Some(crate::s3::ByteRange::Inclusive {
+                first: 0,
+                last: 255,
+            }),
+            ..Request::get(ObjectKey {
+                bucket: "b".into(),
+                key: "k".into(),
+            })
+        };
+        gateway.on_request(Time(5), ClientRequestId(3), request);
+        let whole: Vec<(u64, u64)> = spans(gateway.drain())
+            .into_iter()
+            .map(|(_, first, last)| (first, last))
+            .collect();
+        assert_eq!(whole, [(0, 255)]);
     }
 
     /// A node answers a part with other bytes than it asked for, as a node

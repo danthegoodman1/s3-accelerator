@@ -44,6 +44,10 @@ pub struct Disk {
     /// The directory the node's files live in.
     dir: PathBuf,
     slabs: File,
+    /// Held while a block's bytes are copied into the slab file. The file
+    /// system takes one write into a file at a time anyway, and threads
+    /// that wait here sleep rather than spin on the file's lock.
+    writing: Mutex<()>,
     /// For each span a largest slot covers, the largest slot written there
     /// since its pages were last dropped whole: a folio no larger may
     /// remain cached across the span's slots.
@@ -235,6 +239,7 @@ impl Disk {
         let spans = (slabs_len / config.max_slot) as usize;
         let disk = Disk {
             dir: dir.to_path_buf(),
+            writing: Mutex::new(()),
             written: Mutex::new(vec![config.max_slot; spans]),
             slabs,
             slab_sync: GroupSync::default(),
@@ -290,7 +295,10 @@ impl Disk {
             written[index] = written[index].max(slot_size);
         }
         let first = self.slab_sync.begin();
-        self.slabs.write_all_at(bytes, offset)?;
+        {
+            let _writing = self.writing.lock().expect("writing lock");
+            self.slabs.write_all_at(bytes, offset)?;
+        }
         let sync = self.slab_sync.sync(first, || self.slabs.sync_data())?;
         let checksum = xxh3_64(bytes);
         self.checksums

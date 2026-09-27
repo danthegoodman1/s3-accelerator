@@ -986,7 +986,7 @@ MUTANTS = [
     ),
     (
         "one owner's window goes out as one part",
-        [(GATEWAY, "let most = self.config.read_ahead / 2;", "let most = u64::MAX;")],
+        [(GATEWAY, "true => self.config.read_ahead / 2,", "true => u64::MAX,")],
     ),
     (
         "warmed blocks count as misses",
@@ -1015,6 +1015,10 @@ MUTANTS = [
     (
         "a restarted node trusts metadata from before its restart",
         [(NODE, "(!written && !forgotten).then_some((meta, validated))", "(!written).then_some((meta, validated))")],
+    ),
+    (
+        "a window that holds the whole body goes out in halves",
+        [(GATEWAY, "let split = !runs.is_empty();\n        let dispatched", "let split = true;\n        let dispatched")],
     ),
     (
         "request IDs never reach nodes",

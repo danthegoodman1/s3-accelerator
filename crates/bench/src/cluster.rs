@@ -10,6 +10,7 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// How the gateway's clients and the cluster's members connect.
@@ -37,6 +38,8 @@ pub struct Setup<'a> {
     pub extent: u64,
     pub policy: &'a str,
     pub transport: Transport,
+    /// How often to scrape each process's metrics, if at all.
+    pub scrape: Option<Duration>,
 }
 
 pub struct Cluster {
@@ -46,6 +49,8 @@ pub struct Cluster {
     pub slabs: PathBuf,
     /// A client config that trusts the gateway, when it serves TLS.
     pub tls: Option<Arc<ClientConfig>>,
+    /// Stops the scraper, when one runs.
+    scraping: Option<Arc<AtomicBool>>,
     _ports: Vec<OwnedFd>,
 }
 
@@ -91,8 +96,17 @@ impl Cluster {
             cache,
             extent,
             policy,
+            scrape,
             ..
         } = setup;
+        // Admin listeners, which the scraper reads.
+        let admin = scrape.map(|_| (reserve_port(), reserve_port()));
+        let admin_table = |port: Option<u16>| match port {
+            Some(port) => format!("\n[admin]\nlisten = \"127.0.0.1:{port}\"\n"),
+            None => String::new(),
+        };
+        let node_admin = admin_table(admin.as_ref().map(|((port, _), _)| *port));
+        let gateway_admin = admin_table(admin.as_ref().map(|(_, (port, _))| *port));
         let extents = cache / extent;
         let shared = format!(
             r#"
@@ -130,7 +144,7 @@ secret_access_key = "origin-secret"
 [node]
 id = 0
 data_dir = "{}"
-{member_tls}"#,
+{member_tls}{node_admin}"#,
                 data.display()
             ),
         )
@@ -139,7 +153,7 @@ data_dir = "{}"
         std::fs::write(
             &gateway_config,
             format!(
-                "{shared}\n[gateway]\nlisten = \"127.0.0.1:{gateway_port}\"\n{client_tls}{member_tls}"
+                "{shared}\n[gateway]\nlisten = \"127.0.0.1:{gateway_port}\"\n{client_tls}{member_tls}{gateway_admin}"
             ),
         )
         .unwrap();
@@ -158,13 +172,27 @@ data_dir = "{}"
         listening(gateway_port);
         // For profilers to attach to.
         eprintln!("node pid {}, gateway pid {}", node.id(), gateway.id());
+        let mut ports = vec![node_reservation, gateway_reservation];
+        let scraping = admin
+            .zip(*scrape)
+            .map(|(((node, a), (gateway, b)), every)| {
+                ports.extend([a, b]);
+                listening(node);
+                listening(gateway);
+                let files = [
+                    (node, dir.join("node.metrics")),
+                    (gateway, dir.join("gateway.metrics")),
+                ];
+                scrape_every(every, files)
+            });
         Cluster {
             node,
             gateway,
             gateway_port,
             slabs: data.join("slabs"),
             tls,
-            _ports: vec![node_reservation, gateway_reservation],
+            scraping,
+            _ports: ports,
         }
     }
 
@@ -211,9 +239,39 @@ data_dir = "{}"
 
 impl Drop for Cluster {
     fn drop(&mut self) {
+        if let Some(scraping) = &self.scraping {
+            scraping.store(false, Ordering::Relaxed);
+        }
         let _ = self.gateway.kill();
         let _ = self.node.kill();
     }
+}
+
+/// Reads `/metrics` from each admin port every `every`, on a thread of its
+/// own, until the returned flag clears, and keeps each port's latest scrape
+/// in its file.
+fn scrape_every(every: Duration, ports: [(u16, PathBuf); 2]) -> Arc<AtomicBool> {
+    use std::io::{Read, Write};
+    let running = Arc::new(AtomicBool::new(true));
+    let flag = running.clone();
+    std::thread::spawn(move || {
+        while flag.load(Ordering::Relaxed) {
+            for (port, file) in &ports {
+                let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", *port)) else {
+                    continue;
+                };
+                let request = "GET /metrics HTTP/1.1\r\nhost: bench\r\nconnection: close\r\n\r\n";
+                let mut answer = Vec::new();
+                if stream.write_all(request.as_bytes()).is_ok()
+                    && stream.read_to_end(&mut answer).is_ok()
+                {
+                    let _ = std::fs::write(file, answer);
+                }
+            }
+            std::thread::sleep(every);
+        }
+    });
+    running
 }
 
 /// Writes a CA, a certificate it signs for 127.0.0.1 that every process

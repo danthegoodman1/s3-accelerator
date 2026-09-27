@@ -18,6 +18,9 @@
 //! cargo build --release -p s3-accelerator -p s3-accelerator-bench
 //! target/release/s3-accelerator-bench [--scale X] [--clients N] [--origin-latency-ms MS] [--dir DIR]
 //! ```
+//!
+//! With `--scrape-ms MS`, both processes serve their admin listener, and a
+//! thread scrapes each one's `/metrics` every `MS` milliseconds.
 
 mod client;
 mod cluster;
@@ -48,6 +51,8 @@ struct Args {
     extent: u64,
     /// The one section to run: hits, scan, shift or transports.
     only: Option<String>,
+    /// How often to scrape each process's metrics, if at all.
+    scrape: Option<Duration>,
 }
 
 fn args() -> Args {
@@ -60,6 +65,7 @@ fn args() -> Args {
         latency: Duration::from_millis(20),
         extent: MIB,
         only: None,
+        scrape: None,
     };
     let mut given = std::env::args().skip(1);
     while let Some(flag) = given.next() {
@@ -73,6 +79,9 @@ fn args() -> Args {
             "--clients" => args.clients = value.parse().unwrap(),
             "--extent-mib" => args.extent = value.parse::<u64>().unwrap() * MIB,
             "--only" => args.only = Some(value),
+            "--scrape-ms" => {
+                args.scrape = Some(Duration::from_millis(value.parse().unwrap()));
+            }
             "--origin-latency-ms" => {
                 args.latency = Duration::from_millis(value.parse().unwrap());
             }
@@ -179,6 +188,7 @@ impl Bench {
             extent: self.args.extent,
             policy,
             transport,
+            scrape: self.args.scrape,
         };
         Cluster::start(
             &self.args.server,
