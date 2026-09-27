@@ -27,3 +27,13 @@ fn faults_stop_once_their_budget_runs_out() {
         panic!("{failure}");
     }
 }
+
+/// Seed 5757: a new home's first fetch admitted a block whose reservation
+/// evicted a block of the same version it no longer owned, dropping the
+/// version's last reference while the fetch still stored its blocks.
+#[test]
+fn an_eviction_during_a_first_fetch_keeps_its_version() {
+    if let Err(failure) = Simulator::from_seed(5757).run() {
+        panic!("{failure}");
+    }
+}

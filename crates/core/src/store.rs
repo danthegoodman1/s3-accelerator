@@ -139,6 +139,8 @@ pub struct Store {
     small_bytes: u64,
     ghost: VecDeque<u64>,
     ghosts: BTreeMap<u64, u32>,
+    /// Blocks the node no longer owns, which eviction takes first.
+    disowned: VecDeque<BlockKey>,
     next_seq: u64,
     evicted: Vec<(BlockKey, Location)>,
 }
@@ -189,6 +191,7 @@ impl Store {
             small_bytes: 0,
             ghost: VecDeque::new(),
             ghosts: BTreeMap::new(),
+            disowned: VecDeque::new(),
             next_seq: 1,
             evicted: Vec::new(),
         }
@@ -440,9 +443,39 @@ impl Store {
         entry
     }
 
+    /// Marks every readable block whose placement `owned` rejects, so
+    /// eviction takes them before any other, oldest mark first.
+    pub fn disown(&mut self, owned: impl Fn(PlacementHash) -> bool) {
+        self.disowned = self
+            .blocks
+            .iter()
+            .filter(|(_, entry)| entry.queue != Queue::None && !owned(entry.placement))
+            .map(|(&key, _)| key)
+            .collect();
+    }
+
+    /// Evicts one block: a disowned one if any is unpinned, and otherwise
+    /// by S3-FIFO. Returns false when every queued block is pinned.
+    fn evict_one(&mut self) -> bool {
+        for _ in 0..self.disowned.len() {
+            let Some(key) = self.disowned.pop_front() else {
+                break;
+            };
+            match self.blocks.get(&key) {
+                Some(entry) if entry.pins > 0 => self.disowned.push_back(key),
+                Some(entry) if entry.queue != Queue::None => {
+                    self.evict(key);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        self.evict_by_frequency()
+    }
+
     /// Evicts one block by S3-FIFO. Returns false when every queued block
     /// is pinned.
-    fn evict_one(&mut self) -> bool {
+    fn evict_by_frequency(&mut self) -> bool {
         let small_target =
             self.config.extent_size * u64::from(self.config.extents) * SMALL_QUEUE_PERCENT / 100;
         // Pinned blocks each queue has rotated past since the last block
@@ -620,6 +653,25 @@ mod tests {
         fill(&mut store, 8, 16).unwrap();
         assert_eq!(evicted(&mut store), [key(1)]);
         assert!(store.get(&key(0)).is_some());
+    }
+
+    /// Blocks placed elsewhere leave before any the node owns, however
+    /// often those were read, and a pinned one waits its turn.
+    #[test]
+    fn disowned_blocks_leave_first() {
+        let mut store = store();
+        for index in 0..8 {
+            store.reserve(key(index), 16, index, PlacementHash(index));
+            store.filled(key(index));
+        }
+        store.pin(key(3));
+        store.disown(|placement| placement.0 % 2 == 0 || placement.0 == 7);
+        fill(&mut store, 8, 16).unwrap();
+        fill(&mut store, 9, 16).unwrap();
+        assert_eq!(evicted(&mut store), [key(1), key(5)]);
+        fill(&mut store, 10, 16).unwrap();
+        assert_eq!(evicted(&mut store), [key(0)]);
+        store.unpin(key(3));
     }
 
     #[test]

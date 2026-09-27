@@ -3,12 +3,12 @@
 
 use s3_accelerator_core::gateway;
 use s3_accelerator_core::layout::Layout;
+use s3_accelerator_core::membership::{self, Peer};
 use s3_accelerator_core::node::{self, BucketPolicy, Freshness};
-use s3_accelerator_core::placement::{Member, NodeId, Ring};
+use s3_accelerator_core::placement::{NodeId, Ring};
 use s3_accelerator_core::store::StoreConfig;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroU32;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,7 +28,52 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     pub secret: String,
+    /// The nodes a process starts with. Nodes gossip, so one missing here
+    /// joins through the others; a gateway reaches only nodes named here.
     pub nodes: Vec<ClusterNode>,
+    #[serde(default)]
+    pub membership: MembershipConfig,
+}
+
+/// SWIM's timings among storage nodes.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MembershipConfig {
+    /// How often a node probes another, and how long it waits for the
+    /// answer before asking others to probe it.
+    pub probe_period_ms: u64,
+    pub probe_rtt_ms: u64,
+    /// How long a suspected node has to answer before it is declared down,
+    /// and how long a node declared down stays in the ring.
+    pub suspect_to_down_ms: u64,
+    pub down_grace_ms: u64,
+    /// How often a node gossips updates to a few others.
+    pub gossip_period_ms: u64,
+}
+
+impl Default for MembershipConfig {
+    fn default() -> MembershipConfig {
+        MembershipConfig {
+            probe_period_ms: 1_000,
+            probe_rtt_ms: 500,
+            suspect_to_down_ms: 5_000,
+            down_grace_ms: 60_000,
+            gossip_period_ms: 200,
+        }
+    }
+}
+
+impl MembershipConfig {
+    pub fn config(&self) -> membership::Config {
+        membership::Config {
+            probe_period: self.probe_period_ms,
+            probe_rtt: self.probe_rtt_ms,
+            suspect_to_down: self.suspect_to_down_ms,
+            down_grace: self.down_grace_ms,
+            gossip_period: self.gossip_period_ms,
+            max_packet: 1_400,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -94,17 +139,25 @@ impl Config {
         self.cache.check()
     }
 
+    /// The ring of the nodes the config names, which every process that
+    /// starts from the same config shares.
     pub fn ring(&self) -> Ring {
-        let members = self
-            .cluster
+        membership::ring_of(&self.peers())
+    }
+
+    /// The nodes the config names, as membership first knows them.
+    pub fn peers(&self) -> Vec<Peer> {
+        self.cluster
             .nodes
             .iter()
-            .map(|node| Member {
-                id: NodeId(node.id),
-                weight: NonZeroU32::new(node.weight).unwrap_or(NonZeroU32::MIN),
+            .map(|node| Peer {
+                id: node.id,
+                weight: node.weight,
+                run: 0,
+                leaving: false,
+                address: node.address.clone(),
             })
-            .collect();
-        Ring::new(1, members)
+            .collect()
     }
 
     /// Where gateways reach each node.
@@ -177,6 +230,10 @@ pub struct CacheConfig {
     pub origin_timeout_ms: u64,
     pub node_timeout_ms: u64,
     pub suspect_ttl_ms: u64,
+    /// How long after a ring change a node asks previous owners for
+    /// blocks first, and how long a previous owner has to answer.
+    pub fallback_window_ms: u64,
+    pub peer_timeout_ms: u64,
     pub default_policy: PolicyConfig,
     pub buckets: BTreeMap<String, PolicyConfig>,
 }
@@ -197,6 +254,8 @@ impl Default for CacheConfig {
             origin_timeout_ms: 60_000,
             node_timeout_ms: 150_000,
             suspect_ttl_ms: 10_000,
+            fallback_window_ms: 600_000,
+            peer_timeout_ms: 1_000,
             default_policy: PolicyConfig::default(),
             buckets: BTreeMap::new(),
         }
@@ -273,6 +332,8 @@ impl CacheConfig {
             fill_budget: self.fill_budget,
             metadata_capacity: self.metadata_capacity,
             origin_timeout: self.origin_timeout_ms,
+            fallback_window: self.fallback_window_ms,
+            peer_timeout: self.peer_timeout_ms,
             default_policy: self.default_policy.policy(),
             buckets: self
                 .buckets

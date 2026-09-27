@@ -377,6 +377,18 @@ pub async fn send_payload(
     (status, response.bytes().await.unwrap().to_vec())
 }
 
+/// Sends a signed GET and returns the status and body, or `None` if the
+/// connection failed or the body ended early, as when its server dies.
+pub async fn try_get(port: u16, path: &str) -> Option<(u16, Vec<u8>)> {
+    let mut request = reqwest::Client::new().get(format!("http://127.0.0.1:{port}{path}"));
+    for (name, value) in signed(port, "GET", path, "", &[]) {
+        request = request.header(name, value);
+    }
+    let response = request.send().await.ok()?;
+    let status = response.status().as_u16();
+    Some((status, response.bytes().await.ok()?.to_vec()))
+}
+
 /// A server process, killed if the test ends first.
 pub struct Process(Child);
 
@@ -413,6 +425,28 @@ impl Process {
             .status()
             .unwrap();
         assert!(self.0.wait().unwrap().success());
+    }
+
+    /// Sends the server `signal`, such as `USR1` to make a node leave.
+    pub fn signal(&self, signal: &str) {
+        let pid = self.server_pid();
+        Command::new("kill")
+            .args([&format!("-{signal}"), &pid.to_string()])
+            .status()
+            .unwrap();
+    }
+
+    /// Waits up to `limit` for the server to exit, and whether it did so
+    /// cleanly.
+    pub async fn exited(&mut self, limit: Duration) -> Option<bool> {
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                return Some(status.success());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        None
     }
 
     /// The server's process: this child, or the child `strace` started.
@@ -470,22 +504,59 @@ pub async fn listening(port: u16) {
 /// The `[cache]` settings of `Cluster`s by default.
 pub const CLUSTER_CACHE: &str = "block_size = 65536\nextent_size = 1048576\nextents = 32";
 
-/// Configs for one node and a gateway, in `dir`, whose bucket `bucket` is
-/// immutable and admits blocks on their first read.
+/// Configs for storage nodes and a gateway, in `dir`, whose bucket
+/// `bucket` is immutable and admits blocks on their first read.
 pub struct Cluster {
     pub gateway_port: u16,
+    pub gateway: PathBuf,
+    /// Node 0's port and config.
     pub node_port: u16,
     pub node: PathBuf,
-    pub gateway: PathBuf,
+    /// Every node's port and config, by ID.
+    pub nodes: Vec<(u16, PathBuf)>,
 }
 
 impl Cluster {
-    /// `cache` holds the `[cache]` table's own settings.
+    /// One node. `cache` holds the `[cache]` table's own settings.
     pub fn new(dir: &Path, origin_port: u16, cache: &str) -> Cluster {
+        Cluster::with_nodes(dir, origin_port, cache, 1, "", &[])
+    }
+
+    /// `count` nodes, each with its own disk. Every config names every node
+    /// but those `unnamed`, which only their own configs name, as for nodes
+    /// added after the others' configs were written. `cluster` holds more
+    /// of the `[cluster]` table's settings.
+    pub fn with_nodes(
+        dir: &Path,
+        origin_port: u16,
+        cache: &str,
+        count: usize,
+        cluster: &str,
+        unnamed: &[usize],
+    ) -> Cluster {
         std::fs::create_dir_all(dir).unwrap();
-        let (gateway_port, node_port) = (port(), port());
-        let shared = format!(
-            r#"
+        let gateway_port = port();
+        let ports: Vec<u16> = (0..count).map(|_| port()).collect();
+        let entries: Vec<String> = ports
+            .iter()
+            .enumerate()
+            .map(|(id, port)| format!(r#"{{ id = {id}, address = "127.0.0.1:{port}" }}"#))
+            .collect();
+        // The nodes a config names: every node for an unnamed node's own,
+        // and every node but the unnamed ones for the rest.
+        let named = |everyone: bool| {
+            let entries: Vec<&str> = entries
+                .iter()
+                .enumerate()
+                .filter(|(id, _)| everyone || !unnamed.contains(id))
+                .map(|(_, entry)| entry.as_str())
+                .collect();
+            entries.join(", ")
+        };
+        let shared = |everyone: bool| {
+            let named = named(everyone);
+            format!(
+                r#"
             [origin]
             endpoint = "http://127.0.0.1:{origin_port}"
             region = "us-east-1"
@@ -502,24 +573,43 @@ impl Cluster {
             admit_on_first_read = true
             [cluster]
             secret = "cluster-secret"
-            nodes = [{{ id = 0, address = "127.0.0.1:{node_port}" }}]
+            nodes = [{named}]
+            {cluster}
             "#
-        );
-        let node = dir.join("node.toml");
-        let node_role = format!(
-            "[node]\nid = 0\ndata_dir = \"{}\"\n",
-            dir.join("disk").display()
-        );
-        std::fs::write(&node, format!("{shared}\n{node_role}")).unwrap();
+            )
+        };
+        let nodes: Vec<(u16, PathBuf)> = ports
+            .iter()
+            .enumerate()
+            .map(|(id, &port)| {
+                let config = dir.join(format!("node-{id}.toml"));
+                let role = format!(
+                    "[node]\nid = {id}\ndata_dir = \"{}\"\n",
+                    dir.join(format!("disk-{id}")).display()
+                );
+                let shared = shared(unnamed.contains(&id));
+                std::fs::write(&config, format!("{shared}\n{role}")).unwrap();
+                (port, config)
+            })
+            .collect();
         let gateway = dir.join("gateway.toml");
         let gateway_role = format!("[gateway]\nlisten = \"127.0.0.1:{gateway_port}\"\n");
-        std::fs::write(&gateway, format!("{shared}\n{gateway_role}")).unwrap();
+        std::fs::write(&gateway, format!("{}\n{gateway_role}", shared(false))).unwrap();
         Cluster {
             gateway_port,
-            node_port,
-            node,
             gateway,
+            node_port: nodes[0].0,
+            node: nodes[0].1.clone(),
+            nodes,
         }
+    }
+
+    /// Starts node `id` and waits until it listens.
+    pub async fn start(&self, id: usize) -> Process {
+        let (port, config) = &self.nodes[id];
+        let process = Process::start(config);
+        listening(*port).await;
+        process
     }
 
     pub async fn start_node(&self) -> Process {

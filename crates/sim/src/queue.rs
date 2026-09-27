@@ -35,4 +35,9 @@ impl<E> Queue<E> {
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
+
+    /// Whether every event waiting passes `test`.
+    pub fn all(&self, test: impl Fn(&E) -> bool) -> bool {
+        self.events.values().all(test)
+    }
 }

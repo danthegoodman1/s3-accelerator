@@ -7,8 +7,10 @@ use crate::disk::Disk;
 use crate::gateway_engine::{Event, GatewayEngine, SharedGateway};
 use crate::http::{Connection, Framing, RequestHead, Response};
 use crate::http::{etag_condition, format_content_range, header, parse_range};
+use crate::membership_engine;
 use crate::node_engine::{self, NodeEngine};
 use crate::origin::{self, Origin, RequestBody};
+use crate::peers::Peers;
 use crate::sigv4::{self, AuthError, Credentials, Signable};
 use crate::zero_copy::{self, Short};
 use bytes::Bytes;
@@ -16,16 +18,20 @@ use http_body_util::channel::{Channel, Sender as BodySender};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use percent_encoding::percent_decode_str;
+use s3_accelerator_core::Time;
+use s3_accelerator_core::membership::{Membership, Peer};
 use s3_accelerator_core::node::Node;
 use s3_accelerator_core::placement::NodeId;
 use s3_accelerator_core::s3::{Method, ObjectKey, Request, ResponseHead};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::io;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
+use std::time::{Duration, Instant};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 
@@ -59,7 +65,11 @@ pub async fn serve(config: Config) -> io::Result<()> {
             _ = tokio::signal::ctrl_c() => {}
         }
     };
-    run(config, listeners, stop).await
+    let mut user1 = signal(SignalKind::user_defined1())?;
+    let leave = async move {
+        user1.recv().await;
+    };
+    run_with(config, listeners, stop, leave).await
 }
 
 /// Where a process's gateway takes S3 clients and its node takes gateways.
@@ -77,6 +87,18 @@ pub async fn run(
     listeners: Listeners,
     stop: impl Future<Output = ()> + 'static,
 ) -> io::Result<()> {
+    run_with(config, listeners, stop, std::future::pending()).await
+}
+
+/// As `run`, and once `leave` completes, the node leaves the cluster: it
+/// drops out of every ring, serves its blocks to their new owners through
+/// the fallback window, and then stops.
+pub async fn run_with(
+    config: Config,
+    listeners: Listeners,
+    stop: impl Future<Output = ()> + 'static,
+    leave: impl Future<Output = ()> + 'static,
+) -> io::Result<()> {
     let credentials = Credentials {
         access_key_id: config.origin.access_key_id.clone(),
         secret_access_key: config.origin.secret_access_key.clone(),
@@ -87,23 +109,74 @@ pub async fn run(
         credentials,
     ));
     let secret: Rc<str> = config.cluster.secret.as_str().into();
+    let peers = Peers::new(config.addresses(), secret.clone());
     let (stopping, stopped) = watch::channel(false);
+    let stopping = Rc::new(stopping);
+    let stopper = stopping.clone();
     tokio::task::spawn_local(async move {
         stop.await;
-        let _ = stopping.send(true);
+        let _ = stopper.send(true);
     });
     let node = match (&config.node, listeners.node) {
         (Some(node), Some(listener)) => {
             let node_config = config.cache.node_config();
             let (disk, recovery) = Disk::open(Path::new(&node.data_dir), node_config.store)?;
+            let id = NodeId(node.id);
+            let me = config
+                .peers()
+                .into_iter()
+                .find(|peer| peer.id == node.id)
+                .map(|peer| Peer {
+                    run: disk.run(),
+                    ..peer
+                })
+                .expect("a node is in cluster.nodes");
             let recovered = Node::recover(
-                NodeId(node.id),
+                id,
                 config.ring(),
                 node_config,
                 recovery.records,
                 recovery.metadata,
             );
-            let engine = NodeEngine::new(recovered, origin.clone(), Arc::new(disk));
+            let engine = NodeEngine::new(
+                recovered,
+                origin.clone(),
+                peers.clone(),
+                Arc::new(disk),
+                config.addresses(),
+            );
+            let gossip = resolve(&config)?;
+            let socket = UdpSocket::bind(gossip[&id]).await?;
+            let started = Instant::now();
+            let membership = Membership::new(
+                Time(0),
+                me,
+                &config.peers(),
+                config.cluster.membership.config(),
+                random_seed(),
+            );
+            let seeds: Vec<NodeId> = gossip.keys().copied().collect();
+            let fallback_window = Duration::from_millis(config.cache.fallback_window_ms);
+            let (engine_for_membership, peers) = (engine.clone(), peers.clone());
+            let stopper = stopping.clone();
+            tokio::task::spawn_local(async move {
+                let membership = membership_engine::run(
+                    started,
+                    membership,
+                    engine_for_membership,
+                    peers,
+                    socket,
+                    gossip,
+                    seeds,
+                )
+                .await;
+                leave.await;
+                eprintln!("leaving the cluster");
+                membership_engine::start_leaving(&membership);
+                tokio::time::sleep(fallback_window).await;
+                membership_engine::leave(&membership);
+                let _ = stopper.send(true);
+            });
             let stop = stopped_signal(stopped.clone());
             Some(tokio::task::spawn_local(node_engine::serve(
                 listener,
@@ -115,12 +188,7 @@ pub async fn run(
         _ => None,
     };
     if let (Some(_), Some(listener)) = (&config.gateway, listeners.gateway) {
-        let gateway = GatewayEngine::new(
-            config.ring(),
-            config.cache.gateway_config(),
-            config.addresses(),
-            secret,
-        );
+        let gateway = GatewayEngine::new(config.ring(), config.cache.gateway_config(), peers);
         let context = Rc::new(Context {
             gateway,
             origin,
@@ -132,6 +200,28 @@ pub async fn run(
         Some(node) => node.await.map_err(io::Error::other)?,
         None => Ok(()),
     }
+}
+
+/// Each node's cluster address, where it also gossips over UDP.
+fn resolve(config: &Config) -> io::Result<BTreeMap<NodeId, SocketAddr>> {
+    config
+        .addresses()
+        .into_iter()
+        .map(|(id, address)| {
+            let resolved = address.to_socket_addrs()?.next().ok_or_else(|| {
+                io::Error::other(format!("node {} has no address: {address}", id.0))
+            })?;
+            Ok((id, resolved))
+        })
+        .collect()
+}
+
+/// A seed for membership's random choices, which need no secrecy.
+fn random_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+    nanos ^ (u64::from(std::process::id()) << 32)
 }
 
 /// Completes once `run`'s stop has.

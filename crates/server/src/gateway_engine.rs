@@ -2,9 +2,11 @@
 //! storage nodes over the cluster protocol, and tells each client's
 //! connection how to answer. A node's body stays in its connection until
 //! the client's connection relays it with `splice`, or the gateway drops it.
+//! Every answer names the version of its node's ring, and the gateway
+//! fetches a ring whose version differs from its own.
 
-use crate::http::Connection;
-use crate::protocol::{self, NodeAnswer, NodeRequest};
+use crate::peers::{Exchanged, NodeBody, Peers};
+use crate::protocol::{NodeAnswer, NodeRequest};
 use s3_accelerator_core::Time;
 use s3_accelerator_core::gateway::{self, ClientRequestId, Gateway, NodeRequestId};
 use s3_accelerator_core::node::Read;
@@ -12,11 +14,12 @@ use s3_accelerator_core::placement::{NodeId, Placement, Ring};
 use s3_accelerator_core::s3::{ObjectKey, Request, ResponseHead};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::io;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+
+/// How long a gateway waits for each node's ring.
+const RING_WAIT: Duration = Duration::from_secs(1);
 
 /// What a client's connection does next for its read.
 pub enum Event {
@@ -35,62 +38,33 @@ pub enum Event {
     Abort,
 }
 
-/// A node's answer whose body is still in its connection.
-pub struct NodeBody {
-    node: NodeId,
-    connection: Connection,
-    /// Body bytes still unread.
-    len: u64,
-}
-
-impl NodeBody {
-    pub fn stream(&self) -> &TcpStream {
-        self.connection.stream()
-    }
-
-    /// Body bytes still unread.
-    pub fn unread(&self) -> u64 {
-        self.len
-    }
-}
-
 pub type SharedGateway = Rc<RefCell<GatewayEngine>>;
 
 pub struct GatewayEngine {
     started: Instant,
     gateway: Gateway,
-    ring: Ring,
-    /// Where each node listens, and the secret the cluster shares.
-    addresses: BTreeMap<NodeId, String>,
-    secret: Rc<str>,
+    peers: Rc<Peers>,
     next_id: u64,
     clients: BTreeMap<ClientRequestId, mpsc::UnboundedSender<Event>>,
     /// Nodes' answered bodies, until forwarded or discarded.
     relayed: BTreeMap<NodeRequestId, NodeBody>,
-    /// Reads to send to nodes.
+    /// Reads to send to nodes, and nodes to fetch rings from, or `None` to
+    /// try every node known.
     sends: Vec<(NodeId, NodeRequestId, Read)>,
-    /// Idle connections to each node.
-    idle: BTreeMap<NodeId, Vec<Connection>>,
+    ring_fetches: Vec<Option<NodeId>>,
 }
 
 impl GatewayEngine {
-    pub fn new(
-        ring: Ring,
-        config: gateway::Config,
-        addresses: BTreeMap<NodeId, String>,
-        secret: Rc<str>,
-    ) -> SharedGateway {
+    pub fn new(ring: Ring, config: gateway::Config, peers: Rc<Peers>) -> SharedGateway {
         Rc::new(RefCell::new(GatewayEngine {
             started: Instant::now(),
-            gateway: Gateway::new(ring.clone(), config),
-            ring,
-            addresses,
-            secret,
+            gateway: Gateway::new(ring, config),
+            peers,
             next_id: 0,
             clients: BTreeMap::new(),
             relayed: BTreeMap::new(),
             sends: Vec::new(),
-            idle: BTreeMap::new(),
+            ring_fetches: Vec::new(),
         }))
     }
 
@@ -98,7 +72,7 @@ impl GatewayEngine {
     /// receiver.
     pub fn read(engine: &SharedGateway, request: Request) -> mpsc::UnboundedReceiver<Event> {
         let (sender, receiver) = mpsc::unbounded_channel();
-        let sends = {
+        let work = {
             let mut this = engine.borrow_mut();
             this.next_id += 1;
             let id = ClientRequestId(this.next_id);
@@ -107,7 +81,7 @@ impl GatewayEngine {
             this.gateway.on_request(now, id, request);
             this.pump()
         };
-        send(engine, sends);
+        start(engine, work);
         receiver
     }
 
@@ -119,34 +93,34 @@ impl GatewayEngine {
         copied: u64,
         read_in_full: Option<NodeBody>,
     ) {
-        let sends = {
+        let work = {
             let mut this = engine.borrow_mut();
             if let Some(mut body) = read_in_full {
-                body.len = 0;
-                this.idle(body);
+                body.consumed(body.unread());
+                this.peers.idle(body);
             }
             let now = this.now();
             this.gateway.on_forwarded(now, from, copied);
             this.pump()
         };
-        send(engine, sends);
+        start(engine, work);
     }
 
     /// A write to `key` through this gateway succeeded: the gateway forgets
     /// the key's metadata, and tells the key's home.
     pub fn written(engine: &SharedGateway, key: &ObjectKey) {
-        let home = {
+        let (home, peers) = {
             let mut this = engine.borrow_mut();
             let now = this.now();
             this.gateway.on_write(now, key);
-            this.ring.owner(Placement::Home(key).hash())
+            let home = this.gateway.ring().owner(Placement::Home(key).hash());
+            (home, this.peers.clone())
         };
         if let Some(home) = home {
-            let engine = engine.clone();
             let request = NodeRequest::Written(key.clone());
             tokio::task::spawn_local(async move {
-                match exchange(&engine, home, &request).await {
-                    Ok((_, body)) => engine.borrow_mut().idle(body),
+                match peers.exchange(home, &request).await {
+                    Ok(exchanged) => peers.idle(exchanged.body),
                     Err(error) => eprintln!("telling node {} of a write: {error}", home.0),
                 }
             });
@@ -155,23 +129,26 @@ impl GatewayEngine {
 
     /// Lets the gateway fail over from nodes that time out.
     pub fn tick(engine: &SharedGateway) {
-        let sends = {
+        let work = {
             let mut this = engine.borrow_mut();
             this.clients.retain(|_, client| !client.is_closed());
             let now = this.now();
             this.gateway.on_tick(now);
             this.pump()
         };
-        send(engine, sends);
+        start(engine, work);
     }
 
     /// Carries out every action until the gateway has none left, and
-    /// returns the reads to send.
-    fn pump(&mut self) -> Vec<(NodeId, NodeRequestId, Read)> {
+    /// returns the reads to send and the rings to fetch.
+    fn pump(&mut self) -> Work {
         loop {
             let actions = self.gateway.drain();
             if actions.is_empty() {
-                return std::mem::take(&mut self.sends);
+                return Work {
+                    sends: std::mem::take(&mut self.sends),
+                    ring_fetches: std::mem::take(&mut self.ring_fetches),
+                };
             }
             for action in actions {
                 self.act(action);
@@ -208,9 +185,11 @@ impl GatewayEngine {
             }
             gateway::Action::Discard { id } => {
                 if let Some(body) = self.relayed.remove(&id) {
-                    self.idle(body);
+                    self.peers.idle(body);
                 }
             }
+            gateway::Action::FetchRing { node } => self.ring_fetches.push(Some(node)),
+            gateway::Action::FindRing => self.ring_fetches.push(None),
         }
     }
 
@@ -222,48 +201,57 @@ impl GatewayEngine {
             .is_some_and(|client| client.send(event).is_ok())
     }
 
-    /// Keeps a connection for the next read if its last answer was read in
-    /// full, and otherwise closes it.
-    fn idle(&mut self, body: NodeBody) {
-        if body.len == 0 {
-            self.idle
-                .entry(body.node)
-                .or_default()
-                .push(body.connection);
-        }
-    }
-
     fn now(&self) -> Time {
         Time(self.started.elapsed().as_millis() as u64)
     }
 }
 
-/// Sends each read to its node, and feeds the node's answer back to the
-/// gateway. A node that cannot be reached, or answers out of protocol, fails
-/// the read over at once, as a 5xx does.
-fn send(engine: &SharedGateway, sends: Vec<(NodeId, NodeRequestId, Read)>) {
-    for (node, id, read) in sends {
+/// What the gateway's actions left to start.
+struct Work {
+    sends: Vec<(NodeId, NodeRequestId, Read)>,
+    ring_fetches: Vec<Option<NodeId>>,
+}
+
+/// Sends each read to its node and feeds the node's answer back to the
+/// gateway, and fetches each ring asked for. A node that cannot be reached,
+/// or answers out of protocol, fails the read over at once, as a 5xx does.
+fn start(engine: &SharedGateway, work: Work) {
+    for (node, id, read) in work.sends {
         let engine = engine.clone();
         tokio::task::spawn_local(async move {
+            let peers = engine.borrow().peers.clone();
             let request = NodeRequest::Read(read);
-            let exchanged = exchange(&engine, node, &request).await;
-            let sends = {
+            let exchanged = peers.exchange(node, &request).await;
+            let work = {
                 let mut this = engine.borrow_mut();
                 let now = this.now();
+                let version = exchanged.as_ref().ok().and_then(|exchanged| exchanged.ring);
                 match exchanged {
-                    Ok((NodeAnswer::Respond { head, meta }, body)) => {
+                    Ok(Exchanged {
+                        answer: NodeAnswer::Respond { head, meta },
+                        body,
+                        ..
+                    }) => {
                         this.relayed.insert(id, body);
                         this.gateway.on_node_response(now, id, head, meta);
                     }
-                    Ok((NodeAnswer::Metadata(meta), body)) => {
-                        this.idle(body);
+                    Ok(Exchanged {
+                        answer: NodeAnswer::Metadata(meta),
+                        body,
+                        ..
+                    }) => {
+                        this.peers.idle(body);
                         this.gateway.on_node_metadata(now, id, meta);
                     }
-                    Ok((NodeAnswer::Stale, body)) => {
-                        this.idle(body);
+                    Ok(Exchanged {
+                        answer: NodeAnswer::Stale,
+                        body,
+                        ..
+                    }) => {
+                        this.peers.idle(body);
                         this.gateway.on_node_stale(now, id);
                     }
-                    Ok((NodeAnswer::Written, _)) | Err(_) => {
+                    Ok(_) | Err(_) => {
                         if let Err(error) = &exchanged {
                             eprintln!("reading from node {}: {error}", node.0);
                         }
@@ -271,66 +259,46 @@ fn send(engine: &SharedGateway, sends: Vec<(NodeId, NodeRequestId, Read)>) {
                             .on_node_response(now, id, ResponseHead::status(503), None);
                     }
                 }
+                if let Some(version) = version {
+                    this.gateway.on_ring_version(now, node, version);
+                }
                 this.pump()
             };
-            send(&engine, sends);
+            start(&engine, work);
+        });
+    }
+    for node in work.ring_fetches {
+        let engine = engine.clone();
+        tokio::task::spawn_local(async move {
+            let peers = engine.borrow().peers.clone();
+            let nodes = match node {
+                Some(node) => vec![node],
+                None => peers.nodes(),
+            };
+            for node in nodes {
+                let exchanged =
+                    tokio::time::timeout(RING_WAIT, peers.exchange(node, &NodeRequest::Ring));
+                match exchanged.await {
+                    Ok(Ok(Exchanged {
+                        answer: NodeAnswer::Ring { ring, addresses },
+                        body,
+                        ..
+                    })) => {
+                        peers.idle(body);
+                        peers.learn(&addresses);
+                        let mut this = engine.borrow_mut();
+                        let now = this.now();
+                        this.gateway.on_ring(now, ring);
+                        return;
+                    }
+                    Ok(Ok(_)) => {
+                        eprintln!("node {} answered a ring request out of protocol", node.0)
+                    }
+                    // The next answer with another version asks again.
+                    Ok(Err(error)) => eprintln!("fetching node {}'s ring: {error}", node.0),
+                    Err(_) => eprintln!("fetching node {}'s ring: timed out", node.0),
+                }
+            }
         });
     }
 }
-
-/// Sends one request to `node` and reads the answer's head, leaving its
-/// body in the connection. An idle connection the node has since closed
-/// gets one retry on a new one.
-async fn exchange(
-    engine: &SharedGateway,
-    node: NodeId,
-    request: &NodeRequest,
-) -> io::Result<(NodeAnswer, NodeBody)> {
-    let (idle, address, secret) = {
-        let mut this = engine.borrow_mut();
-        let idle = this.idle.get_mut(&node).and_then(Vec::pop);
-        let address = this.addresses.get(&node).cloned();
-        (idle, address, this.secret.clone())
-    };
-    let address = address.ok_or_else(|| io::Error::other("no address"))?;
-    let (answer, len, connection) = match idle {
-        Some(connection) => match exchange_on(connection, request, &secret).await {
-            Ok(exchanged) => exchanged,
-            Err(_) => exchange_on(connect(&address).await?, request, &secret).await?,
-        },
-        None => exchange_on(connect(&address).await?, request, &secret).await?,
-    };
-    let body = NodeBody {
-        node,
-        connection,
-        len,
-    };
-    Ok((answer, body))
-}
-
-async fn connect(address: &str) -> io::Result<Connection> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
-        .await
-        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
-    stream.set_nodelay(true)?;
-    Ok(Connection::new(stream))
-}
-
-async fn exchange_on(
-    mut connection: Connection,
-    request: &NodeRequest,
-    secret: &str,
-) -> io::Result<(NodeAnswer, u64, Connection)> {
-    let (method, target, headers) = protocol::encode_request(request, secret);
-    connection
-        .write_request(method, &target, &headers, &[])
-        .await?;
-    let (status, headers) = connection.read_response_head().await?;
-    let answer = protocol::decode_answer(status, &headers).map_err(io::Error::other)?;
-    let len = crate::http::header(&headers, "content-length")
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(0);
-    Ok((answer, len, connection))
-}
-
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

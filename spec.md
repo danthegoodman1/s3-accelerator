@@ -24,7 +24,7 @@ A distributed NVMe read cache in front of S3. S3 remains the source of truth, an
 
 ## Unique advantages
 
-**1. The cache survives resizing.** Ring ownership decides what a node writes to disk, never what it may serve. After a ring change, the new owner fetches missing blocks from the previous owner before going to S3. A node being removed keeps serving those fetches for a grace window.
+**1. The cache survives resizing.** Ring ownership decides what a node writes to disk, never what it may serve. After a ring change, the new owner fetches missing blocks, and a new home the metadata, from the previous owner before going to S3. A node being removed keeps serving those fetches for a fallback window.
 
 - *Matters when* the cluster autoscales, runs on spot instances or deploys often, and the working set is large or slow to refill from S3.
 - *Matters little when* the cluster size stays fixed.
@@ -58,8 +58,10 @@ A distributed NVMe read cache in front of S3. S3 remains the source of truth, an
 
 ### Membership and placement
 
-- **Membership** runs SWIM gossip among storage nodes only and publishes an immutable, versioned ring snapshot. Nodes also keep the previous snapshot for the grace window.
-- **Gateways fetch the ring** over HTTP from any storage node. Every storage response carries the ring version, and a gateway refetches when it sees a newer one. Only storage nodes gossip, so adding gateways adds no membership traffic.
+- **Membership** runs SWIM gossip among storage nodes only. Each node derives an immutable ring snapshot from what it hears: the nodes up, and those declared down within the down grace period, less any that are leaving. A ring's version is a hash of its members and their weights, so nodes that agree on the members agree on the version. A node keeps its previous ring for the fallback window after a change. Every ten probe periods, a node announces itself again to the seeds it doesn't hear from, so a lost announcement or a healed partition doesn't leave the cluster split.
+- **Joining:** a starting node asks its seeds for their ring before it announces itself. A ring that lacks the node means the node is new, and that ring becomes its previous one, so it reads what it takes over from the nodes that held it. A restarted node finds itself in the ring and reads nothing from others.
+- **Leaving:** a node told to leave drops out of every ring at once, keeps serving its blocks to their new owners through the fallback window, and then stops.
+- **Gateways fetch the ring** over HTTP from storage nodes. Every storage response carries the version of its node's ring, and a gateway fetches the ring from a node whose version differs from its own, one fetch at a time. A ring names each node's address, so gateways and nodes reach nodes their configs never named. A gateway whose ring names no node that answers asks the nodes it knows of for a ring. Only storage nodes gossip, so adding gateways adds no membership traffic.
 - **Placement** uses weighted rendezvous hashing over stable node IDs. It moves few keys when membership changes, weights nodes by disk size, and gives each key an ordered candidate list that doubles as its replica set. Each home or chunk reduces to a 64-bit placement hash, and a node's score mixes that hash with the node's ID.
 - **Blocks and chunks:**
   - A **block** (1 MiB) is the unit of fill, storage and eviction.
@@ -67,7 +69,7 @@ A distributed NVMe read cache in front of S3. S3 remains the source of truth, an
 - **Object home** = `rendezvous(bucket, key)`. The home holds the object's metadata, chunk 0 and every block overlapping the object's final 16 MiB. Most file formats keep their metadata at the head or tail (Parquet and ORC footers, safetensors headers), so the home serves those reads in one hop. Objects up to 32 MiB live entirely on their home.
 - **Other chunks** belong to `rendezvous(bucket, key, chunk_index)`. Large objects spread across the cluster, and a large read fans out to several owners in parallel.
 - **Ownership costs disk only for blocks readers touch.** Blocks fill on read, so a large tail region reserves no space.
-- **Unresponsive nodes** stay in the ring for a grace period while gateways route around them. A brief failure therefore doesn't reshuffle ownership. A gateway fails over from a node that times out, answers 5xx or ends a body early to the next rendezvous candidate. Only the home keeps an object's metadata, since writes reach only the home, so a candidate standing in for it reads S3 directly and caches nothing.
+- **Unresponsive nodes** stay in the ring for the down grace period while gateways route around them. A brief failure therefore doesn't reshuffle ownership. A gateway fails over from a node that times out, answers 5xx or ends a body early to the next rendezvous candidate. Only the home keeps an object's metadata, since writes reach only the home, so a candidate standing in for it reads S3 directly and caches nothing.
 - **Disagreement about the ring** costs duplicate fills, never wrong data. A node asked for a chunk it doesn't own serves its own copy if it has one; otherwise it fetches the data without admitting it to disk.
 
 ### Read path
@@ -76,10 +78,11 @@ A distributed NVMe read cache in front of S3. S3 remains the source of truth, an
 2. The Gateway looks up the object's metadata (size, ETag and response headers) in its cache.
    - On a hit, it sends each range straight to the node that owns it.
    - On a miss, it sends the request to the object's home, which returns the metadata with any requested bytes from the head or tail. Suffix ranges (`bytes=-N`) resolve there. Ranges in the middle of the object take a second hop, unless the home has no metadata yet. In that case, the home's first fetch from S3 requests exactly those bytes and streams them back, storing the whole blocks the admission policy accepts.
+   - A home without the metadata asks the object's previous home first, within the fallback window. The metadata counts as validated when the home asked for it, less its age, and a write the new home learned of since then makes it useless.
 3. The Gateway fetches ranges that span several chunks from their owners in parallel. Every request carries the object's ETag.
 4. When an owner misses a block, it:
    - merges concurrent misses for that block into one fetch;
-   - asks the previous owner first, if the ring changed within the grace window;
+   - within the fallback window, asks the block's previous owner first, which answers only from blocks it holds; a previous owner that lacks them, or doesn't answer within the peer timeout, sends the fill to S3, and the node stops asking it until the next ring change;
    - otherwise fetches from S3 with `If-Match: <etag>`, combining adjacent missing blocks, up to a chunk, into one range GET.
 5. Readers that arrive while a fill is in flight share its body, which the owner holds until its readers finish; a chunk bounds it. A first fetch's body streams through the home without being held, so only the requests queued behind the first fetch share it, as its head arrives. A later reader waits for the block to be written and reads its slot, or fetches the block again.
 6. The response starts once every part has answered, and the parts' bodies follow in order. If an owner fails, times out, or its body ends early, even partway through a response, the Gateway fetches the rest through the next rendezvous candidate, which reads from S3 with `Range` and `If-Match`. If S3 no longer holds that version, the response ends early and the client retries. A fill whose S3 body ends early stores nothing.
@@ -114,7 +117,7 @@ The core decides what a node admits and evicts and which slot each block fills. 
   - **Fill budget:** a node caps the bytes it fills at once. Past the cap, misses stream from S3 without admission.
 - **Warming on write** (per bucket or prefix): a `PutObject` passes through the object's home, which keeps chunk 0 and the final 16 MiB as it forwards the body. After S3 accepts the write, the home reads the object's metadata with a HEAD. If the HEAD's ETag matches the write's, the home indexes the blocks under it, so the first read hits; otherwise it discards them.
 - **Metadata prefetch:** some formats state their metadata's length at a fixed spot: Parquet and ORC in their trailers, safetensors in its first 8 bytes. When a read touches that spot, the home fills every block the metadata spans with one range GET, before the reader asks for it.
-- **Eviction:** S3-FIFO over blocks: a small FIFO holding about 10% of capacity, a main FIFO, and a ghost queue of recently evicted keys. A hit bumps a 2-bit counter and moves nothing. Once a ring change's grace window ends, blocks the node no longer owns go first. Each block stores its placement hash, so the node rechecks ownership without the object's key.
+- **Eviction:** S3-FIFO over blocks: a small FIFO holding about 10% of capacity, a main FIFO, and a ghost queue of recently evicted keys. A hit bumps a 2-bit counter and moves nothing. Once the fallback window after a ring change ends, blocks the node no longer owns go first. Each block stores its placement hash, so the node rechecks ownership without the object's key.
 - **Blocks need no TTL.** They are keyed by ETag, so they never go stale: a changed object gets new blocks, and the old ones stop being read and age out. Freshness applies to metadata only. To meet a retention rule, such as removing deleted data within a set time, a purge drops an object's blocks and metadata. The home knows the object's size and ETag, so it can reach every chunk owner. Each node makes the purge durable before it confirms, and the home resends it to owners that were down until each confirms.
 
 ### Hot keys
@@ -150,7 +153,7 @@ The system is written in Rust.
 - **Zero-copy:** storage nodes serve blocks with `sendfile`, and gateways relay peer responses to clients with `splice`. `sendfile` blocks when a block isn't in the page cache, so it runs on worker threads or io_uring, off the async event loop. `splice` between sockets never blocks, so it runs on the event loop through a pipe. A gateway reads a peer response's head without reading past it, so the body stays in the socket for `splice`.
 - **Pages in flight:** `sendfile` and `splice` pass references to page-cache pages. A page stays in use after the call returns, until the peer acknowledges it or, over loopback, until the reader reads it, and a write into it would change bytes already sent. Before a write overwrites a slot, the node asks the kernel to drop the slot's pages; the kernel keeps only pages that a socket or pipe still references, so a page still cached means the write waits. After 30 seconds it gives up, and the block counts as unwritten. The node reads the slab file with `FADV_RANDOM`, so every cached folio lies within one slot, and slots are multiples of the page size. The data directory must be on a disk-backed filesystem: tmpfs pages never leave the page cache.
 - **TLS:** rustls runs the handshake, and the `ktls` crate moves the session into the kernel, so zero-copy works under TLS. A peer's TLS 1.3 KeyUpdate ends the connection, and the client reconnects.
-- **Membership:** a Rust gossip library, such as foca (SWIM) or chitchat.
+- **Membership:** foca (SWIM) in the core, fed packets and timer events by its owner. Nodes gossip over UDP on their cluster addresses, and carry their addresses in their identities.
 - **Peer links** run on a private network: plaintext with signed request tokens, or mTLS over kTLS where policy requires encryption.
 - **Reference designs:** TAG and ocache (Go) implement versioned block caching, request coalescing, SigV4 validation, warming on write and Parquet footer prefetch. Read them before building those parts.
 
@@ -158,5 +161,5 @@ The system is written in Rust.
 
 - **Workload targets:** object-size mix, request rate, working-set size, and hit-rate and latency goals. These set the chunk size, block size and hot-key thresholds.
 - **Chunk size:** larger chunks mean fewer hops per read; smaller chunks spread load more evenly.
-- **Grace window:** how long to keep previous-owner fallback after a ring change.
+- **Fallback window:** how long to keep previous-owner fallback after a ring change. The default is ten minutes.
 - **Storage layout:** revisit once the simulator and NVMe benchmarks produce numbers. It carries three risks: rebalancing size classes evicts every block in an extent, hot ones included, and a reservation first evicts up to eight blocks of any class before it empties an extent; the kernel decides what stays in memory; and fills land as random writes, which wear flash faster in small slots. A log-structured store is the fallback if these bite.

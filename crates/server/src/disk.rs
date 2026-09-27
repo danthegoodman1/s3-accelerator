@@ -254,6 +254,12 @@ impl Disk {
         self.table.sync_data()
     }
 
+    /// This run of the node: one more than the last run the slot table
+    /// saw.
+    pub fn run(&self) -> u64 {
+        self.run
+    }
+
     /// The slab file's offset of `location`.
     pub fn offset(&self, location: Location) -> u64 {
         u64::from(location.extent) * self.config.extent_size + location.offset

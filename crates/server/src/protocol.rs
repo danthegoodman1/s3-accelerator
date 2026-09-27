@@ -1,7 +1,9 @@
-//! How gateways and storage nodes talk: HTTP/1.1, one request per read.
-//! The request's path names the object, and headers say what to read; the
-//! node's answer is a response with its body, the object's metadata, or word
-//! that the object changed. Every request carries the cluster's secret.
+//! How gateways and storage nodes talk, and nodes to each other: HTTP/1.1,
+//! one request per read. The request's path names the object, and headers
+//! say what to read; the node's answer is a response with its body, the
+//! object's metadata, word that the object changed, or its ring. Every
+//! request carries the cluster's secret, and every answer the version of
+//! the node's ring.
 //!
 //! `Content-Length` always counts the body bytes that follow. A response's
 //! own length, which a HEAD read answers without a body, travels in
@@ -14,7 +16,9 @@ use crate::origin::is_object_header;
 use crate::sigv4;
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use s3_accelerator_core::node::{ObjectMeta, RangeRead, Read};
+use s3_accelerator_core::placement::{Member, NodeId, Ring};
 use s3_accelerator_core::s3::{ETag, Method, ObjectKey, Request, ResponseHead};
+use std::collections::BTreeMap;
 
 pub const SECRET: &str = "x-accel-secret";
 const KIND: &str = "x-accel-read";
@@ -31,6 +35,8 @@ const META_ETAG: &str = "x-accel-meta-etag";
 const META_SIZE: &str = "x-accel-meta-size";
 const META_AGE: &str = "x-accel-meta-age";
 const META_HEADER: &str = "x-accel-meta-header";
+const RING: &str = "x-accel-ring";
+const RING_MEMBERS: &str = "x-accel-ring-members";
 
 /// What a gateway asks of a node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +44,8 @@ pub enum NodeRequest {
     Read(Read),
     /// A write to the key passed through the gateway and succeeded.
     Written(ObjectKey),
+    /// The node's ring.
+    Ring,
 }
 
 /// A node's answer to a gateway.
@@ -50,6 +58,11 @@ pub enum NodeAnswer {
     Metadata(ObjectMeta),
     Stale,
     Written,
+    /// The node's ring, and where each of its nodes is reached.
+    Ring {
+        ring: Ring,
+        addresses: BTreeMap<NodeId, String>,
+    },
 }
 
 /// A request's method, target and headers.
@@ -60,6 +73,10 @@ pub fn encode_request(
     let mut headers = vec![(SECRET.to_string(), secret.to_string())];
     let mut add = |name: &str, value: String| headers.push((name.to_string(), value));
     let key = match request {
+        NodeRequest::Ring => {
+            add(KIND, "ring".into());
+            return ("GET", "/".into(), headers);
+        }
         NodeRequest::Written(key) => {
             add(KIND, "written".into());
             key
@@ -92,26 +109,37 @@ pub fn encode_request(
             }
             &request.key
         }
-        NodeRequest::Read(Read::Range(range)) => {
-            add(KIND, "range".into());
+        NodeRequest::Read(Read::Range(range)) | NodeRequest::Read(Read::Stored(range)) => {
+            let kind = match request {
+                NodeRequest::Read(Read::Stored(_)) => "stored",
+                _ => "range",
+            };
+            add(KIND, kind.into());
             add(ETAG, range.etag.0.clone());
             add(SIZE, range.size.to_string());
             add(FIRST, range.first.to_string());
             add(LAST, range.last.to_string());
             &range.key
         }
+        NodeRequest::Read(Read::Known(key)) => {
+            add(KIND, "known".into());
+            key
+        }
     };
     let method = match request {
         NodeRequest::Written(_) => "POST",
-        NodeRequest::Read(_) => "GET",
+        NodeRequest::Read(_) | NodeRequest::Ring => "GET",
     };
     (method, path(key), headers)
 }
 
 /// The request a gateway sent, from its path and headers.
 pub fn decode_request(path: &str, headers: &[(String, String)]) -> Result<NodeRequest, String> {
-    let key = key(path)?;
     let field = |name: &str| header(headers, name).ok_or_else(|| format!("no {name}"));
+    if field(KIND)? == "ring" {
+        return Ok(NodeRequest::Ring);
+    }
+    let key = key(path)?;
     let number = |name: &str| -> Result<u64, String> {
         field(name)?
             .parse()
@@ -120,15 +148,20 @@ pub fn decode_request(path: &str, headers: &[(String, String)]) -> Result<NodeRe
     let condition = |name: &str| {
         etag_condition(header(headers, name)).ok_or_else(|| format!("{name} names no one ETag"))
     };
-    match field(KIND)? {
-        "written" => Ok(NodeRequest::Written(key)),
-        "range" => Ok(NodeRequest::Read(Read::Range(RangeRead {
+    let range = |key: ObjectKey| -> Result<RangeRead, String> {
+        Ok(RangeRead {
             key,
             etag: ETag(field(ETAG)?.to_string()),
             size: number(SIZE)?,
             first: number(FIRST)?,
             last: number(LAST)?,
-        }))),
+        })
+    };
+    match field(KIND)? {
+        "written" => Ok(NodeRequest::Written(key)),
+        "range" => Ok(NodeRequest::Read(Read::Range(range(key)?))),
+        "stored" => Ok(NodeRequest::Read(Read::Stored(range(key)?))),
+        "known" => Ok(NodeRequest::Read(Read::Known(key))),
         "object" => {
             let method = match field(METHOD)? {
                 "GET" => Method::Get,
@@ -152,9 +185,10 @@ pub fn decode_request(path: &str, headers: &[(String, String)]) -> Result<NodeRe
     }
 }
 
-/// An answer's status and headers. A `Respond` answer's body follows it.
-pub fn encode_answer(answer: &NodeAnswer) -> (u16, Vec<(String, String)>) {
-    let mut headers = Vec::new();
+/// An answer's status and headers, which name the version of the node's
+/// ring. A `Respond` answer's body follows it.
+pub fn encode_answer(answer: &NodeAnswer, ring: u64) -> (u16, Vec<(String, String)>) {
+    let mut headers = vec![(RING.to_string(), format!("{ring:016x}"))];
     let status = match answer {
         NodeAnswer::Respond { head, meta } => {
             headers.push((ANSWER.to_string(), "respond".into()));
@@ -184,8 +218,26 @@ pub fn encode_answer(answer: &NodeAnswer) -> (u16, Vec<(String, String)>) {
             headers.push((ANSWER.to_string(), "written".into()));
             200
         }
+        NodeAnswer::Ring { ring, addresses } => {
+            headers.push((ANSWER.to_string(), "ring".into()));
+            let members: Vec<String> = ring
+                .members()
+                .iter()
+                .map(|member| {
+                    let address = addresses.get(&member.id).map_or("", String::as_str);
+                    format!("{}:{}@{address}", member.id.0, member.weight)
+                })
+                .collect();
+            headers.push((RING_MEMBERS.to_string(), members.join(",")));
+            200
+        }
     };
     (status, headers)
+}
+
+/// The version of the ring of the node that answered.
+pub fn ring_version(headers: &[(String, String)]) -> Option<u64> {
+    u64::from_str_radix(header(headers, RING)?, 16).ok()
 }
 
 pub fn decode_answer(status: u16, headers: &[(String, String)]) -> Result<NodeAnswer, String> {
@@ -214,6 +266,30 @@ pub fn decode_answer(status: u16, headers: &[(String, String)]) -> Result<NodeAn
         "metadata" => Ok(NodeAnswer::Metadata(decode_meta(headers)?)),
         "stale" => Ok(NodeAnswer::Stale),
         "written" => Ok(NodeAnswer::Written),
+        "ring" => {
+            let version = ring_version(headers).ok_or_else(|| format!("no {RING}"))?;
+            let mut addresses = BTreeMap::new();
+            let members = field(RING_MEMBERS)?
+                .split(',')
+                .filter(|member| !member.is_empty())
+                .map(|entry| {
+                    let parsed = entry.split_once('@').and_then(|(member, address)| {
+                        let (id, weight) = member.split_once(':')?;
+                        let member = Member {
+                            id: NodeId(id.parse().ok()?),
+                            weight: weight.parse().ok()?,
+                        };
+                        if !address.is_empty() {
+                            addresses.insert(member.id, address.to_string());
+                        }
+                        Some(member)
+                    });
+                    parsed.ok_or_else(|| format!("{RING_MEMBERS} {entry}"))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let ring = Ring::new(version, members);
+            Ok(NodeAnswer::Ring { ring, addresses })
+        }
         other => Err(format!("{ANSWER} {other}")),
     }
 }
@@ -318,7 +394,16 @@ mod tests {
             first: 10,
             last: 20,
         })));
+        round_trip(NodeRequest::Read(Read::Stored(RangeRead {
+            key: key(),
+            etag: ETag("\"d\"".into()),
+            size: 50,
+            first: 0,
+            last: 49,
+        })));
+        round_trip(NodeRequest::Read(Read::Known(key())));
         round_trip(NodeRequest::Written(key()));
+        round_trip(NodeRequest::Ring);
     }
 
     #[test]
@@ -340,6 +425,15 @@ mod tests {
             content_length: 10,
             headers: vec![("content-type".into(), "text/plain".into())],
         };
+        let member = |id, weight| Member {
+            id: NodeId(id),
+            weight: std::num::NonZeroU32::new(weight).unwrap(),
+        };
+        let ring = Ring::new(0xfeed, vec![member(1, 2), member(7, 1)]);
+        let addresses = BTreeMap::from([
+            (NodeId(1), "10.0.0.1:9100".to_string()),
+            (NodeId(7), "cache-7.internal:9100".to_string()),
+        ]);
         for answer in [
             NodeAnswer::Respond {
                 head: head.clone(),
@@ -349,8 +443,15 @@ mod tests {
             NodeAnswer::Metadata(meta),
             NodeAnswer::Stale,
             NodeAnswer::Written,
+            NodeAnswer::Ring { ring, addresses },
         ] {
-            let (status, headers) = encode_answer(&answer);
+            // A node's answer names its ring, which a ring answer carries.
+            let version = match &answer {
+                NodeAnswer::Ring { ring, .. } => ring.version(),
+                _ => 0xabc,
+            };
+            let (status, headers) = encode_answer(&answer, version);
+            assert_eq!(ring_version(&headers), Some(version));
             assert_eq!(decode_answer(status, &headers), Ok(answer));
         }
     }

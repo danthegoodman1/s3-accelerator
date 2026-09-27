@@ -84,6 +84,11 @@ pub enum Action {
     /// Drop the body of the node's response to `id`, which the client's
     /// response will not use.
     Discard { id: NodeRequestId },
+    /// Fetch the ring from `node`, and pass it to `on_ring`.
+    FetchRing { node: NodeId },
+    /// Every node the ring names for a read failed: fetch the ring from a
+    /// node the owner knows of otherwise, and pass it to `on_ring`.
+    FindRing,
 }
 
 pub struct Gateway {
@@ -97,6 +102,8 @@ pub struct Gateway {
     parts: BTreeMap<NodeRequestId, Part>,
     /// Nodes that timed out, and until when the gateway routes around them.
     suspects: BTreeMap<NodeId, Time>,
+    /// When the gateway last asked a node for its ring, until it arrives.
+    fetching_ring: Option<Time>,
     actions: Vec<Action>,
 }
 
@@ -213,8 +220,37 @@ impl Gateway {
             reads: BTreeMap::new(),
             parts: BTreeMap::new(),
             suspects: BTreeMap::new(),
+            fetching_ring: None,
             actions: Vec::new(),
         }
+    }
+
+    /// The ring the gateway routes by.
+    pub fn ring(&self) -> &Ring {
+        &self.ring
+    }
+
+    /// A node answered with its ring's version. A version other than the
+    /// gateway's means the ring changed, so the gateway fetches it from
+    /// that node, one fetch at a time.
+    pub fn on_ring_version(&mut self, now: Time, from: NodeId, version: u64) {
+        self.now = self.now.max(now);
+        let fetching = self
+            .fetching_ring
+            .is_some_and(|since| now.0 < since.0 + self.config.node_timeout);
+        if version == self.ring.version() || fetching {
+            return;
+        }
+        self.fetching_ring = Some(now);
+        self.actions.push(Action::FetchRing { node: from });
+    }
+
+    /// A node sent its ring. Reads in progress keep the nodes they went
+    /// to; later ones go by this ring.
+    pub fn on_ring(&mut self, now: Time, ring: Ring) {
+        self.now = self.now.max(now);
+        self.fetching_ring = None;
+        self.ring = ring;
     }
 
     /// True when no read is in progress.
@@ -423,7 +459,22 @@ impl Gateway {
             Some(node) => {
                 self.dispatch(id, What::Object(read, placement), node, Vec::new());
             }
-            None => self.respond(id, ResponseHead::status(503)),
+            None => {
+                self.find_ring(now);
+                self.respond(id, ResponseHead::status(503));
+            }
+        }
+    }
+
+    /// The ring named no node that could serve a read, and may name only
+    /// nodes that are gone: the gateway asks for the ring elsewhere.
+    fn find_ring(&mut self, now: Time) {
+        let fetching = self
+            .fetching_ring
+            .is_some_and(|since| now.0 < since.0 + self.config.node_timeout);
+        if !fetching {
+            self.fetching_ring = Some(now);
+            self.actions.push(Action::FindRing);
         }
     }
 
@@ -439,6 +490,8 @@ impl Gateway {
         let runs = self.runs(&request.key, meta.size, first, last);
         let Some(parts) = self.dispatch_runs(id, &request.key, &meta.etag, meta.size, runs, &[])
         else {
+            let now = self.now;
+            self.find_ring(now);
             return self.respond(id, ResponseHead::status(503));
         };
         let read = self.reads.get_mut(&id).expect("planned read exists");
@@ -569,6 +622,7 @@ impl Gateway {
             } => self.dispatch_runs(part.read, &key, &etag, size, runs, &tried),
         };
         let Some(replacements) = replacements else {
+            self.find_ring(now);
             if matches!(self.reads[&part.read].stage, Stage::Streaming { .. }) {
                 return self.abort(part.read);
             }

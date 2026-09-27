@@ -25,12 +25,15 @@ from pathlib import Path
 NODE = "crates/core/src/node.rs"
 STORE = "crates/core/src/store.rs"
 GATEWAY = "crates/core/src/gateway.rs"
+MEMBERSHIP = "crates/core/src/membership.rs"
 SERVER = "crates/server/src/server.rs"
 DISK = "crates/server/src/disk.rs"
 HTTP = "crates/server/src/http.rs"
 NODE_ENGINE = "crates/server/src/node_engine.rs"
 ORIGIN = "crates/server/src/origin.rs"
 ZERO_COPY = "crates/server/src/zero_copy.rs"
+MEMBERSHIP_ENGINE = "crates/server/src/membership_engine.rs"
+GATEWAY_ENGINE = "crates/server/src/gateway_engine.rs"
 STEP_TIMEOUT = 600
 
 MUTANTS = [
@@ -51,11 +54,11 @@ MUTANTS = [
     ),
     (
         "doorkeeper admits on the first read",
-        [(NODE, "if !self.policy(&key.bucket).admit_on_first_read && !self.doorkeeper.contains(hash) {", "if false {")],
+        [(NODE, "&& !self.policy(&key.bucket).admit_on_first_read\n            && !self.doorkeeper.contains(hash)", "&& false")],
     ),
     (
         "response leaves its blocks unpinned",
-        [(NODE, "self.store.pin(block);\n                holds.pins.push(block);", "")],
+        [(NODE, "if let Some((location, awaited)) = slot {\n                self.store.pin(block);\n                holds.pins.push(block);", "if let Some((location, awaited)) = slot {")],
     ),
     (
         "write leaves its body unheld",
@@ -108,6 +111,83 @@ MUTANTS = [
         "a copy's source is not checked against the grants",
         [(SERVER, 'if let Some(source) = header(&head.headers, "x-amz-copy-source") {',
           "if let Some(source) = None::<&str> {")],
+    ),
+    (
+        "a down node leaves the ring at once",
+        [(MEMBERSHIP, "self.down.retain(|_, (_, since)| now.0 < since.0 + grace);", "self.down.retain(|_, _| false);")],
+    ),
+    (
+        "a leaving node stays in the ring",
+        [(MEMBERSHIP, "true => weights.remove(&peer.id),", "true => weights.insert(peer.id, peer.weight),")],
+    ),
+    (
+        "a restarted node loses to its earlier run",
+        [(MEMBERSHIP, "(self.run, self.leaving) > (adversary.run, adversary.leaving)",
+          "(self.run, self.leaving) < (adversary.run, adversary.leaving)")],
+    ),
+    (
+        "fallback outside the fallback window",
+        [(NODE, "if self.now >= *until {\n            return None;\n        }", ""),
+         (NODE, "self.previous = None;\n            self.written.clear();", "self.written.clear();")],
+    ),
+    (
+        "owned blocks are evicted before disowned ones",
+        [(STORE, "for _ in 0..self.disowned.len() {", "for _ in 0..0 {")],
+    ),
+    (
+        "a joining node takes no previous ring",
+        [(NODE, "if before.members().iter().any(|member| member.id == self.id) {", "if true {")],
+    ),
+    (
+        "new owners never ask previous owners for blocks",
+        [(NODE, "true => self.previous_owner(placement),", "true => None,")],
+    ),
+    (
+        "a new home never asks the previous home",
+        [(NODE, "None if let Some(peer) = previous_home => {", "None if let Some(peer) = previous_home.filter(|_| false) => {")],
+    ),
+    (
+        "a previous home's metadata outlives a write",
+        [(NODE, "(!written).then_some((meta, validated))", "Some((meta, validated)).filter(|_| written || !written)")],
+    ),
+    (
+        "blocks a previous owner lacks are not read from S3",
+        [(NODE, "if !valid && request.peer.is_some() {\n            return self.refill(origin);\n        }", "")],
+    ),
+    (
+        "blocks from a previous owner wait for the doorkeeper",
+        [(NODE, "if let Some(location) = self.admit(key, size, block, peer.is_some()) {",
+          "if let Some(location) = self.admit(key, size, block, false) {")],
+    ),
+    (
+        "nodes never announce again to silent seeds",
+        [(MEMBERSHIP, "self.announce(&silent);", "let _ = silent;")],
+    ),
+    (
+        "a gateway never asks for the ring elsewhere",
+        [(GATEWAY, "self.actions.push(Action::FindRing);", "")],
+    ),
+    (
+        "a first fetch lets an eviction drop its version",
+        [(NODE, "self.refer(version);\n        let layout = self.config.layout;\n        for index in layout.blocks_covering(first, last) {",
+          "let layout = self.config.layout;\n        for index in layout.blocks_covering(first, last) {"),
+         (NODE, "self.unref(version);\n    }\n\n    fn revalidated(", "self.forget_if_unused(version);\n    }\n\n    fn revalidated(")],
+    ),
+    (
+        "a starting node takes no ring from its seeds",
+        [(MEMBERSHIP_ENGINE, "NodeEngine::on_joined(&node, ring);", "let _ = ring;")],
+    ),
+    (
+        "a leaving node never stops",
+        [(SERVER, "membership_engine::leave(&membership);\n                let _ = stopper.send(true);", "membership_engine::leave(&membership);")],
+    ),
+    (
+        "gateways learn no addresses from rings",
+        [(GATEWAY_ENGINE, "peers.learn(&addresses);", "let _ = &addresses;")],
+    ),
+    (
+        "gateways ignore ring versions",
+        [(GATEWAY, "if version == self.ring.version() || fetching {", "if true {")],
     ),
     (
         "a key list of any size is read",
@@ -221,8 +301,8 @@ MUTANTS = [
     ),
     (
         "nodes never give up on S3 requests",
-        [(NODE, ".filter(|(_, request)| !request.answered && request.sent.0 + timeout <= now.0)",
-          ".filter(|(_, request)| !request.answered && request.sent.0 + timeout <= now.0 && false)")],
+        [(NODE, ".filter(|(_, request)| !request.answered && request.sent.0 + request.timeout <= now.0)",
+          ".filter(|(_, request)| !request.answered && request.sent.0 + request.timeout <= now.0 && false)")],
     ),
     (
         "gateways never fail over",
@@ -325,8 +405,8 @@ MUTANTS = [
     ),
     (
         "a late reader joins a streaming body",
-        [(NODE, "if let Some(location) = self.admit(key, meta.size, block) {\n                self.write(location, origin, span.start - first, span.end - span.start);",
-          "self.track_in_flight(block, origin);\n            if let Some(location) = self.admit(key, meta.size, block) {\n                self.write(location, origin, span.start - first, span.end - span.start);")],
+        [(NODE, "if let Some(location) = self.admit(key, meta.size, block, false) {\n                self.write(location, origin, span.start - first, span.end - span.start);",
+          "self.track_in_flight(block, origin);\n            if let Some(location) = self.admit(key, meta.size, block, false) {\n                self.write(location, origin, span.start - first, span.end - span.start);")],
     ),
     (
         "a fill spans more than a chunk",

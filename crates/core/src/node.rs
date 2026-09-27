@@ -47,6 +47,12 @@ pub enum Read {
     },
     /// Bytes of one version, sent to the node that owns them.
     Range(RangeRead),
+    /// Bytes of one version that a node took over from this one: answered
+    /// from stored blocks only, and with 404 if any is missing.
+    Stored(RangeRead),
+    /// The metadata this node knows for an object whose home it was:
+    /// answered with `Action::Metadata`, or with 404 if it knows none.
+    Known(ObjectKey),
 }
 
 /// Bytes `first..=last` of the version `etag` of an object of `size`
@@ -100,6 +106,12 @@ pub struct Config {
     /// Milliseconds after which an unanswered S3 request is abandoned and
     /// treated as S3 failing with 503.
     pub origin_timeout: u64,
+    /// Milliseconds after a ring change during which the node keeps the
+    /// previous ring, and asks previous owners for blocks first.
+    pub fallback_window: u64,
+    /// Milliseconds a previous owner has to answer before the node goes to
+    /// S3 instead, and stops asking it until the next ring change.
+    pub peer_timeout: u64,
     pub default_policy: BucketPolicy,
     pub buckets: BTreeMap<String, BucketPolicy>,
 }
@@ -152,6 +164,14 @@ pub enum Action {
         origin: OriginRequestId,
         request: Request,
         streams: bool,
+    },
+    /// Send `read`, a `Stored` or `Known` read, to node `peer`. Its answer
+    /// to a `Stored` read goes to `on_origin_response`, its body held like
+    /// a fill's; its answer to a `Known` read goes to `on_peer_metadata`.
+    PeerFetch {
+        origin: OriginRequestId,
+        peer: NodeId,
+        read: Read,
     },
     /// Answer the gateway with `head`, then `body`. Call `on_sent` once the
     /// body is sent. A home that knows the object's metadata includes it.
@@ -225,6 +245,11 @@ pub struct Stats {
     /// failed.
     pub verified_blocks: u64,
     pub corrupt_blocks: u64,
+    /// Reads sent to previous owners, objects whose metadata a previous
+    /// home supplied, and body bytes served from previous owners' blocks.
+    pub peer_requests: u64,
+    pub peer_metadata: u64,
+    pub peer_bytes: u64,
 }
 
 impl std::ops::AddAssign for Stats {
@@ -237,6 +262,9 @@ impl std::ops::AddAssign for Stats {
         self.evicted_blocks += other.evicted_blocks;
         self.verified_blocks += other.verified_blocks;
         self.corrupt_blocks += other.corrupt_blocks;
+        self.peer_requests += other.peer_requests;
+        self.peer_metadata += other.peer_metadata;
+        self.peer_bytes += other.peer_bytes;
     }
 }
 
@@ -254,6 +282,13 @@ pub struct Node {
     /// The latest time an input carried.
     now: Time,
     ring: Ring,
+    /// The ring before the last change, until the fallback window ends.
+    previous: Option<(Ring, Time)>,
+    /// Previous owners that failed to answer since the last ring change.
+    unreachable: BTreeSet<NodeId>,
+    /// Writes to keys this node knew nothing of, during the fallback
+    /// window: a previous home's metadata validated before one is stale.
+    written: BTreeMap<ObjectKey, Time>,
     config: Config,
     objects: BTreeMap<ObjectKey, Object>,
     /// Known objects by when they were last used, oldest first.
@@ -327,6 +362,10 @@ struct OriginRequest {
     purpose: Purpose,
     method: Method,
     sent: Time,
+    /// How long it has to answer.
+    timeout: u64,
+    /// The node asked, when it is a peer rather than S3.
+    peer: Option<NodeId>,
     answered: bool,
     /// Timed out: its response, if it comes, is the owner's to drop.
     cancelled: bool,
@@ -361,6 +400,13 @@ enum Purpose {
         version: VersionId,
         last_byte: u64,
         stored: Vec<(BlockKey, Location)>,
+    },
+    /// Metadata asked of the object's previous home, for the request that
+    /// found none.
+    PeerMeta {
+        key: ObjectKey,
+        request: GatewayRequestId,
+        sent: Time,
     },
 }
 
@@ -407,6 +453,9 @@ impl Node {
             id,
             now: Time::default(),
             ring,
+            previous: None,
+            unreachable: BTreeSet::new(),
+            written: BTreeMap::new(),
             store: Store::new(config.store),
             doorkeeper: Doorkeeper::new(config.doorkeeper_window),
             config,
@@ -612,6 +661,81 @@ impl Node {
                 self.serve(now, id);
             }
             Read::Range(range) => self.read_range(now, id, range),
+            Read::Stored(range) => self.serve_stored(id, range),
+            Read::Known(key) => self.serve_known(id, &key),
+        }
+    }
+
+    /// Answers a new owner's read from stored blocks, or with 404 if any
+    /// is missing or unverified. The blocks gain no hits, since their new
+    /// owner will hold them.
+    fn serve_stored(&mut self, id: GatewayRequestId, range: RangeRead) {
+        let layout = self.config.layout;
+        let version = VersionId::of(&range.key, &range.etag);
+        let mut blocks = Vec::new();
+        let valid = range.first <= range.last && range.last < range.size;
+        for index in layout
+            .blocks_covering(range.first, range.last)
+            .filter(|_| valid)
+        {
+            let block = BlockKey { version, index };
+            match self.store.get(&block) {
+                Some(entry) if entry.state == BlockState::Ready && entry.verify.is_none() => {
+                    blocks.push((block, entry.location, layout.block_span(range.size, index)));
+                }
+                _ => {
+                    blocks.clear();
+                    break;
+                }
+            }
+        }
+        if blocks.is_empty() {
+            let head = ResponseHead::status(404);
+            return self.respond(id, head, Vec::new(), Holds::default(), None);
+        }
+        let mut holds = Holds::default();
+        let mut body = Vec::new();
+        for (block, location, span) in blocks {
+            self.store.pin(block);
+            holds.pins.push(block);
+            let piece = span.start.max(range.first)..span.end.min(range.last + 1);
+            body.push(Segment::Slot {
+                location,
+                offset: piece.start - span.start,
+                len: piece.end - piece.start,
+            });
+        }
+        let head = ResponseHead {
+            status: 206,
+            etag: Some(range.etag.clone()),
+            content_range: Some(ContentRange {
+                first: range.first,
+                last: range.last,
+                size: range.size,
+            }),
+            content_length: range.last - range.first + 1,
+            headers: Vec::new(),
+        };
+        self.respond(id, head, body, holds, None);
+    }
+
+    /// Tells an object's new home the metadata this node knows, however
+    /// old, or answers 404.
+    fn serve_known(&mut self, id: GatewayRequestId, key: &ObjectKey) {
+        match self.objects.get(key) {
+            Some(Object::Known {
+                meta, validated, ..
+            }) => {
+                let meta = shared(meta, *validated, self.now);
+                self.actions.push(Action::Metadata { request: id, meta });
+            }
+            _ => self.respond(
+                id,
+                ResponseHead::status(404),
+                Vec::new(),
+                Holds::default(),
+                None,
+            ),
         }
     }
 
@@ -676,7 +800,7 @@ impl Node {
     fn object_request(&self, id: GatewayRequestId) -> &Request {
         match &self.waiting[&id].read {
             Read::Object { request, .. } => request,
-            Read::Range(_) => unreachable!("only object reads need metadata"),
+            _ => unreachable!("only object reads need metadata"),
         }
     }
 
@@ -687,6 +811,8 @@ impl Node {
         };
         request.answered = true;
         match &request.purpose {
+            // A previous home that answers without metadata has none.
+            Purpose::PeerMeta { .. } => return self.on_peer_metadata(now, origin, None),
             Purpose::First {
                 key,
                 request,
@@ -713,6 +839,9 @@ impl Node {
     /// metadata no longer holds.
     pub fn on_write(&mut self, now: Time, key: &ObjectKey) {
         self.now = self.now.max(now);
+        if self.previous.is_some() {
+            self.written.insert(key.clone(), self.now);
+        }
         if self.policy(&key.bucket).freshness == Freshness::Immutable {
             let key = key.clone();
             self.actions.push(Action::Forget { key });
@@ -734,24 +863,85 @@ impl Node {
         }
     }
 
+    /// The ring the node places blocks by.
+    pub fn ring(&self) -> &Ring {
+        &self.ring
+    }
+
+    /// Membership changed the ring. The node keeps the previous one for
+    /// the fallback window.
+    pub fn on_ring(&mut self, now: Time, ring: Ring) {
+        self.now = self.now.max(now);
+        if ring == self.ring {
+            return;
+        }
+        let until = Time(self.now.0 + self.config.fallback_window);
+        let previous = std::mem::replace(&mut self.ring, ring);
+        self.previous = Some((previous, until));
+        self.unreachable.clear();
+    }
+
+    /// The node is joining a cluster whose ring, before it arrived, was
+    /// `before`. If that ring lacks this node, the node took its placements
+    /// from others, and asks them first until the fallback window ends.
+    pub fn on_joined(&mut self, now: Time, before: Ring) {
+        self.now = self.now.max(now);
+        if before.members().iter().any(|member| member.id == self.id) {
+            return;
+        }
+        let until = Time(self.now.0 + self.config.fallback_window);
+        self.previous = Some((before, until));
+        self.unreachable.clear();
+    }
+
+    /// The node that owned `placement` before the last ring change, while
+    /// the fallback window lasts, unless it is this node or failed to
+    /// answer.
+    fn previous_owner(&self, placement: PlacementHash) -> Option<NodeId> {
+        let (ring, until) = self.previous.as_ref()?;
+        if self.now >= *until {
+            return None;
+        }
+        ring.owner(placement)
+            .filter(|owner| *owner != self.id && !self.unreachable.contains(owner))
+    }
+
     /// Time passed: S3 requests unanswered past the timeout are abandoned,
-    /// and whatever waited on them proceeds as if S3 failed with 503.
+    /// and whatever waited on them proceeds as if S3 failed with 503. The
+    /// previous ring goes once the fallback window ends.
     pub fn on_tick(&mut self, now: Time) {
         self.now = self.now.max(now);
-        let timeout = self.config.origin_timeout;
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|(_, until)| *until <= self.now)
+        {
+            self.previous = None;
+            self.written.clear();
+            // Blocks placed elsewhere now go before any this node owns.
+            let (ring, id) = (&self.ring, self.id);
+            self.store
+                .disown(|placement| ring.owner(placement) == Some(id));
+        }
         let expired: Vec<OriginRequestId> = self
             .origins
             .iter()
-            .filter(|(_, request)| !request.answered && request.sent.0 + timeout <= now.0)
+            .filter(|(_, request)| !request.answered && request.sent.0 + request.timeout <= now.0)
             .map(|(&origin, _)| origin)
             .collect();
         for origin in expired {
-            self.origins
-                .get_mut(&origin)
-                .expect("expired request")
-                .cancelled = true;
+            let request = self.origins.get_mut(&origin).expect("expired request");
+            request.cancelled = true;
+            let (peer, asks_metadata) = (
+                request.peer,
+                matches!(request.purpose, Purpose::PeerMeta { .. }),
+            );
             self.actions.push(Action::Cancel { origin });
-            self.on_origin_response(now, origin, ResponseHead::status(503));
+            self.unreachable.extend(peer);
+            match asks_metadata {
+                true => self.on_peer_metadata(now, origin, None),
+                false => self.on_origin_response(now, origin, ResponseHead::status(503)),
+            }
         }
     }
 
@@ -867,7 +1057,22 @@ impl Node {
                 return self.first_fetch(now, id, Request::head(key), Vec::new(), false);
             }
         }
+        let previous_home = self.previous_owner(Placement::Home(&key).hash());
         match self.objects.get_mut(&key) {
+            None if let Some(peer) = previous_home => {
+                let purpose = Purpose::PeerMeta {
+                    key: key.clone(),
+                    request: id,
+                    sent: now,
+                };
+                let origin = self.ask_peer(purpose, peer, Read::Known(key.clone()), 0);
+                let fetching = Object::Fetching {
+                    origin,
+                    waiting: Vec::new(),
+                    superseded: false,
+                };
+                self.objects.insert(key, fetching);
+            }
             None => {
                 let client = self.object_request(id);
                 let request = Request {
@@ -891,7 +1096,7 @@ impl Node {
                     Read::Object { stale, .. } => {
                         stale.take().is_some_and(|stale| stale == meta.etag)
                     }
-                    Read::Range(_) => false,
+                    _ => false,
                 };
                 let fresh = !reported_stale
                     && match freshness {
@@ -968,6 +1173,8 @@ impl Node {
                 purpose,
                 method: request.method,
                 sent: self.now,
+                timeout: self.config.origin_timeout,
+                peer: None,
                 answered: false,
                 cancelled: false,
                 body_start,
@@ -983,6 +1190,105 @@ impl Node {
             streams,
         });
         origin
+    }
+
+    /// Sends `read` to `peer`, whose answer's body, if it has one, starts
+    /// at the object's byte `body_start`.
+    fn ask_peer(
+        &mut self,
+        purpose: Purpose,
+        peer: NodeId,
+        read: Read,
+        body_start: u64,
+    ) -> OriginRequestId {
+        let origin = OriginRequestId(self.next_origin);
+        self.next_origin += 1;
+        self.origins.insert(
+            origin,
+            OriginRequest {
+                purpose,
+                method: Method::Get,
+                sent: self.now,
+                timeout: self.config.peer_timeout,
+                peer: Some(peer),
+                answered: false,
+                cancelled: false,
+                body_start,
+                readers: 0,
+                blocks: Vec::new(),
+                waiters: Vec::new(),
+            },
+        );
+        self.stats.peer_requests += 1;
+        self.actions.push(Action::PeerFetch { origin, peer, read });
+        origin
+    }
+
+    /// The object's previous home answered with the metadata it knows, or
+    /// with none. Metadata counts as validated when it was asked for, less
+    /// its age, and a write since then makes it useless. Without it, the
+    /// home fetches the object from S3.
+    pub fn on_peer_metadata(
+        &mut self,
+        now: Time,
+        origin: OriginRequestId,
+        meta: Option<ObjectMeta>,
+    ) {
+        self.now = self.now.max(now);
+        let Some(request) = self.origins.get(&origin) else {
+            return;
+        };
+        let Purpose::PeerMeta {
+            key,
+            request: id,
+            sent,
+        } = &request.purpose
+        else {
+            return;
+        };
+        let (key, id, sent) = (key.clone(), *id, *sent);
+        self.origins.remove(&origin);
+        let (waiters, superseded) = match self.objects.remove(&key) {
+            Some(Object::Fetching {
+                origin: fetch,
+                waiting,
+                superseded,
+            }) if fetch == origin => (waiting, superseded),
+            other => {
+                self.objects.extend(other.map(|object| (key, object)));
+                return;
+            }
+        };
+        let usable = meta.filter(|_| !superseded).and_then(|meta| {
+            let validated = Time(sent.0.saturating_sub(meta.age));
+            let written = self
+                .written
+                .get(&key)
+                .is_some_and(|&written| written >= validated);
+            (!written).then_some((meta, validated))
+        });
+        let Some((meta, validated)) = usable else {
+            let client = self.object_request(id);
+            let request = Request {
+                method: client.method,
+                key: key.clone(),
+                range: client.range,
+                if_match: None,
+                if_none_match: None,
+            };
+            return self.first_fetch(now, id, request, waiters, true);
+        };
+        self.stats.peer_metadata += 1;
+        let meta = Meta {
+            etag: meta.etag,
+            size: meta.size,
+            headers: meta.headers,
+        };
+        self.know(key, meta, validated);
+        self.serve(now, id);
+        for waiter in waiters {
+            self.serve(now, waiter);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1118,6 +1424,9 @@ impl Node {
         last: u64,
     ) {
         let version = self.version(key, &meta.etag);
+        // Admitting a block may evict another of this version, which must
+        // not take the version with it.
+        self.refer(version);
         let layout = self.config.layout;
         for index in layout.blocks_covering(first, last) {
             let span = layout.block_span(meta.size, index);
@@ -1131,11 +1440,11 @@ impl Node {
             }
             // The body streams, so later readers wait for the block's write
             // and read its slot instead of joining the body.
-            if let Some(location) = self.admit(key, meta.size, block) {
+            if let Some(location) = self.admit(key, meta.size, block, false) {
                 self.write(location, origin, span.start - first, span.end - span.start);
             }
         }
-        self.forget_if_unused(version);
+        self.unref(version);
     }
 
     fn revalidated(
@@ -1371,12 +1680,30 @@ impl Node {
             last_byte,
             stored: Vec::new(),
         };
-        let origin = self.fetch(purpose, request);
+        // A run lies within one chunk, so one node owns it, and owned it.
+        let placement = layout.placement(key, size, *run.start()).hash();
+        let peer = match self.ring.owner(placement) == Some(self.id) {
+            true => self.previous_owner(placement),
+            false => None,
+        };
+        let origin = match peer {
+            Some(peer) => {
+                let read = Read::Stored(RangeRead {
+                    key: key.clone(),
+                    etag: etag.clone(),
+                    size,
+                    first,
+                    last: last_byte,
+                });
+                self.ask_peer(purpose, peer, read, first)
+            }
+            None => self.fetch(purpose, request),
+        };
         let mut stored = Vec::new();
         for index in run {
             let block = BlockKey { version, index };
             self.track_in_flight(block, origin);
-            if let Some(location) = self.admit(key, size, block) {
+            if let Some(location) = self.admit(key, size, block, peer.is_some()) {
                 stored.push((block, location));
             }
         }
@@ -1404,6 +1731,9 @@ impl Node {
         let valid = head.status == 206
             && head.etag.as_ref() == Some(etag)
             && head.content_range.map(|range| (range.first, range.last)) == expected;
+        if !valid && request.peer.is_some() {
+            return self.refill(origin);
+        }
         let waiters = std::mem::take(&mut self.origins.get_mut(&origin).expect("fill").waiters);
         if valid {
             let body_start = self.origins[&origin].body_start;
@@ -1447,6 +1777,82 @@ impl Node {
         for waiter in revalidating {
             self.serve(now, waiter);
         }
+    }
+
+    /// A previous owner lacked the blocks of fill `old`, or never answered:
+    /// the same bytes come from S3, into the same slots, and the requests
+    /// waiting on `old` wait on the new fill instead.
+    fn refill(&mut self, old: OriginRequestId) {
+        let request = &self.origins[&old];
+        let Purpose::Fill {
+            version,
+            last_byte,
+            stored,
+        } = &request.purpose
+        else {
+            unreachable!("only fills are refilled");
+        };
+        let (version, last_byte, stored) = (*version, *last_byte, stored.clone());
+        let first = request.body_start;
+        let (key, etag) = self.name(version).clone();
+        let s3 = Request {
+            method: Method::Get,
+            key,
+            range: Some(ByteRange::Inclusive {
+                first,
+                last: last_byte,
+            }),
+            if_match: Some(etag),
+            if_none_match: None,
+        };
+        let purpose = Purpose::Fill {
+            version,
+            last_byte,
+            stored,
+        };
+        let new = self.fetch(purpose, s3);
+        let request = self.origins.get_mut(&old).expect("refilled fill");
+        let blocks = std::mem::take(&mut request.blocks);
+        let waiters = std::mem::take(&mut request.waiters);
+        let mut readers = 0;
+        for &waiter in &waiters {
+            let Some(plan) = self
+                .waiting
+                .get_mut(&waiter)
+                .and_then(|waiting| waiting.plan.as_mut())
+            else {
+                continue;
+            };
+            if plan.awaiting.remove(&Await::Fill(old)) {
+                plan.awaiting.insert(Await::Fill(new));
+            }
+            for segment in &mut plan.body {
+                if let Segment::Origin { origin, .. } = segment
+                    && *origin == old
+                {
+                    *origin = new;
+                }
+            }
+            for reader in plan
+                .holds
+                .readers
+                .iter_mut()
+                .filter(|reader| **reader == old)
+            {
+                *reader = new;
+                readers += 1;
+            }
+        }
+        self.origins.get_mut(&old).expect("refilled fill").readers -= readers;
+        for &block in &blocks {
+            if self.in_flight.get(&block) == Some(&old) {
+                self.in_flight.insert(block, new);
+            }
+        }
+        let request = self.origins.get_mut(&new).expect("the new fill");
+        request.readers += readers;
+        request.waiters = waiters;
+        request.blocks = blocks;
     }
 
     /// A fill or verification a request awaited has finished.
@@ -1535,6 +1941,7 @@ impl Node {
                 self.waiting.remove(&id);
                 self.read_range(now, id, range);
             }
+            Read::Stored(_) | Read::Known(_) => unreachable!("peers' reads never wait"),
         }
     }
 
@@ -1605,7 +2012,10 @@ impl Node {
         for segment in &body {
             match segment {
                 Segment::Slot { len, .. } => self.stats.hit_bytes += len,
-                Segment::Origin { len, .. } => self.stats.miss_bytes += len,
+                Segment::Origin { origin, len, .. } => match self.origins[origin].peer {
+                    Some(_) => self.stats.peer_bytes += len,
+                    None => self.stats.miss_bytes += len,
+                },
             }
         }
         self.sending.insert(id, holds);
@@ -1667,15 +2077,26 @@ impl Node {
         request.blocks.push(block);
     }
 
-    /// Reserves a slot if the admission policy stores this block.
-    fn admit(&mut self, key: &ObjectKey, size: u64, block: BlockKey) -> Option<Location> {
+    /// Reserves a slot if the admission policy stores this block. Blocks
+    /// asked of a previous owner skip the doorkeeper: they were read
+    /// before, where they were stored.
+    fn admit(
+        &mut self,
+        key: &ObjectKey,
+        size: u64,
+        block: BlockKey,
+        skip_doorkeeper: bool,
+    ) -> Option<Location> {
         let layout = self.config.layout;
         let placement = layout.placement(key, size, block.index).hash();
         if self.ring.owner(placement) != Some(self.id) {
             return None;
         }
         let hash = block_hash(block.version, layout.block_size(), block.index);
-        if !self.policy(&key.bucket).admit_on_first_read && !self.doorkeeper.contains(hash) {
+        if !skip_doorkeeper
+            && !self.policy(&key.bucket).admit_on_first_read
+            && !self.doorkeeper.contains(hash)
+        {
             self.doorkeeper.insert(hash);
             return None;
         }
@@ -1895,6 +2316,8 @@ mod tests {
             fill_budget: 1_024,
             metadata_capacity,
             origin_timeout: 1_000,
+            fallback_window: 1_000,
+            peer_timeout: 100,
             default_policy: policy,
             buckets: BTreeMap::new(),
         }

@@ -5,17 +5,21 @@
 //! Stored blocks leave with `sendfile` on worker threads, which also write
 //! and verify blocks. A fill's body is held until the node releases it;
 //! every other S3 body passes through as it arrives, to the replies and
-//! slots that read it, and is never held whole.
+//! slots that read it, and is never held whole. After a ring change, the
+//! node reads blocks and metadata from their previous owners over the
+//! cluster protocol, and holds those bodies like fills.
 
 use crate::disk::Disk;
 use crate::http::{Connection, Framing, Response, header};
 use crate::origin::{self, Origin, OriginBody};
+use crate::peers::{Exchanged, Peers};
 use crate::protocol::{self, NodeAnswer, NodeRequest};
 use bytes::Bytes;
 use hyper::body::Incoming;
 use s3_accelerator_core::Time;
 use s3_accelerator_core::node::{self, GatewayRequestId, Node, OriginRequestId, Read, Segment};
-use s3_accelerator_core::s3::{ByteRange, Method, ObjectKey, Request};
+use s3_accelerator_core::placement::{NodeId, Ring};
+use s3_accelerator_core::s3::{ByteRange, Method, ObjectKey, Request, ResponseHead};
 use s3_accelerator_core::store::Location;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -89,6 +93,7 @@ const PAGES_RECHECK: Duration = Duration::from_millis(10);
 pub struct NodeEngine {
     started: Instant,
     origin: Rc<Origin>,
+    peers: Rc<Peers>,
     disk: Arc<Disk>,
     node: Node,
     /// S3 response bodies the node still reads.
@@ -101,6 +106,8 @@ pub struct NodeEngine {
     tasks: BTreeMap<OriginRequestId, tokio::task::AbortHandle>,
     /// Entries appended to the metadata file since it was last synced.
     unsynced_metadata: bool,
+    /// Where each node in the ring is reached, for answering ring requests.
+    addresses: BTreeMap<NodeId, String>,
 }
 
 /// What the node's actions left to start off this thread.
@@ -108,16 +115,28 @@ pub struct NodeEngine {
 struct Work {
     /// S3 requests, and whether each body streams.
     fetches: Vec<(OriginRequestId, Request, bool)>,
+    /// Reads of previous owners.
+    peer_fetches: Vec<(OriginRequestId, NodeId, Read)>,
     writes: Vec<(Location, Bytes)>,
     /// Slots to verify: location, length and checksum.
     verifies: Vec<(Location, u64, u64)>,
 }
 
 impl NodeEngine {
-    pub fn new(node: Node, origin: Rc<Origin>, disk: Arc<Disk>) -> SharedNode {
+    /// A node started over `disk`. `addresses` say where the nodes of its
+    /// first ring are reached.
+    pub fn new(
+        node: Node,
+        origin: Rc<Origin>,
+        peers: Rc<Peers>,
+        disk: Arc<Disk>,
+        addresses: BTreeMap<NodeId, String>,
+    ) -> SharedNode {
         let engine = Rc::new(RefCell::new(NodeEngine {
+            addresses,
             started: Instant::now(),
             origin,
+            peers,
             disk,
             node,
             bodies: BTreeMap::new(),
@@ -158,6 +177,30 @@ impl NodeEngine {
             this.pump()
         };
         start(engine, work);
+    }
+
+    /// The node's ring.
+    pub fn ring(engine: &SharedNode) -> Ring {
+        engine.borrow().node.ring().clone()
+    }
+
+    /// Membership changed the ring, whose nodes are reached at `addresses`.
+    pub fn on_ring(engine: &SharedNode, ring: Ring, addresses: BTreeMap<NodeId, String>) {
+        let work = {
+            let mut this = engine.borrow_mut();
+            let now = this.now();
+            this.addresses = addresses;
+            this.node.on_ring(now, ring);
+            this.pump()
+        };
+        start(engine, work);
+    }
+
+    /// The node is joining a cluster whose ring was `before`.
+    pub fn on_joined(engine: &SharedNode, before: Ring) {
+        let mut this = engine.borrow_mut();
+        let now = this.now();
+        this.node.on_joined(now, before);
     }
 
     /// A write to `key` passed through a gateway and succeeded.
@@ -277,6 +320,9 @@ impl NodeEngine {
             node::Action::Release { origin } => {
                 self.bodies.remove(&origin);
             }
+            node::Action::PeerFetch { origin, peer, read } => {
+                self.work.peer_fetches.push((origin, peer, read));
+            }
             node::Action::Cancel { origin } => {
                 if let Some(task) = self.tasks.remove(&origin) {
                     task.abort();
@@ -389,6 +435,13 @@ fn start(engine: &SharedNode, work: Work) {
             .tasks
             .insert(origin, task.abort_handle());
     }
+    for (origin, peer, read) in work.peer_fetches {
+        let task = tokio::task::spawn_local(fetch_from_peer(engine.clone(), origin, peer, read));
+        engine
+            .borrow_mut()
+            .tasks
+            .insert(origin, task.abort_handle());
+    }
     for (location, bytes) in work.writes {
         write(engine, location, bytes);
     }
@@ -449,6 +502,53 @@ async fn fetch(engine: SharedNode, origin: OriginRequestId, request: Request, st
     if let Some((body, readers)) = passing {
         pass_through(&engine, body, readers).await;
     }
+}
+
+/// Reads blocks or metadata from a previous owner and gives the node the
+/// answer. Blocks are held like a fill's; a peer that fails or answers out
+/// of protocol has none.
+async fn fetch_from_peer(engine: SharedNode, origin: OriginRequestId, peer: NodeId, read: Read) {
+    let peers = engine.borrow().peers.clone();
+    let asks_metadata = matches!(read, Read::Known(_));
+    let exchanged = peers.exchange(peer, &NodeRequest::Read(read)).await;
+    let answer = match exchanged {
+        Ok(Exchanged {
+            answer: NodeAnswer::Metadata(meta),
+            body,
+            ..
+        }) => {
+            peers.idle(body);
+            Ok(Some(meta))
+        }
+        Ok(Exchanged {
+            answer: NodeAnswer::Respond { head, .. },
+            body,
+            ..
+        }) if !asks_metadata => match peers.read_body(body).await {
+            Ok(bytes) => Err((head, bytes)),
+            Err(_) => Err((ResponseHead::status(503), Bytes::new())),
+        },
+        _ => Ok(None),
+    };
+    let work = {
+        let mut this = engine.borrow_mut();
+        this.tasks.remove(&origin);
+        let now = this.now();
+        match (asks_metadata, answer) {
+            (true, Ok(meta)) => this.node.on_peer_metadata(now, origin, meta),
+            (false, Err((head, bytes))) => {
+                this.bodies.insert(origin, Body::Held(bytes));
+                this.node.on_origin_response(now, origin, head);
+            }
+            (_, _) => {
+                this.bodies.insert(origin, Body::Held(Bytes::new()));
+                this.node
+                    .on_origin_response(now, origin, ResponseHead::status(503));
+            }
+        }
+        this.pump()
+    };
+    start(&engine, work);
 }
 
 /// The most a fill's held body may be: the bytes it asked for, or an
@@ -658,6 +758,15 @@ async fn connection(stream: TcpStream, engine: &SharedNode, secret: &str) -> io:
                     sending: None,
                 }
             }
+            Ok(NodeRequest::Ring) => Reply {
+                answer: NodeAnswer::Ring {
+                    ring: NodeEngine::ring(engine),
+                    addresses: engine.borrow().addresses.clone(),
+                },
+                body: Vec::new(),
+                len: 0,
+                sending: None,
+            },
             Ok(NodeRequest::Read(read)) => {
                 let head_only =
                     matches!(&read, Read::Object { request, .. } if request.method == Method::Head);
@@ -670,7 +779,8 @@ async fn connection(stream: TcpStream, engine: &SharedNode, secret: &str) -> io:
                 reply
             }
         };
-        let (status, headers) = protocol::encode_answer(&reply.answer);
+        let version = NodeEngine::ring(engine).version();
+        let (status, headers) = protocol::encode_answer(&reply.answer, version);
         let framing = Framing::Length(reply.len);
         let sent = async {
             connection

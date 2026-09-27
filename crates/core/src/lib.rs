@@ -9,6 +9,7 @@
 pub mod doorkeeper;
 pub mod gateway;
 pub mod layout;
+pub mod membership;
 pub mod node;
 pub mod placement;
 pub mod s3;

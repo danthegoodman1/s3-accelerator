@@ -742,3 +742,83 @@ fn a_write_through_the_home_outlasts_a_restart() {
     assert_eq!(head.etag.as_ref(), Some(&current.etag));
     assert_eq!(body.len(), 120);
 }
+
+/// Three nodes that gossip, with the scenario's timings: probes every 50
+/// ticks, suspicion for 100, and a grace period of 500.
+fn gossiping() -> Options {
+    let mut options = Options::scenario();
+    options.nodes = 3;
+    options.membership = true;
+    options
+}
+
+fn run(sim: &mut Simulator, ticks: u64) {
+    for _ in 0..ticks {
+        sim.step().unwrap();
+    }
+}
+
+/// A node that stays down past the grace period leaves every ring, and a
+/// gateway takes up the new ring once an answer names its version.
+#[test]
+fn a_node_down_past_its_grace_period_leaves_every_ring() {
+    let mut sim = Simulator::new(1, gossiping());
+    run(&mut sim, 300);
+    for node in 0..3 {
+        assert_eq!(sim.node_ring(node), Some(vec![0, 1, 2]), "node {node}");
+    }
+    sim.crash(2).unwrap();
+    // Declared down within about 300 ticks, and kept for 500 more.
+    run(&mut sim, 500);
+    assert_eq!(sim.node_ring(0), Some(vec![0, 1, 2]));
+    run(&mut sim, 600);
+    for node in 0..2 {
+        assert_eq!(sim.node_ring(node), Some(vec![0, 1]), "node {node}");
+    }
+    assert_eq!(sim.gateway_ring(0), [0, 1, 2]);
+    let key = key(IMMUTABLE_BUCKET, "k");
+    sim.put(&key, 100);
+    let (head, _) = sim.read(Request::get(key)).unwrap();
+    assert_eq!(head.status, 200);
+    run(&mut sim, 50);
+    assert_eq!(sim.gateway_ring(0), [0, 1]);
+    assert_eq!(sim.summary().ring_fetches, 1);
+}
+
+/// A node that comes back within the grace period moves no ownership.
+#[test]
+fn a_node_back_within_its_grace_period_changes_no_ring() {
+    let mut sim = Simulator::new(1, gossiping());
+    run(&mut sim, 300);
+    sim.crash(2).unwrap();
+    run(&mut sim, 400);
+    sim.restart(2).unwrap();
+    run(&mut sim, 1_000);
+    for node in 0..3 {
+        assert_eq!(sim.node_ring(node), Some(vec![0, 1, 2]), "node {node}");
+    }
+    assert_eq!(sim.summary().ring_changes, 0);
+}
+
+/// Every node a gateway's ring names fails for good while a new node
+/// serves. The gateway finds the ring through the nodes it knows, and its
+/// client's retry succeeds.
+#[test]
+fn a_gateway_whose_ring_names_only_gone_nodes_finds_the_ring() {
+    let mut options = gossiping();
+    options.nodes = 2;
+    let mut sim = Simulator::new(1, options);
+    run(&mut sim, 300);
+    sim.add_node().unwrap();
+    run(&mut sim, 300);
+    sim.fail(0).unwrap();
+    sim.fail(1).unwrap();
+    run(&mut sim, 1_500);
+    assert_eq!(sim.node_ring(2), Some(vec![2]));
+    assert_eq!(sim.gateway_ring(0), [0, 1]);
+    let key = key(IMMUTABLE_BUCKET, "k");
+    sim.put(&key, 100);
+    let (head, body) = sim.read(Request::get(key)).unwrap();
+    assert_eq!((head.status, body.len()), (200, 100));
+    assert_eq!(sim.gateway_ring(0), [2]);
+}

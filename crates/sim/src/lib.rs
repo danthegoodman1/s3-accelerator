@@ -23,6 +23,7 @@ use queue::Queue;
 use s3_accelerator_core::Time;
 use s3_accelerator_core::gateway::{self, ClientRequestId, Gateway, NodeRequestId};
 use s3_accelerator_core::layout::Layout;
+use s3_accelerator_core::membership::{self, Membership, MembershipTimer, Peer};
 use s3_accelerator_core::node::{
     self, BucketPolicy, Freshness, GatewayRequestId, Node, ObjectMeta, OriginRequestId, Read,
     Segment, StoredBlock,
@@ -34,6 +35,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroU32;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
+
+fn members(ring: &Ring) -> Vec<usize> {
+    ring.members()
+        .iter()
+        .map(|member| member.id.0 as usize)
+        .collect()
+}
+
+/// Node `node`'s identity in its run `run`.
+fn peer(node: usize, run: u64) -> Peer {
+    Peer {
+        id: node as u64,
+        weight: 1,
+        run,
+        leaving: false,
+        address: format!("node-{node}"),
+    }
+}
+
+/// Resizes a run makes at most.
+pub const MAX_RESIZES: u64 = 6;
 
 /// More events than any tick of a live run delivers: with zero delays, a
 /// retry loop would otherwise spin within one tick forever.
@@ -116,6 +138,24 @@ pub struct Options {
     /// Ticks a disk write or a response body takes, at most.
     pub disk_delay_max: u64,
     pub send_delay_max: u64,
+    /// Membership runs SWIM among the nodes, and each node's ring follows
+    /// what it hears; otherwise every node shares one fixed ring.
+    pub membership: bool,
+    /// Membership's timings, in ticks: how often a node probes another,
+    /// how long it waits for the answer, how long a suspect has to answer,
+    /// and how long a node declared down stays in the ring.
+    pub probe_period: u64,
+    pub probe_rtt: u64,
+    pub suspect_to_down: u64,
+    pub down_grace: u64,
+    /// Ticks a node keeps the previous ring after a change, and ticks a
+    /// previous owner has to answer.
+    pub fallback_window: u64,
+    pub peer_timeout: u64,
+    /// Chance per 10,000 ticks, while faults happen, that the cluster
+    /// resizes: a node joins, one leaves, or one fails for good and a new
+    /// one replaces it. A run resizes at most `MAX_RESIZES` times.
+    pub resize_per_10k: u64,
 }
 
 impl Options {
@@ -171,6 +211,14 @@ impl Options {
             down_max: 0,
             cut_percent: 0,
             origin_cut_percent: 0,
+            membership: false,
+            probe_period: 0,
+            probe_rtt: 0,
+            suspect_to_down: 0,
+            down_grace: 0,
+            fallback_window: 0,
+            peer_timeout: 0,
+            resize_per_10k: 0,
         };
         // Timeouts outlast every exchange of a fault-free run, so only
         // faults make them fire: S3 answers within two hops, and a node
@@ -200,6 +248,19 @@ impl Options {
         options.down_max = prng.range(1..=300);
         options.cut_percent = prng.range(0..=5);
         options.origin_cut_percent = prng.range(0..=5);
+        options.membership = prng.percent(80);
+        // A probe's answer takes two hops, and its indirect probes four.
+        options.probe_rtt = 2 * hop + prng.range(0..=hop);
+        options.probe_period = options.probe_rtt * prng.range(2..=4);
+        options.suspect_to_down = options.probe_period * prng.range(1..=3);
+        options.down_grace = options.probe_period * prng.range(0..=10);
+        options.fallback_window = prng.range(0..=2_000);
+        // A previous owner answers within two hops unless faults intervene.
+        options.peer_timeout = hop * prng.range(2..=6);
+        options.resize_per_10k = match options.membership {
+            true => prng.range(0..=20),
+            false => 0,
+        };
         options
     }
 
@@ -250,6 +311,14 @@ impl Options {
             delay_max: 1,
             disk_delay_max: 1,
             send_delay_max: 1,
+            membership: false,
+            probe_period: 50,
+            probe_rtt: 10,
+            suspect_to_down: 100,
+            down_grace: 500,
+            fallback_window: 1_000,
+            peer_timeout: 50,
+            resize_per_10k: 0,
         }
     }
 
@@ -285,11 +354,24 @@ impl Options {
             fill_budget: self.block_size * self.fill_budget_blocks,
             metadata_capacity: self.metadata_capacity,
             origin_timeout: self.origin_timeout,
+            fallback_window: self.fallback_window,
+            peer_timeout: self.peer_timeout,
             default_policy: ttl,
             buckets: BTreeMap::from([
                 (IMMUTABLE_BUCKET.to_string(), immutable),
                 (TTL_BUCKET.to_string(), ttl),
             ]),
+        }
+    }
+
+    fn membership_config(&self) -> membership::Config {
+        membership::Config {
+            probe_period: self.probe_period,
+            probe_rtt: self.probe_rtt,
+            suspect_to_down: self.suspect_to_down,
+            down_grace: self.down_grace,
+            gossip_period: (self.probe_period / 2).max(1),
+            max_packet: 1_400,
         }
     }
 
@@ -338,13 +420,45 @@ enum Message {
         head: ResponseHead,
         body: Body,
         meta: Option<ObjectMeta>,
+        ring: (usize, u64),
     },
     NodeMetadata {
         id: NodeRequestId,
         meta: ObjectMeta,
+        ring: (usize, u64),
     },
     NodeStale {
         id: NodeRequestId,
+        ring: (usize, u64),
+    },
+    /// Membership's packets between nodes.
+    Gossip {
+        packet: Vec<u8>,
+    },
+    RingRequest {
+        from: Address,
+    },
+    RingResponse {
+        ring: Ring,
+    },
+    /// A node's read of a previous owner, which it numbered `origin` in its
+    /// run `run`, and the answers.
+    PeerRequest {
+        node: usize,
+        run: u64,
+        origin: OriginRequestId,
+        read: Read,
+    },
+    PeerResponse {
+        run: u64,
+        origin: OriginRequestId,
+        head: ResponseHead,
+        body: Body,
+    },
+    PeerMetadata {
+        run: u64,
+        origin: OriginRequestId,
+        meta: ObjectMeta,
     },
     OriginResponse {
         run: u64,
@@ -389,6 +503,54 @@ enum Event {
         len: u64,
         checksum: u64,
     },
+    /// A timer a node's membership set.
+    MembershipTimer {
+        node: usize,
+        run: u64,
+        timer: MembershipTimer,
+    },
+    /// A starting node stops waiting for a seed's ring and joins.
+    JoinTimeout {
+        node: usize,
+        run: u64,
+    },
+}
+
+/// Who sent a node a request, and where the answer goes.
+#[derive(Clone, Copy, Debug)]
+enum Requester {
+    Gateway(usize, NodeRequestId),
+    /// A node reading from a previous owner, in its run `run`.
+    Peer {
+        node: usize,
+        run: u64,
+        origin: OriginRequestId,
+    },
+}
+
+/// A node's answer to a request.
+enum NodeAnswer {
+    Response {
+        head: ResponseHead,
+        body: Body,
+        meta: Option<ObjectMeta>,
+    },
+    Metadata(ObjectMeta),
+    Stale,
+}
+
+impl Event {
+    fn is_membership(&self) -> bool {
+        matches!(
+            self,
+            Event::MembershipTimer { .. }
+                | Event::JoinTimeout { .. }
+                | Event::Deliver {
+                    message: Message::Gossip { .. },
+                    ..
+                }
+        )
+    }
 }
 
 /// A client's request, which it sends again after a 5xx or a timeout.
@@ -445,12 +607,21 @@ pub struct Simulator {
     crashes: Prng,
     tears: Prng,
     cuts: Prng,
+    resizes: Prng,
     /// Whether faults happen: while clients are still issuing requests.
     faulty: bool,
     /// Nodes cut off from everyone, until the tick given.
     partitioned: BTreeMap<usize, u64>,
     /// Nodes that are down, until the tick given.
     down: BTreeMap<usize, u64>,
+    /// Nodes leaving the cluster, and the tick each stops for good.
+    leaving: BTreeMap<usize, u64>,
+    /// Nodes that left the cluster.
+    left: BTreeSet<usize>,
+    /// Starting nodes waiting for a seed's ring before they join.
+    joining: BTreeSet<usize>,
+    /// The node a gateway that lost track of the ring asks next.
+    ring_seeds: usize,
     /// Each node's run: how many times it has stopped.
     runs: Vec<u64>,
     /// Stats of each node's runs that ended.
@@ -463,8 +634,11 @@ pub struct Simulator {
     keys: Vec<ObjectKey>,
     ring: Ring,
     gateways: Vec<Gateway>,
-    /// Each node, while it is up.
+    /// Each node, while it is up, and its membership, while it gossips.
     nodes: Vec<Option<Node>>,
+    memberships: Vec<Option<Membership>>,
+    /// Seeds for each membership's random choices.
+    membership_seeds: Prng,
     disks: Vec<Disk>,
     in_flight: Vec<usize>,
     requests: BTreeMap<u64, Pending>,
@@ -480,7 +654,10 @@ pub struct Simulator {
     // holds while a node or gateway reads them.
     next_id: u64,
     gateway_requests: BTreeMap<(usize, ClientRequestId), u64>,
-    node_requests: BTreeMap<(usize, GatewayRequestId), (usize, NodeRequestId)>,
+    node_requests: BTreeMap<(usize, GatewayRequestId), Requester>,
+    /// Reads nodes sent previous owners, and whether each asked for
+    /// metadata rather than blocks.
+    peer_reads: BTreeMap<(usize, OriginRequestId), bool>,
     gateway_bodies: BTreeMap<(usize, NodeRequestId), Body>,
     origin_bodies: BTreeMap<(usize, OriginRequestId), Body>,
     /// Scripted cuts: the next body a node sends, or S3 sends a node, that
@@ -521,7 +698,28 @@ impl Simulator {
                 weight: NonZeroU32::MIN,
             })
             .collect();
-        let ring = Ring::new(1, members);
+        let mut membership_seeds = Prng::stream(seed, "membership");
+        let known: Vec<Peer> = (0..options.nodes).map(|node| peer(node, 0)).collect();
+        let memberships: Vec<Option<Membership>> = known
+            .iter()
+            .map(|me| {
+                let seed = membership_seeds.next_u64();
+                options.membership.then(|| {
+                    Membership::new(
+                        Time(0),
+                        me.clone(),
+                        &known,
+                        options.membership_config(),
+                        seed,
+                    )
+                })
+            })
+            .collect();
+        // Nodes that start together start with the same ring.
+        let ring = match memberships.first() {
+            Some(Some(membership)) => membership.ring().clone(),
+            _ => Ring::new(1, members),
+        };
         let keys: Vec<ObjectKey> = (0..options.keys)
             .map(|index| ObjectKey {
                 bucket: [IMMUTABLE_BUCKET, TTL_BUCKET][index % 2].to_string(),
@@ -536,7 +734,7 @@ impl Simulator {
             }
         }
         let config = options.node_config();
-        Simulator {
+        let mut simulator = Simulator {
             seed,
             workload: Prng::stream(seed, "workload"),
             writers: Prng::stream(seed, "writers"),
@@ -550,9 +748,14 @@ impl Simulator {
             crashes: Prng::stream(seed, "crashes"),
             tears: Prng::stream(seed, "tears"),
             cuts: Prng::stream(seed, "cuts"),
+            resizes: Prng::stream(seed, "resizes"),
             faulty: true,
             partitioned: BTreeMap::new(),
             down: BTreeMap::new(),
+            leaving: BTreeMap::new(),
+            left: BTreeSet::new(),
+            joining: BTreeSet::new(),
+            ring_seeds: 0,
             runs: vec![0; options.nodes],
             retired: vec![node::Stats::default(); options.nodes],
             disk_delays: Prng::stream(seed, "disk delays"),
@@ -574,6 +777,8 @@ impl Simulator {
                     ))
                 })
                 .collect(),
+            memberships,
+            membership_seeds,
             disks: (0..options.nodes)
                 .map(|_| Disk::new(config.store.extents, config.store.extent_size))
                 .collect(),
@@ -587,6 +792,7 @@ impl Simulator {
             next_id: 0,
             gateway_requests: BTreeMap::new(),
             node_requests: BTreeMap::new(),
+            peer_reads: BTreeMap::new(),
             gateway_bodies: BTreeMap::new(),
             origin_bodies: BTreeMap::new(),
             client_responses: BTreeMap::new(),
@@ -605,7 +811,11 @@ impl Simulator {
                 ..Summary::default()
             },
             options,
+        };
+        for node in 0..simulator.nodes.len() {
+            simulator.start_joining(node);
         }
+        simulator
     }
 
     pub fn options(&self) -> &Options {
@@ -661,8 +871,13 @@ impl Simulator {
         self.faulty = false;
         self.quiet_since = Some(self.now);
         self.partitioned.clear();
+        for node in std::mem::take(&mut self.leaving).into_keys() {
+            self.leave(node)?;
+        }
         for node in std::mem::take(&mut self.down).into_keys() {
-            self.restart(node)?;
+            if !self.left.contains(&node) {
+                self.restart(node)?;
+            }
         }
         Ok(())
     }
@@ -676,12 +891,13 @@ impl Simulator {
         self.origin.delete(self.now, key);
     }
 
-    /// Writes an object through its home: to the model of S3, then to the
-    /// home, which learns the write succeeded.
+    /// Writes an object through gateway 0 and the key's home under its
+    /// ring: to the model of S3, then to the home, which learns the write
+    /// succeeded.
     pub fn write_through(&mut self, key: &ObjectKey, size: u64) -> Result<(), Failure> {
         self.origin.put(self.now, key, size, &mut self.writers);
-        let home = self
-            .ring
+        let home = self.gateways[0]
+            .ring()
             .owner(Placement::Home(key).hash())
             .expect("a node")
             .0 as usize;
@@ -738,10 +954,123 @@ impl Simulator {
         answer.ok_or_else(|| self.failure(format!("request {request} was never started")))
     }
 
+    /// The members of `node`'s ring, while it is up.
+    pub fn node_ring(&self, node: usize) -> Option<Vec<usize>> {
+        let up = self.nodes[node].as_ref()?;
+        Some(members(up.ring()))
+    }
+
+    /// The members of `gateway`'s ring.
+    pub fn gateway_ring(&self, gateway: usize) -> Vec<usize> {
+        members(self.gateways[gateway].ring())
+    }
+
+    /// Starts a new node with an empty disk, which joins through the nodes
+    /// it knows. Returns its index.
+    pub fn add_node(&mut self) -> Result<usize, Failure> {
+        let node = self.nodes.len();
+        let config = self.options.node_config();
+        self.nodes.push(None);
+        self.memberships.push(None);
+        self.disks
+            .push(Disk::new(config.store.extents, config.store.extent_size));
+        self.runs.push(0);
+        self.retired.push(node::Stats::default());
+        if self.trace {
+            eprintln!("{} node {node} joins", self.now);
+        }
+        self.restart(node)?;
+        Ok(node)
+    }
+
+    /// Starts `node` leaving: it drops out of every ring at once, serves
+    /// its blocks to their new owners through the fallback window, and then
+    /// stops for good.
+    pub fn remove_node(&mut self, node: usize) -> Result<(), Failure> {
+        if self.trace {
+            eprintln!("{} node {node} starts leaving", self.now);
+        }
+        let until = self.now + self.options.fallback_window;
+        self.leaving.insert(node, until);
+        if let Some(membership) = self.memberships[node].as_mut() {
+            membership.start_leaving(Time(self.now));
+        }
+        self.drain_membership(node)
+    }
+
+    /// Grows the cluster by a node, lets one leave, or replaces one that
+    /// fails for good, within bounds that keep it between one and eight
+    /// nodes.
+    fn resize(&mut self) -> Result<(), Failure> {
+        const MAX_NODES: usize = 8;
+        let live: Vec<usize> = self
+            .members()
+            .filter(|node| self.nodes[*node].is_some() && !self.leaving.contains_key(node))
+            .collect();
+        let room = self.members().count() < MAX_NODES;
+        match self.resizes.below(3) {
+            0 if room => {
+                self.add_node()?;
+                self.summary.resizes += 1;
+            }
+            1 if live.len() > 1 => {
+                let node = live[self.resizes.index(live.len())];
+                self.remove_node(node)?;
+                self.summary.resizes += 1;
+            }
+            2 if live.len() > 1 => {
+                let node = live[self.resizes.index(live.len())];
+                self.fail(node)?;
+                self.add_node()?;
+                self.summary.resizes += 1;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Crashes `node` for good: it never restarts, and leaves the cluster.
+    pub fn fail(&mut self, node: usize) -> Result<(), Failure> {
+        if self.trace {
+            eprintln!("{} node {node} fails for good", self.now);
+        }
+        self.stop(node, false, true, u64::MAX)?;
+        self.down.remove(&node);
+        self.left.insert(node);
+        Ok(())
+    }
+
+    /// Stops a leaving node for good, as a clean shutdown.
+    fn leave(&mut self, node: usize) -> Result<(), Failure> {
+        if self.trace {
+            eprintln!("{} node {node} leaves", self.now);
+        }
+        if let Some(membership) = self.memberships[node].as_mut() {
+            membership.leave(Time(self.now));
+        }
+        self.drain_membership(node)?;
+        if self.nodes[node].is_some() {
+            self.stop(node, true, false, u64::MAX)?;
+        }
+        self.down.remove(&node);
+        self.left.insert(node);
+        Ok(())
+    }
+
+    /// The ring of the lowest node up, or the fixed ring.
+    fn current_ring(&self) -> &Ring {
+        self.nodes
+            .iter()
+            .flatten()
+            .next()
+            .filter(|_| self.options.membership)
+            .map_or(&self.ring, |node| node.ring())
+    }
+
     /// The node that is `key`'s home.
     pub fn home(&self, key: &ObjectKey) -> usize {
         let home = self
-            .ring
+            .current_ring()
             .owner(Placement::Home(key).hash())
             .expect("a node");
         home.0 as usize
@@ -750,7 +1079,7 @@ impl Simulator {
     /// The rendezvous candidates for `key`'s home, best first.
     pub fn home_candidates(&self, key: &ObjectKey) -> Vec<usize> {
         let placement = Placement::Home(key).hash();
-        self.ring
+        self.current_ring()
             .candidates(placement)
             .into_iter()
             .map(|node| node.0 as usize)
@@ -775,15 +1104,113 @@ impl Simulator {
         self.stop(node, true, false, u64::MAX)
     }
 
-    /// Starts a node that is down, over its slot table.
+    /// Starts a node that is down, over its slot table. With membership,
+    /// it starts as a new run, with every node it knows in its ring.
     pub fn restart(&mut self, node: usize) -> Result<(), Failure> {
         self.down.remove(&node);
         let records = self.disks[node].start();
         let metadata = self.disks[node].metadata.clone();
         let config = self.options.node_config();
         let id = NodeId(node as u64);
-        let ring = self.ring.clone();
+        let seed = self.membership_seeds.next_u64();
+        let ring = match self.options.membership {
+            true => {
+                let known: Vec<Peer> = self.members().map(|node| peer(node, 0)).collect();
+                let me = peer(node, self.runs[node]);
+                let config = self.options.membership_config();
+                let membership = Membership::new(Time(self.now), me, &known, config, seed);
+                let ring = membership.ring().clone();
+                self.memberships[node] = Some(membership);
+                ring
+            }
+            false => self.ring.clone(),
+        };
         self.nodes[node] = Some(Node::recover(id, ring, config, records, metadata));
+        self.drain_node(node)?;
+        self.start_joining(node);
+        Ok(())
+    }
+
+    /// A starting node asks the others for their ring before it joins, so
+    /// it learns whether it is new to them. It joins once a ring arrives,
+    /// or after a few probe periods without one.
+    fn start_joining(&mut self, node: usize) {
+        if self.memberships[node].is_none() {
+            return;
+        }
+        self.joining.insert(node);
+        let seeds: Vec<usize> = self.members().filter(|&seed| seed != node).collect();
+        for seed in seeds {
+            let message = Message::RingRequest {
+                from: Address::Node(node),
+            };
+            self.send(Address::Node(node), Address::Node(seed), message);
+        }
+        let run = self.runs[node];
+        let timeout = Event::JoinTimeout { node, run };
+        self.queue
+            .push(self.now + 4 * self.options.probe_period, timeout);
+    }
+
+    /// A starting node joins, having heard the ring `before` it, if any.
+    fn finish_joining(&mut self, node: usize, before: Option<Ring>) -> Result<(), Failure> {
+        if !self.joining.remove(&node) {
+            return Ok(());
+        }
+        if let (Some(before), Some(up)) = (before, self.nodes[node].as_mut()) {
+            up.on_joined(Time(self.now), before);
+        }
+        self.join(node);
+        self.drain_membership(node)
+    }
+
+    /// Nodes that have not left the cluster.
+    fn members(&self) -> impl Iterator<Item = usize> + use<'_> {
+        (0..self.nodes.len()).filter(|node| !self.left.contains(node))
+    }
+
+    /// Announces a node's membership to every node it knows.
+    fn join(&mut self, node: usize) {
+        let seeds: Vec<NodeId> = self.members().map(|node| NodeId(node as u64)).collect();
+        if let Some(membership) = self.memberships[node].as_mut() {
+            membership.join(Time(self.now), &seeds);
+        }
+    }
+
+    /// Carries out a node's membership actions: packets cross the network,
+    /// timers go on the queue, and a new ring reaches the node.
+    fn drain_membership(&mut self, node: usize) -> Result<(), Failure> {
+        let Some(membership) = self.memberships[node].as_mut() else {
+            return Ok(());
+        };
+        let run = self.runs[node];
+        for action in membership.drain() {
+            match action {
+                membership::Action::Send { to, packet } => {
+                    let message = Message::Gossip { packet };
+                    self.send(Address::Node(node), Address::Node(to.0 as usize), message);
+                }
+                membership::Action::Schedule { timer, at } => {
+                    let event = Event::MembershipTimer { node, run, timer };
+                    self.queue.push(at.0.max(self.now), event);
+                }
+                membership::Action::Ring(ring) => {
+                    if self.trace {
+                        let members: Vec<u64> =
+                            ring.members().iter().map(|member| member.id.0).collect();
+                        eprintln!(
+                            "{} node {node} ring {:016x} {members:?}",
+                            self.now,
+                            ring.version()
+                        );
+                    }
+                    self.summary.ring_changes += 1;
+                    if let Some(up) = self.nodes[node].as_mut() {
+                        up.on_ring(Time(self.now), ring);
+                    }
+                }
+            }
+        }
         self.drain_node(node)
     }
 
@@ -822,7 +1249,7 @@ impl Simulator {
     pub fn owner(&self, key: &ObjectKey, size: u64, index: u64) -> usize {
         let layout = Layout::new(self.options.block_size, self.options.chunk_blocks);
         let placement = layout.placement(key, size, index).hash();
-        self.ring.owner(placement).expect("a node").0 as usize
+        self.current_ring().owner(placement).expect("a node").0 as usize
     }
 
     /// Writes `node` has in progress.
@@ -873,6 +1300,9 @@ impl Simulator {
             summary.evicted_blocks += stats.evicted_blocks;
             summary.verified_blocks += stats.verified_blocks;
             summary.corrupt_blocks += stats.corrupt_blocks;
+            summary.peer_requests += stats.peer_requests;
+            summary.peer_metadata += stats.peer_metadata;
+            summary.peer_bytes += stats.peer_bytes;
             summary.node_reads.push(stats.reads);
         }
         summary
@@ -892,6 +1322,10 @@ impl Simulator {
         }
         let now = Time(self.now);
         for node in 0..self.nodes.len() {
+            if let Some(membership) = self.memberships[node].as_mut() {
+                membership.on_tick(now);
+                self.drain_membership(node)?;
+            }
             if let Some(up) = self.nodes[node].as_mut() {
                 up.on_tick(now);
                 self.drain_node(node)?;
@@ -915,6 +1349,16 @@ impl Simulator {
     /// partitions and stops.
     fn tick_faults(&mut self) -> Result<(), Failure> {
         let now = self.now;
+        let gone: Vec<usize> = self
+            .leaving
+            .iter()
+            .filter(|&(_, &until)| until <= now)
+            .map(|(&node, _)| node)
+            .collect();
+        for node in gone {
+            self.leaving.remove(&node);
+            self.leave(node)?;
+        }
         self.partitioned.retain(|_, until| *until > now);
         if self.faulty && self.partitions.percent(self.options.partition_percent) {
             let node = self.partitions.index(self.nodes.len());
@@ -936,11 +1380,18 @@ impl Simulator {
             }
             self.restart(node)?;
         }
+        if self.faulty
+            && self.summary.resizes < MAX_RESIZES
+            && self.resizes.below(10_000) < self.options.resize_per_10k
+        {
+            self.resize()?;
+        }
         if self.faulty && self.crashes.below(1_000) < self.options.crash_permille {
             let node = self.crashes.index(self.nodes.len());
             let clean = self.crashes.percent(self.options.clean_percent);
             let ticks = self.crashes.range(1..=self.options.down_max);
-            if self.nodes[node].is_some() {
+            // A leaving node stops only for good.
+            if self.nodes[node].is_some() && !self.leaving.contains_key(&node) {
                 if self.trace {
                     let how = if clean { "shuts down" } else { "crashes" };
                     eprintln!("{now} node {node} {how} for {ticks} ticks");
@@ -974,7 +1425,7 @@ impl Simulator {
                 .remove(&(node, id))
                 .expect("a send in progress");
             let mut body = self.assemble(node, &body)?;
-            let (gateway, gateway_id) = self.node_requests[&(node, id)];
+            let requester = self.node_requests[&(node, id)];
             if !clean {
                 if self.cuts.percent(50) {
                     continue;
@@ -982,13 +1433,8 @@ impl Simulator {
                 body.bytes
                     .truncate(self.cuts.below(body.len.max(1)) as usize);
             }
-            let response = Message::NodeResponse {
-                id: gateway_id,
-                head,
-                body,
-                meta,
-            };
-            self.send(Address::Node(node), Address::Gateway(gateway), response);
+            let answer = NodeAnswer::Response { head, body, meta };
+            self.answer_request(node, requester, answer);
         }
         let writes: Vec<Location> = self
             .writes
@@ -1035,6 +1481,8 @@ impl Simulator {
         }
         self.retired[node] += stats;
         self.nodes[node] = None;
+        self.memberships[node] = None;
+        self.joining.remove(&node);
         self.runs[node] += 1;
         self.down.insert(node, until);
         self.writes.retain(|&(owner, _), _| owner != node);
@@ -1044,6 +1492,7 @@ impl Simulator {
         self.streaming.retain(|&(owner, _)| owner != node);
         self.started.retain(|&(owner, _)| owner != node);
         self.node_requests.retain(|&(owner, _), _| owner != node);
+        self.peer_reads.retain(|&(owner, _), _| owner != node);
         self.check_table(node)
     }
 
@@ -1054,7 +1503,9 @@ impl Simulator {
             + 4 * (self.options.client_timeout
                 + self.options.node_timeout
                 + self.options.origin_timeout);
-        while !(self.queue.is_empty() && self.idle()) && self.now <= deadline {
+        // Membership gossips forever, so its timers and packets never run
+        // out.
+        while !(self.queue.all(Event::is_membership) && self.idle()) && self.now <= deadline {
             self.tick()?;
         }
         // Responses to cancelled requests that were lost never arrive.
@@ -1235,9 +1686,18 @@ impl Simulator {
             Event::Written { node, run, .. }
             | Event::Sent { node, run, .. }
             | Event::Verified { node, run, .. }
+            | Event::MembershipTimer { node, run, .. }
+            | Event::JoinTimeout { node, run }
                 if run != self.runs[node] =>
             {
                 Ok(())
+            }
+            Event::JoinTimeout { node, .. } => self.finish_joining(node, None),
+            Event::MembershipTimer { node, timer, .. } => {
+                if let Some(membership) = self.memberships[node].as_mut() {
+                    membership.on_timer(Time(self.now), timer);
+                }
+                self.drain_membership(node)
             }
             Event::Written { node, location, .. } => self.written(node, location),
             Event::Forwarded {
@@ -1265,8 +1725,12 @@ impl Simulator {
     fn deliver(&mut self, to: Address, message: Message) -> Result<(), Failure> {
         let now = Time(self.now);
         if let Address::Node(node) = to {
-            let stale =
-                matches!(&message, Message::OriginResponse { run, .. } if *run != self.runs[node]);
+            let stale = match &message {
+                Message::OriginResponse { run, .. }
+                | Message::PeerResponse { run, .. }
+                | Message::PeerMetadata { run, .. } => *run != self.runs[node],
+                _ => false,
+            };
             if self.nodes[node].is_none() || stale {
                 self.summary.lost += 1;
                 return Ok(());
@@ -1286,25 +1750,110 @@ impl Simulator {
                     head,
                     body,
                     meta,
+                    ring: (node, version),
                 },
             ) => {
                 self.gateway_bodies.insert((gateway, id), body);
                 self.gateways[gateway].on_node_response(now, id, head, meta);
+                self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version);
                 self.drain_gateway(gateway)
             }
-            (Address::Gateway(gateway), Message::NodeMetadata { id, meta }) => {
+            (
+                Address::Gateway(gateway),
+                Message::NodeMetadata {
+                    id,
+                    meta,
+                    ring: (node, version),
+                },
+            ) => {
                 self.gateways[gateway].on_node_metadata(now, id, meta);
+                self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version);
                 self.drain_gateway(gateway)
             }
-            (Address::Gateway(gateway), Message::NodeStale { id }) => {
+            (
+                Address::Gateway(gateway),
+                Message::NodeStale {
+                    id,
+                    ring: (node, version),
+                },
+            ) => {
                 self.summary.retries += 1;
                 self.gateways[gateway].on_node_stale(now, id);
+                self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version);
                 self.drain_gateway(gateway)
+            }
+            (Address::Gateway(gateway), Message::RingResponse { ring }) => {
+                self.summary.ring_fetches += 1;
+                self.gateways[gateway].on_ring(now, ring);
+                self.drain_gateway(gateway)
+            }
+            (Address::Node(node), Message::RingResponse { ring }) => {
+                self.finish_joining(node, Some(ring))
+            }
+            (Address::Node(node), Message::Gossip { packet }) => {
+                if let Some(membership) = self.memberships[node].as_mut() {
+                    membership.on_packet(now, &packet);
+                }
+                self.drain_membership(node)
+            }
+            (Address::Node(node), Message::RingRequest { from }) => {
+                let ring = self.node(node).ring().clone();
+                let response = Message::RingResponse { ring };
+                self.send(Address::Node(node), from, response);
+                Ok(())
             }
             (Address::Node(node), Message::NodeRequest { gateway, id, read }) => {
                 let local = GatewayRequestId(self.next_id());
-                self.node_requests.insert((node, local), (gateway, id));
+                let requester = Requester::Gateway(gateway, id);
+                self.node_requests.insert((node, local), requester);
                 self.node(node).on_request(now, local, read);
+                self.drain_node(node)
+            }
+            (
+                Address::Node(peer),
+                Message::PeerRequest {
+                    node,
+                    run,
+                    origin,
+                    read,
+                },
+            ) => {
+                let local = GatewayRequestId(self.next_id());
+                let requester = Requester::Peer { node, run, origin };
+                self.node_requests.insert((peer, local), requester);
+                self.node(peer).on_request(now, local, read);
+                self.drain_node(peer)
+            }
+            (
+                Address::Node(node),
+                Message::PeerResponse {
+                    origin, head, body, ..
+                },
+            ) => {
+                let asked_metadata = self.peer_reads.remove(&(node, origin));
+                if self.cancelled.remove(&(node, origin)) {
+                    return Ok(());
+                }
+                match asked_metadata {
+                    Some(true) => self.node(node).on_peer_metadata(now, origin, None),
+                    Some(false) => {
+                        self.origin_bodies.insert((node, origin), body);
+                        self.node(node).on_origin_response(now, origin, head);
+                    }
+                    None => {
+                        return Err(self.failure(format!(
+                            "node {node} got an answer to {origin:?}, which it never sent"
+                        )));
+                    }
+                }
+                self.drain_node(node)
+            }
+            (Address::Node(node), Message::PeerMetadata { origin, meta, .. }) => {
+                self.peer_reads.remove(&(node, origin));
+                if self.cancelled.remove(&(node, origin)) {
+                    return Ok(());
+                }
+                self.node(node).on_peer_metadata(now, origin, Some(meta));
                 self.drain_node(node)
             }
             (
@@ -1439,6 +1988,27 @@ impl Simulator {
                             self.failure(format!("gateway {gateway} discarded {id:?} twice"))
                         );
                     }
+                }
+                // A gateway knows the nodes in the cluster, as if its
+                // config were kept current, and asks them in turn.
+                gateway::Action::FindRing => {
+                    let members: Vec<usize> = self.members().collect();
+                    let node = members[self.ring_seeds % members.len()];
+                    self.ring_seeds += 1;
+                    let message = Message::RingRequest {
+                        from: Address::Gateway(gateway),
+                    };
+                    self.send(Address::Gateway(gateway), Address::Node(node), message);
+                }
+                gateway::Action::FetchRing { node } => {
+                    let message = Message::RingRequest {
+                        from: Address::Gateway(gateway),
+                    };
+                    self.send(
+                        Address::Gateway(gateway),
+                        Address::Node(node.0 as usize),
+                        message,
+                    );
                 }
             }
         }
@@ -1575,24 +2145,27 @@ impl Simulator {
                     self.queue.push(self.now + delay, sent);
                 }
                 node::Action::Metadata { request, meta } => {
-                    let Some((gateway, id)) = self.node_requests.remove(&(node, request)) else {
+                    let Some(requester) = self.node_requests.remove(&(node, request)) else {
                         return Err(self.failure(format!("node {node} answered {request:?} twice")));
                     };
-                    self.send(
-                        Address::Node(node),
-                        Address::Gateway(gateway),
-                        Message::NodeMetadata { id, meta },
-                    );
+                    self.answer_request(node, requester, NodeAnswer::Metadata(meta));
                 }
                 node::Action::Stale { request } => {
-                    let Some((gateway, id)) = self.node_requests.remove(&(node, request)) else {
+                    let Some(requester) = self.node_requests.remove(&(node, request)) else {
                         return Err(self.failure(format!("node {node} answered {request:?} twice")));
                     };
-                    self.send(
-                        Address::Node(node),
-                        Address::Gateway(gateway),
-                        Message::NodeStale { id },
-                    );
+                    self.answer_request(node, requester, NodeAnswer::Stale);
+                }
+                node::Action::PeerFetch { origin, peer, read } => {
+                    let asks_metadata = matches!(read, Read::Known(_));
+                    self.peer_reads.insert((node, origin), asks_metadata);
+                    let message = Message::PeerRequest {
+                        node,
+                        run,
+                        origin,
+                        read,
+                    };
+                    self.send(Address::Node(node), Address::Node(peer.0 as usize), message);
                 }
                 node::Action::Write {
                     location,
@@ -1601,6 +2174,7 @@ impl Simulator {
                     len,
                 } => {
                     self.check_streaming(node, origin)?;
+                    self.check_owned(node, location)?;
                     let write = Write {
                         origin,
                         offset,
@@ -1694,7 +2268,6 @@ impl Simulator {
         self.disks[node].write(location, &bytes);
         self.node(node).on_written(location);
         self.check_disk(node, Some(location))?;
-        self.check_owned(node, location)?;
         self.drain_node(node)
     }
 
@@ -1715,18 +2288,57 @@ impl Simulator {
         } else if self.faulty && body.len > 0 && self.cuts.percent(self.options.cut_percent) {
             body.bytes.truncate(self.cuts.below(body.len) as usize);
         }
-        let Some((gateway, gateway_id)) = self.node_requests.remove(&(node, id)) else {
+        let Some(requester) = self.node_requests.remove(&(node, id)) else {
             return Err(self.failure(format!("node {node} answered {id:?} twice")));
         };
-        let response = Message::NodeResponse {
-            id: gateway_id,
-            head,
-            body,
-            meta,
-        };
-        self.send(Address::Node(node), Address::Gateway(gateway), response);
+        self.answer_request(node, requester, NodeAnswer::Response { head, body, meta });
         self.node(node).on_sent(id);
         self.drain_node(node)
+    }
+
+    /// Sends a node's answer to whoever asked: a gateway, with the node's
+    /// ring version, or a node reading from a previous owner.
+    fn answer_request(&mut self, node: usize, requester: Requester, answer: NodeAnswer) {
+        let from = Address::Node(node);
+        match requester {
+            Requester::Gateway(gateway, id) => {
+                let ring = (node, self.node(node).ring().version());
+                let message = match answer {
+                    NodeAnswer::Response { head, body, meta } => Message::NodeResponse {
+                        id,
+                        head,
+                        body,
+                        meta,
+                        ring,
+                    },
+                    NodeAnswer::Metadata(meta) => Message::NodeMetadata { id, meta, ring },
+                    NodeAnswer::Stale => Message::NodeStale { id, ring },
+                };
+                self.send(from, Address::Gateway(gateway), message);
+            }
+            Requester::Peer {
+                node: asker,
+                run,
+                origin,
+            } => {
+                let message = match answer {
+                    NodeAnswer::Response { head, body, .. } => Message::PeerResponse {
+                        run,
+                        origin,
+                        head,
+                        body,
+                    },
+                    NodeAnswer::Metadata(meta) => Message::PeerMetadata { run, origin, meta },
+                    NodeAnswer::Stale => Message::PeerResponse {
+                        run,
+                        origin,
+                        head: ResponseHead::status(503),
+                        body: Body::whole(Vec::new()),
+                    },
+                };
+                self.send(from, Address::Node(asker), message);
+            }
+        }
     }
 
     /// A node response's body from its segments. It ends early where an S3
@@ -1795,9 +2407,18 @@ impl Simulator {
         // Faults explain a 5xx or a body that ended early until their
         // effects have run their course: S3 and node timeouts, and messages
         // held back by a spike.
-        let grace = 2 * (self.options.origin_timeout + self.options.node_timeout)
+        let mut grace = 2 * (self.options.origin_timeout + self.options.node_timeout)
             + 10 * self.options.delay_max
             + 10;
+        // Membership forgets a node that stopped for good only after it is
+        // declared down and its grace period ends, and a gateway may need
+        // a timeout or two to learn the new ring.
+        if self.options.membership {
+            grace += 3 * self.options.probe_period
+                + self.options.suspect_to_down
+                + self.options.down_grace
+                + 2 * self.options.node_timeout;
+        }
         let unexplained = self.quiet_since.is_some_and(|quiet| sent >= quiet + grace);
         if head.status >= 500 {
             if unexplained {
@@ -1918,7 +2539,7 @@ impl Simulator {
         Ok(())
     }
 
-    /// A node stores only blocks it owns.
+    /// A node admits only blocks it owns under its ring.
     fn check_owned(&self, node: usize, location: Location) -> Result<(), Failure> {
         let Some(up) = &self.nodes[node] else {
             return Ok(());
@@ -1933,7 +2554,7 @@ impl Simulator {
         let placement = layout
             .placement(&object.key, object.size, block.index)
             .hash();
-        let owner = self.ring.owner(placement).map(|id| id.0 as usize);
+        let owner = up.ring().owner(placement).map(|id| id.0 as usize);
         if owner != Some(node) {
             return Err(self.failure(format!(
                 "node {node} stored block {} of {:?}, which node {owner:?} owns",
@@ -2019,6 +2640,16 @@ pub struct Summary {
     pub early_ends: u64,
     pub verified_blocks: u64,
     pub corrupt_blocks: u64,
+    /// Times the cluster grew, shrank or replaced a node; rings nodes took
+    /// up, and rings gateways fetched.
+    pub resizes: u64,
+    pub ring_changes: u64,
+    pub ring_fetches: u64,
+    /// Reads nodes sent previous owners, objects whose metadata a previous
+    /// home supplied, and body bytes served from previous owners' blocks.
+    pub peer_requests: u64,
+    pub peer_metadata: u64,
+    pub peer_bytes: u64,
     /// A digest of every response: its request, tick, status and body.
     pub fingerprint: u64,
 }
@@ -2044,7 +2675,8 @@ impl fmt::Display for Summary {
              {}% of body bytes from disk, {} S3 requests, {} bytes written, \
              {} blocks evicted, node reads {:?}, {} messages lost, {} server errors, \
              {} client retries, {} crashes, {} clean shutdowns, {} blocks verified, \
-             {} corrupt, {} cut bodies, {} early ends, fingerprint {:016x}",
+             {} corrupt, {} cut bodies, {} early ends, {} resizes, {} ring changes, {} ring fetches, \
+             {} peer requests, {} peer metadata, {} peer bytes, fingerprint {:016x}",
             self.seed,
             self.ticks,
             self.writes,
@@ -2064,6 +2696,12 @@ impl fmt::Display for Summary {
             self.corrupt_blocks,
             self.cut_bodies,
             self.early_ends,
+            self.resizes,
+            self.ring_changes,
+            self.ring_fetches,
+            self.peer_requests,
+            self.peer_metadata,
+            self.peer_bytes,
             self.fingerprint
         )
     }
