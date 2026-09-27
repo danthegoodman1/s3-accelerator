@@ -156,6 +156,8 @@ data_dir = "{}"
         listening(node_port);
         let gateway = spawn(&gateway_config, "gateway.log");
         listening(gateway_port);
+        // For profilers to attach to.
+        eprintln!("node pid {}, gateway pid {}", node.id(), gateway.id());
         Cluster {
             node,
             gateway,

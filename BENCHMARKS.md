@@ -59,6 +59,21 @@ A 4.0 GiB cache, filled by reading twice a cold set of 64 MiB objects (4.0 GiB),
 
 With 64 MiB extents, the size shift sent 0.14 GiB of hot objects again among the small objects (`--only shift --extent-mib 64`).
 
+## Where the time goes
+
+`perf` sampled the node and the gateway through the "Hits and fills" section, both built with frame pointers (`RUSTFLAGS="-C force-frame-pointers=yes"`). The benchmark prints each process's PID and each workload's window in `CLOCK_MONOTONIC` seconds, so `perf record -k CLOCK_MONOTONIC` samples split by workload with `perf report --time`:
+
+```console
+sudo perf record -k CLOCK_MONOTONIC -F 299 -g -p <pid> -o node.data
+sudo perf report -i node.data --time <from>,<to> --sort comm --no-children
+```
+
+Shares are of each process's CPU in each workload:
+
+- **Fills:** the node's event loop, its one thread, takes 73%. It receives S3's bodies into memory through the S3 client (28%, in `recvfrom`) and writes them to the gateway from memory (30%, in `sendto`), zeroing fresh pages and copying buffers besides; worker threads write the blocks. Every byte crosses the event loop twice, which is the fill ceiling in Limits.
+- **Hits from the page cache and the drive:** the node's workers spend 98% in `sendfile` and the gateway 89% in `splice`: the bytes themselves.
+- **64 KiB range hits:** the cost is per request. The node's event loop writes each response head (22%) and a small body from memory (17%), and hands each `sendfile` to a worker, whose wakeups cost 5 to 16% in `futex`. The gateway spends 28% reading and writing heads and 15 to 18% in `splice`.
+
 ## The storage layout
 
 The spec left the layout open until benchmarks tested its three risks. It stays: slots of power-of-two size classes in extents, served with `sendfile`, with two changes.

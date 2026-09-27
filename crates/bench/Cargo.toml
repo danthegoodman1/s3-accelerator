@@ -9,7 +9,7 @@ publish.workspace = true
 s3-accelerator = { path = "../server" }
 httparse = "1.10.1"
 rcgen = "0.14.10"
-rustix = { version = "1", features = ["fs", "net", "param"] }
+rustix = { version = "1", features = ["fs", "net", "param", "time"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

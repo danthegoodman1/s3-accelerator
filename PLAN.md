@@ -422,6 +422,7 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
+| Complete | Work | 7A: Profiles | `BENCHMARKS.md`, Where the time goes: `perf` on both processes through the hits section, split by workload with `CLOCK_MONOTONIC` windows the benchmark now prints. Fills: the node's event loop takes 73% of the node's CPU, receiving S3's bodies into memory (28%) and writing them to the gateway (30%), so every byte crosses one thread twice (7C). Hits: `sendfile` and `splice` move the bytes, with nothing else of note. 64 KiB ranges: per-request heads, small writes and a worker handoff per `sendfile` (7E). Taken while the planted-bug sweep ran, so the shares hold and the throughputs do not; 7G reruns the benchmarks on an idle machine. |
 
 ## Phase 8: Observability
 

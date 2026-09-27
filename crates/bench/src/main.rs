@@ -202,9 +202,13 @@ impl Bench {
             tls: cluster.tls.clone(),
         };
         let (before, from_s3) = (cluster.counters(), self.s3_bytes());
+        let started = monotonic();
         let outcome = client::run(&target, clients, gets)
             .await
             .unwrap_or_else(|error| panic!("{workload}: {error}"));
+        // CLOCK_MONOTONIC seconds, as `perf record -k CLOCK_MONOTONIC`
+        // stamps samples, so `perf report --time` can take one workload.
+        eprintln!("{workload}: from {started:.6} to {:.6}", monotonic());
         Row {
             workload: workload.to_string(),
             outcome,
@@ -617,4 +621,10 @@ impl Random {
         }
         weights.len() - 1
     }
+}
+
+/// CLOCK_MONOTONIC now, in seconds.
+fn monotonic() -> f64 {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    now.tv_sec as f64 + now.tv_nsec as f64 / 1e9
 }
