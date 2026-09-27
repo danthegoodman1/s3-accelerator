@@ -16,10 +16,14 @@ async fn get(server: &Server) -> (u16, Vec<u8>) {
 }
 
 /// Reads the object twice, the second time from the cache.
-async fn warm(server: &Server, origin: &common::Origin) {
+/// Reads the object twice, then waits until its five blocks are recorded,
+/// which the second read may outrun: it reads the blocks once written,
+/// before they are durable.
+async fn warm(server: &Server, origin: &common::Origin, dir: &std::path::Path) {
     assert_eq!(get(server).await, (200, object()));
     assert_eq!(get(server).await, (200, object()));
     assert_eq!(origin.requests.get(), 1);
+    common::wait_recorded(&dir.join("slots"), 5).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -29,7 +33,7 @@ async fn a_clean_restart_keeps_the_cache_warm() {
             let (origin_port, origin) = start_origin().await;
             let dir = data_dir();
             let server = Server::start(origin_port, &dir, GRANTS, IMMUTABLE).await;
-            warm(&server, &origin).await;
+            warm(&server, &origin, &dir).await;
             server.stop().await;
             for _ in 0..2 {
                 let server = Server::start(origin_port, &dir, GRANTS, IMMUTABLE).await;
@@ -86,7 +90,7 @@ async fn a_crash_restart_verifies_blocks_before_serving_them() {
             let (origin_port, origin) = start_origin().await;
             let dir = data_dir();
             let server = Server::start(origin_port, &dir, GRANTS, IMMUTABLE).await;
-            warm(&server, &origin).await;
+            warm(&server, &origin, &dir).await;
             server.crash();
             let server = Server::start(origin_port, &dir, GRANTS, IMMUTABLE).await;
             assert_eq!(get(&server).await, (200, object()));

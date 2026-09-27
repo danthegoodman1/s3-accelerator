@@ -433,6 +433,30 @@ pub fn data_dir() -> PathBuf {
     dir
 }
 
+/// Valid records in the slot table at `path`.
+pub fn recorded(path: &Path) -> usize {
+    let table = std::fs::read(path).unwrap_or_default();
+    let records = table.get(4096..).unwrap_or_default();
+    records
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .filter(|record| s3_accelerator::disk::decode_record(record.as_slice()).is_some())
+        .count()
+}
+
+/// Waits until the slot table at `path` holds `count` records: the
+/// journal writes them after the blocks are durable, off the event loop.
+pub async fn wait_recorded(path: &Path, count: usize) {
+    for _ in 0..500 {
+        if recorded(path) >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the table holds {} records, not {count}", recorded(path));
+}
+
 /// The admin listener's answer at `path`: its status and body.
 pub async fn admin(port: u16, path: &str) -> (u16, String) {
     let response = reqwest::get(format!("http://127.0.0.1:{port}{path}"))

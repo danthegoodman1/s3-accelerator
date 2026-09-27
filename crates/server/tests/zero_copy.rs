@@ -6,7 +6,7 @@
 mod common;
 
 use common::trace::{Call, WRITES, check_writes_carry_no_body, now, read_trace, windows};
-use common::{Cluster, Process, data_dir, start_origin};
+use common::{Cluster, Process, data_dir, recorded, start_origin};
 use s3_accelerator::disk::decode_record;
 use std::collections::BTreeMap;
 use tokio::task::LocalSet;
@@ -443,18 +443,6 @@ fn cached_pages(file: &std::fs::File) -> usize {
         libc::munmap(address, len);
         pages.iter().filter(|page| *page & 1 == 1).count()
     }
-}
-
-/// How many records the slot table at `path` holds.
-fn recorded(path: &std::path::Path) -> usize {
-    let table = std::fs::read(path).unwrap_or_default();
-    let records = table.get(HEADER_SIZE as usize..).unwrap_or_default();
-    records
-        .as_chunks::<64>()
-        .0
-        .iter()
-        .filter(|record| decode_record(record.as_slice()).is_some())
-        .count()
 }
 
 /// Slot records, clears and metadata entries reach their files from the
