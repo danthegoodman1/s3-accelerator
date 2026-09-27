@@ -856,8 +856,6 @@ fn slice(bytes: &Bytes, offset: u64, len: u64) -> Option<Bytes> {
     Some(bytes.slice(range))
 }
 
-/// Starts S3 requests on this thread, and block writes and verifications
-/// on worker threads, each feeding its result back to the node.
 /// Rewrites the metadata file on a blocking thread, then any rewrite asked
 /// for meanwhile, then appends the entries saved meanwhile.
 async fn rewrite_metadata(engine: SharedNode, entries: Vec<(ObjectKey, node::Meta)>) {
@@ -885,6 +883,10 @@ async fn rewrite_metadata(engine: SharedNode, entries: Vec<(ObjectKey, node::Met
     }
 }
 
+/// Starts the work the node's actions left: S3 requests and reads of
+/// previous owners, whose results come back to this thread; block writes,
+/// verifications and syncs on worker and blocking threads; and messages
+/// to other nodes.
 fn start(engine: &SharedNode, work: Work) {
     if let Some(entries) = work.rewrite {
         tokio::task::spawn_local(rewrite_metadata(engine.clone(), entries));

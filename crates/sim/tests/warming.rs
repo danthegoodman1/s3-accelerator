@@ -31,6 +31,10 @@ fn an_upload_through_its_home_is_read_from_disk() {
     let key = key();
     sim.write_through(&key, 600).unwrap();
     assert_eq!(sim.summary().warmed_uploads, 1);
+    // Warmed blocks are no reader's misses.
+    let stats = sim.node_stats(0);
+    let misses = stats.misses_new + stats.misses_unadmitted + stats.misses_evicted;
+    assert_eq!((misses, stats.admitted), (0, 0));
     let before = sim.summary();
     let (head, body) = sim.read(Request::get(key.clone())).unwrap();
     let current = sim.origin().current(&key).unwrap();

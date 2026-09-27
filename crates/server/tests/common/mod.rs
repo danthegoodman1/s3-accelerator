@@ -53,8 +53,10 @@ pub const LISTING: &str = "<ListBucketResult><Name>bucket</Name></ListBucketResu
 /// object.
 pub struct Origin {
     pub requests: Cell<u64>,
-    /// Response body bytes it sent.
+    /// Response body bytes it sent, and requests whose client hung up
+    /// while it waited out `delay`.
     pub sent: Cell<u64>,
+    pub hung_up: Cell<u64>,
     pub deleted: Cell<bool>,
     /// Each request's path and query, as they arrived.
     pub paths: RefCell<Vec<String>>,
@@ -82,6 +84,7 @@ impl Default for Origin {
         Origin {
             requests: Cell::default(),
             sent: Cell::default(),
+            hung_up: Cell::default(),
             deleted: Cell::default(),
             paths: RefCell::default(),
             queries: RefCell::default(),
@@ -187,7 +190,15 @@ async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
                     }
                     _ => (200, Vec::new()),
                 };
-                tokio::time::sleep(origin.delay.get()).await;
+                let mut peeked = [0; 1];
+                tokio::select! {
+                    () = tokio::time::sleep(origin.delay.get()) => {}
+                    // The client closed the connection before the answer.
+                    Ok(0) = connection.stream().peek(&mut peeked) => {
+                        origin.hung_up.set(origin.hung_up.get() + 1);
+                        return;
+                    }
+                }
                 let listing = head.method == "GET" && body == LISTING.as_bytes();
                 if listing && origin.chunked.get() {
                     let written = async {

@@ -329,9 +329,9 @@ pub struct Stats {
     /// previous owner's responses.
     pub block_hits: u64,
     pub blocks_fetched: u64,
-    /// Blocks an owner or leased replica fetched and could store, by what
-    /// it remembers of them: the ghost queue holds them, the doorkeeper
-    /// turned them away, or neither.
+    /// Blocks an owner or leased replica fetched for a read and could
+    /// store, by what it remembers of them: the ghost queue holds them, the
+    /// doorkeeper turned them away, or neither.
     pub misses_evicted: u64,
     pub misses_unadmitted: u64,
     pub misses_new: u64,
@@ -341,12 +341,13 @@ pub struct Stats {
     pub refused_doorkeeper: u64,
     pub refused_budget: u64,
     pub refused_full: u64,
-    /// Blocks the store let go: evicted cold or disowned, purged, failing
-    /// their checksums, or left unfilled by a fill that ended without them.
+    /// Blocks the store let go, each by one cause: evicted cold or
+    /// disowned, purged, failing their checksums, or left unfilled by a
+    /// fill that ended without them.
     pub evicted_blocks: u64,
     pub disowned_blocks: u64,
     pub purged_blocks: u64,
-    pub corrupt_blocks: u64,
+    pub corrupt_dropped: u64,
     pub unfilled_blocks: u64,
     /// Body bytes served from stored blocks, from S3's responses, and from
     /// previous owners' blocks.
@@ -355,9 +356,10 @@ pub struct Stats {
     pub peer_bytes: u64,
     pub origin_requests: u64,
     pub written_bytes: u64,
-    /// Recovered blocks checked against their checksums; `corrupt_blocks`
-    /// counts those that failed.
+    /// Recovered blocks checked against their checksums, and those that
+    /// failed.
     pub verified_blocks: u64,
+    pub corrupt_blocks: u64,
     /// Reads sent to previous owners, those that went unanswered, and
     /// objects whose metadata a previous home supplied.
     pub peer_requests: u64,
@@ -405,6 +407,7 @@ impl std::ops::AddAssign for Stats {
         self.disowned_blocks += other.disowned_blocks;
         self.purged_blocks += other.purged_blocks;
         self.corrupt_blocks += other.corrupt_blocks;
+        self.corrupt_dropped += other.corrupt_dropped;
         self.unfilled_blocks += other.unfilled_blocks;
         self.hit_bytes += other.hit_bytes;
         self.miss_bytes += other.miss_bytes;
@@ -1190,7 +1193,7 @@ impl Node {
                     if self.store.get(&block).is_some() || self.in_flight.contains_key(&block) {
                         continue;
                     }
-                    if let Some(location) = self.admit(&key, size, block, true) {
+                    if let Some(location) = self.admit(&key, size, block, true, false) {
                         let span = layout.block_span(size, index);
                         self.track_in_flight(block, kept);
                         self.write(location, kept, span.start, span.end - span.start);
@@ -2011,6 +2014,7 @@ impl Node {
         // of the plans just abandoned.
         if self.store.get(&block).is_some() {
             self.store.remove(block);
+            self.stats.corrupt_dropped += 1;
             self.actions.push(Action::Clear { location });
             self.unref(block.version);
         }
@@ -2434,7 +2438,7 @@ impl Node {
             }
             // The body streams, so later readers wait for the block's write
             // and read its slot instead of joining the body.
-            if let Some(location) = self.admit(key, meta.size, block, false) {
+            if let Some(location) = self.admit(key, meta.size, block, false, true) {
                 self.write(location, origin, span.start - first, span.end - span.start);
             }
         }
@@ -2706,7 +2710,7 @@ impl Node {
         for index in run {
             let block = BlockKey { version, index };
             self.track_in_flight(block, origin);
-            if let Some(location) = self.admit(key, size, block, skip_doorkeeper) {
+            if let Some(location) = self.admit(key, size, block, skip_doorkeeper, !prefetch) {
                 stored.push((block, location));
             }
         }
@@ -3129,13 +3133,16 @@ impl Node {
 
     /// Reserves a slot if the admission policy stores this block. Blocks
     /// asked of a previous owner skip the doorkeeper: they were read
-    /// before, where they were stored.
+    /// before, where they were stored. A block a read fetched is `missed`,
+    /// and counts as a miss and by its admission; one warmed on write or
+    /// prefetched counts only where those do.
     fn admit(
         &mut self,
         key: &ObjectKey,
         size: u64,
         block: BlockKey,
         skip_doorkeeper: bool,
+        missed: bool,
     ) -> Option<Location> {
         let layout = self.config.layout;
         let placement = layout.placement(key, size, block.index).hash();
@@ -3143,21 +3150,22 @@ impl Node {
             return None;
         }
         let hash = block_hash(block.version, layout.block_size(), block.index);
+        let counted = u64::from(missed);
         if self.store.remembers(hash) {
-            self.stats.misses_evicted += 1;
+            self.stats.misses_evicted += counted;
         } else if self.doorkeeper.contains(hash) {
-            self.stats.misses_unadmitted += 1;
+            self.stats.misses_unadmitted += counted;
         } else {
-            self.stats.misses_new += 1;
+            self.stats.misses_new += counted;
         }
         if !skip_doorkeeper && !self.passes_doorkeeper(key, size, block) {
-            self.stats.refused_doorkeeper += 1;
+            self.stats.refused_doorkeeper += counted;
             return None;
         }
         let span = layout.block_span(size, block.index);
         let len = span.end - span.start;
         if self.filling_bytes + len > self.config.fill_budget {
-            self.stats.refused_budget += 1;
+            self.stats.refused_budget += counted;
             return None;
         }
         let location = self.store.reserve(block, len, hash, placement);
@@ -3175,10 +3183,10 @@ impl Node {
             self.unref(evicted.version);
         }
         let Some(location) = location else {
-            self.stats.refused_full += 1;
+            self.stats.refused_full += counted;
             return None;
         };
-        self.stats.admitted += 1;
+        self.stats.admitted += counted;
         self.filling_bytes += len;
         Some(location)
     }

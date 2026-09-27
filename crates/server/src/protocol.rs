@@ -36,6 +36,11 @@ impl std::fmt::Display for RequestId {
         write!(f, "{:016x}", self.0)
     }
 }
+
+/// A request ID for a log line, or `none` for work no client asked for.
+pub fn logged(id: Option<RequestId>) -> String {
+    id.map_or_else(|| "none".to_string(), |id| id.to_string())
+}
 const KIND: &str = "x-accel-read";
 const METHOD: &str = "x-accel-method";
 const STALE: &str = "x-accel-stale";

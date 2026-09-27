@@ -143,3 +143,26 @@ async fn checksums_come_back_on_whole_object_reads_that_ask() {
         })
         .await;
 }
+
+/// A read S3 answers only after the node's timeout is cancelled, and its
+/// connection to S3 closes then, rather than waiting on S3's answer.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cancelled_s3_read_closes_its_connection() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            let cache = "block_size = 65536\nextent_size = 1048576\nextents = 8\n\
+                         origin_timeout_ms = 200\nnode_timeout_ms = 1000";
+            let grants = r#"{ bucket = "bucket" }"#;
+            let dir = data_dir();
+            let server = Server::start_with(origin_port, &dir, grants, "", cache).await;
+            origin.delay.set(Duration::from_millis(2_000));
+            let (status, _) = send(server.port, "GET", "/bucket/k", "", &[], Vec::new()).await;
+            assert_eq!(status, 503);
+            // The node hung up on S3 well before S3's answer was due.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(origin.requests.get(), 1);
+            assert_eq!(origin.hung_up.get(), 1);
+        })
+        .await;
+}

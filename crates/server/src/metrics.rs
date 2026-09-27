@@ -402,7 +402,7 @@ fn render_core(out: &mut Out, stats: &Stats, usage: &Usage) {
             ("cause=\"evicted\"", stats.evicted_blocks),
             ("cause=\"disowned\"", stats.disowned_blocks),
             ("cause=\"purged\"", stats.purged_blocks),
-            ("cause=\"corrupt\"", stats.corrupt_blocks),
+            ("cause=\"corrupt\"", stats.corrupt_dropped),
             ("cause=\"unfilled\"", stats.unfilled_blocks),
         ],
     );

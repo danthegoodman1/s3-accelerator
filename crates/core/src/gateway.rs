@@ -128,8 +128,10 @@ pub struct Gateway {
     /// When the gateway last asked a node for its ring, until it arrives.
     fetching_ring: Option<Time>,
     /// Whether a node has answered the gateway. Until one does, the
-    /// gateway asks the nodes it knows for a ring.
+    /// gateway asks the nodes it knows for a ring once a suspect window,
+    /// last at `unheard_asked`.
     heard: bool,
+    unheard_asked: Option<Time>,
     actions: Vec<Action>,
 }
 
@@ -268,6 +270,7 @@ impl Gateway {
             down_fetched: None,
             fetching_ring: None,
             heard: false,
+            unheard_asked: None,
             actions: Vec::new(),
         }
     }
@@ -466,7 +469,11 @@ impl Gateway {
         }
         // A starting gateway's ring may be old: it asks for one before its
         // first read needs it.
-        if !self.heard {
+        let due = self
+            .unheard_asked
+            .is_none_or(|at| now.0 >= at.0 + self.config.suspect_ttl);
+        if !self.heard && due {
+            self.unheard_asked = Some(now);
             self.find_ring(now);
         }
     }
@@ -680,7 +687,9 @@ impl Gateway {
         };
         let read = self.reads.get_mut(&id).expect("planned read exists");
         read.stage = Stage::Parts { head, parts };
-        read.ahead = Some(Ahead {
+        // With runs left, a read whose parts are all forwarded asks for
+        // more; without, it has asked for its whole body.
+        read.ahead = (!runs.is_empty()).then(|| Ahead {
             key: request.key,
             etag: meta.etag.clone(),
             size: meta.size,
@@ -756,7 +765,9 @@ impl Gateway {
     }
 
     /// Sends runs of a version's bytes to their targets, one part per run
-    /// of runs with one target; `None` if some run has no candidate left.
+    /// of runs with one target, each part at most half the read-ahead
+    /// window, so the next part is asked for while one streams; `None` if
+    /// some run has no candidate left.
     fn dispatch_runs(
         &mut self,
         id: ClientRequestId,
@@ -766,11 +777,17 @@ impl Gateway {
         runs: Vec<Run>,
         tried: &[NodeId],
     ) -> Option<VecDeque<NodeRequestId>> {
+        let most = self.config.read_ahead / 2;
         let mut groups: Vec<(NodeId, Vec<Run>)> = Vec::new();
         for run in runs {
             let node = self.spread(run.0, tried)?;
             match groups.last_mut() {
-                Some((target, runs)) if *target == node => runs.push(run),
+                Some((target, runs))
+                    if *target == node
+                        && runs.iter().map(run_len).sum::<u64>() + run_len(&run) <= most =>
+                {
+                    runs.push(run)
+                }
                 _ => groups.push((node, vec![run])),
             }
         }
@@ -1536,6 +1553,99 @@ mod tests {
         gateway.on_forwarded(Time(3), home, 256);
         assert_eq!(gateway.drain(), Vec::new());
         assert!(gateway.is_idle());
+    }
+
+    /// Until a node answers, a gateway asks for a ring once a suspect
+    /// window, however its attempts fail.
+    #[test]
+    fn an_unheard_gateway_asks_for_a_ring_once_a_suspect_window() {
+        let mut gateway = gateway();
+        let finds = |gateway: &mut Gateway| {
+            let actions = gateway.drain().into_iter();
+            actions.filter(|action| *action == Action::FindRing).count()
+        };
+        gateway.on_tick(Time(0));
+        assert_eq!(finds(&mut gateway), 1);
+        gateway.on_ring_failed(Time(10));
+        gateway.on_tick(Time(50));
+        assert_eq!(finds(&mut gateway), 0);
+        gateway.on_tick(Time(100));
+        assert_eq!(finds(&mut gateway), 1);
+        gateway.on_ring_version(Time(110), NodeId(0), gateway.ring().version(), 0);
+        gateway.on_tick(Time(1_000));
+        assert_eq!(finds(&mut gateway), 0);
+    }
+
+    /// With one owner, a read-ahead window goes out as parts of at most half
+    /// the window, so the next part is asked for while one streams.
+    #[test]
+    fn one_owners_window_goes_out_in_halves() {
+        let member = Member {
+            id: NodeId(0),
+            weight: NonZeroU32::MIN,
+        };
+        let config = Config {
+            read_ahead: 256,
+            ..gateway().config
+        };
+        let mut gateway = Gateway::new(Ring::new(1, vec![member]), config);
+        let key = ObjectKey {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        let etag = ETag("\"v1\"".into());
+        gateway.on_request(Time(0), ClientRequestId(1), Request::head(key.clone()));
+        let home = sends(&gateway.drain())[0];
+        let meta = ObjectMeta {
+            etag: etag.clone(),
+            size: 1_024,
+            headers: Vec::new(),
+            age: 0,
+        };
+        gateway.on_node_metadata(Time(1), home, meta);
+        gateway.drain();
+        let spans = |actions: Vec<Action>| -> Vec<(NodeRequestId, u64, u64)> {
+            actions
+                .into_iter()
+                .filter_map(|action| match action {
+                    Action::Send {
+                        id,
+                        read: Read::Range(range),
+                        ..
+                    } => Some((id, range.first, range.last)),
+                    _ => None,
+                })
+                .collect()
+        };
+        gateway.on_request(Time(2), ClientRequestId(2), Request::get(key));
+        let parts = spans(gateway.drain());
+        let asked: Vec<(u64, u64)> = parts
+            .iter()
+            .map(|&(_, first, last)| (first, last))
+            .collect();
+        assert_eq!(asked, [(0, 127), (128, 255)]);
+        for &(id, first, last) in &parts {
+            let answer = ResponseHead {
+                status: 206,
+                etag: Some(etag.clone()),
+                content_range: Some(ContentRange {
+                    first,
+                    last,
+                    size: 1_024,
+                }),
+                content_length: last - first + 1,
+                headers: Vec::new(),
+            };
+            gateway.on_node_response(Time(3), id, answer, None);
+        }
+        gateway.drain();
+        // The first part forwarded, the window has room for the next.
+        gateway.on_forwarded(Time(4), parts[0].0, 128);
+        let next: Vec<(u64, u64)> = spans(gateway.drain())
+            .into_iter()
+            .map(|(_, first, last)| (first, last))
+            .collect();
+        assert_eq!(next, [(256, 383)]);
     }
 
     /// A node answers a part with other bytes than it asked for, as a node

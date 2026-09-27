@@ -113,7 +113,8 @@ impl Origin {
     pub async fn read(self: &Arc<Self>, request: &Request, hold: Option<u64>) -> Reply {
         let (origin, request) = (self.clone(), request.clone());
         let reading = workers().spawn(async move { origin.read_here(&request, hold).await });
-        reading.await.unwrap_or_else(|_| Reply::failed())
+        let mut reading = Cancelling(reading);
+        (&mut reading.0).await.unwrap_or_else(|_| Reply::failed())
     }
 
     async fn read_here(&self, request: &Request, hold: Option<u64>) -> Reply {
@@ -193,7 +194,8 @@ impl Origin {
                 .send(&method, &path, &query, headers, &payload_hash, body, len)
                 .await
         });
-        sending.await.map_err(io::Error::other)?
+        let mut sending = Cancelling(sending);
+        (&mut sending.0).await.map_err(io::Error::other)?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -229,6 +231,16 @@ impl Origin {
         }
         let request = request.body(body).map_err(io::Error::other)?;
         self.client.request(request).await.map_err(io::Error::other)
+    }
+}
+
+/// A worker's task that stops when its waiter does, such as when the core
+/// cancels an S3 request, so the request closes at once.
+struct Cancelling<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for Cancelling<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

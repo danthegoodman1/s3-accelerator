@@ -3,11 +3,13 @@
 
 use crate::gateway_engine::{GatewayEngine, SharedGateway};
 use crate::http::{Connection, Response};
+use crate::log;
 use crate::metrics::{Metrics, View};
 use crate::node_engine::{NodeEngine, SharedNode};
 use bytes::Bytes;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 
 /// What the admin listener reports on: the process's roles as they start,
@@ -153,11 +155,21 @@ impl Progress {
     }
 }
 
+/// How long the admin listener waits after failing to accept.
+const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
+
 /// Serves the admin listener for as long as the process runs.
 pub async fn serve(listener: TcpListener, admin: Rc<Admin>) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            // An error such as running out of descriptors lasts a while;
+            // the pause keeps the event loop free for the node and gateway.
+            Err(error) => {
+                log!(Warn, "the admin listener failed to accept", error = error);
+                tokio::time::sleep(ACCEPT_PAUSE).await;
+                continue;
+            }
         };
         let admin = admin.clone();
         tokio::task::spawn_local(async move {

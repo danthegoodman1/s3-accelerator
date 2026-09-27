@@ -753,6 +753,7 @@ async fn purge(
                 log!(
                     Warn,
                     "a node answered a purge out of protocol",
+                    request = protocol::logged(connection.request_id()),
                     node = node.0
                 )
             }
@@ -761,6 +762,7 @@ async fn purge(
                 log!(
                     Warn,
                     "purging through a node failed",
+                    request = protocol::logged(connection.request_id()),
                     node = node.0,
                     error = failure
                 )
@@ -1092,6 +1094,7 @@ async fn pass(
                 log!(
                     Warn,
                     "passing a request to a node failed",
+                    request = protocol::logged(connection.request_id()),
                     node = node.0,
                     error = failure
                 )
@@ -1162,6 +1165,7 @@ async fn pass(
                     log!(
                         Warn,
                         "passing a request through a node failed",
+                        request = protocol::logged(connection.request_id()),
                         node = node.0,
                         error = failure
                     );

@@ -160,10 +160,15 @@ pub fn changes(body: &str) -> Result<Changes, String> {
 }
 
 /// An ISO 8601 time in UTC, such as `2026-09-27T12:34:56.789Z`, the form
-/// S3's `eventTime` takes.
+/// S3's `eventTime` takes. Anyone who can send to the queue writes it, so
+/// any other text is `None`.
 fn parse_time(time: &str) -> Option<SystemTime> {
     let (date, clock) = time.strip_suffix('Z')?.split_once('T')?;
-    let number = |part: &str| part.parse::<i64>().ok();
+    let number = |part: &str| {
+        let digits =
+            !part.is_empty() && part.len() <= 4 && part.bytes().all(|b| b.is_ascii_digit());
+        digits.then(|| part.parse::<i64>().ok()).flatten()
+    };
     let mut date = date.splitn(3, '-');
     let (year, month, day) = (
         number(date.next()?)?,
@@ -177,7 +182,21 @@ fn parse_time(time: &str) -> Option<SystemTime> {
         number(clock.next()?)?,
         number(clock.next()?)?,
     );
-    let millis = number(&format!("{fraction:0<3}")[..3])?;
+    let fraction: String = fraction
+        .chars()
+        .chain(std::iter::repeat('0'))
+        .take(3)
+        .collect();
+    let millis = number(&fraction)?;
+    let valid = (1970..=9999).contains(&year)
+        && (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && hour < 24
+        && minute < 60
+        && second <= 60;
+    if !valid {
+        return None;
+    }
     let seconds =
         sigv4::days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
     let millis = u64::try_from(seconds * 1_000 + millis).ok()?;
@@ -242,6 +261,15 @@ mod tests {
         let millis = 1_790_512_496_789;
         let earliest = SystemTime::UNIX_EPOCH + Duration::from_millis(millis);
         assert_eq!(read.event_time, Some(earliest));
+    }
+
+    #[test]
+    fn a_malformed_event_time_is_none() {
+        assert_eq!(parse_time("2026-09-27T12:34:56.\u{e9}\u{e9}Z"), None);
+        assert_eq!(parse_time("2026-13-27T12:34:56Z"), None);
+        assert_eq!(parse_time("99999-09-27T12:34:56Z"), None);
+        assert_eq!(parse_time("2026-09-27T12:34:+6Z"), None);
+        assert!(parse_time("2026-09-27T12:34:56.7Z").is_some());
     }
 
     #[test]

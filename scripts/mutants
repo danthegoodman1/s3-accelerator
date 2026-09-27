@@ -461,8 +461,8 @@ MUTANTS = [
     ),
     (
         "a late reader joins a streaming body",
-        [(NODE, "if let Some(location) = self.admit(key, meta.size, block, false) {\n                self.write(location, origin, span.start - first, span.end - span.start);",
-          "self.track_in_flight(block, origin);\n            if let Some(location) = self.admit(key, meta.size, block, false) {\n                self.write(location, origin, span.start - first, span.end - span.start);")],
+        [(NODE, "if let Some(location) = self.admit(key, meta.size, block, false, true) {\n                self.write(location, origin, span.start - first, span.end - span.start);",
+          "self.track_in_flight(block, origin);\n            if let Some(location) = self.admit(key, meta.size, block, false, true) {\n                self.write(location, origin, span.start - first, span.end - span.start);")],
     ),
     (
         "a fill spans more than a chunk",
@@ -882,7 +882,7 @@ MUTANTS = [
     ),
     (
         "S3 bodies are received on the event loop",
-        [(ORIGIN, "let reading = workers().spawn(async move { origin.read_here(&request, hold).await });\n        reading.await.unwrap_or_else(|_| Reply::failed())",
+        [(ORIGIN, "let reading = workers().spawn(async move { origin.read_here(&request, hold).await });\n        let mut reading = Cancelling(reading);\n        (&mut reading.0).await.unwrap_or_else(|_| Reply::failed())",
                   "origin.read_here(&request, hold).await")],
     ),
     (
@@ -926,12 +926,12 @@ MUTANTS = [
     ),
     (
         "an evicted block's miss is counted as new",
-        [(NODE, "if self.store.remembers(hash) {\n            self.stats.misses_evicted += 1;",
-                "if self.store.remembers(hash) {\n            self.stats.misses_new += 1;")],
+        [(NODE, "if self.store.remembers(hash) {\n            self.stats.misses_evicted += counted;",
+                "if self.store.remembers(hash) {\n            self.stats.misses_new += counted;")],
     ),
     (
         "doorkeeper refusals go uncounted",
-        [(NODE, "self.stats.refused_doorkeeper += 1;", "")],
+        [(NODE, "self.stats.refused_doorkeeper += counted;", "")],
     ),
     (
         "a relayed body's blocks go uncounted",
@@ -943,7 +943,7 @@ MUTANTS = [
     ),
     (
         "a corrupt block a purge freed is freed again",
-        [(NODE, "if self.store.get(&block).is_some() {\n            self.store.remove(block);\n            self.actions.push(Action::Clear { location });\n            self.unref(block.version);\n        }",
+        [(NODE, "if self.store.get(&block).is_some() {\n            self.store.remove(block);\n            self.stats.corrupt_dropped += 1;\n            self.actions.push(Action::Clear { location });\n            self.unref(block.version);\n        }",
                 "self.store.remove(block);\n        self.actions.push(Action::Clear { location });\n        self.unref(block.version);")],
     ),
     (
@@ -952,7 +952,7 @@ MUTANTS = [
     ),
     (
         "a starting gateway waits for a read to ask for a ring",
-        [(GATEWAY, "if !self.heard {\n            self.find_ring(now);\n        }", "")],
+        [(GATEWAY, "if !self.heard && due {\n            self.unheard_asked = Some(now);\n            self.find_ring(now);\n        }", "")],
     ),
     (
         "a node is ready before it joins",
@@ -979,6 +979,28 @@ MUTANTS = [
     (
         "cache bytes are rendered as S3's",
         [(METRICS, '("source=\\"cache\\"", stats.hit_bytes),', '("source=\\"cache\\"", stats.miss_bytes),')],
+    ),
+    (
+        "an unheard gateway asks for a ring every tick",
+        [(GATEWAY, "if !self.heard && due {", "if !self.heard {")],
+    ),
+    (
+        "one owner's window goes out as one part",
+        [(GATEWAY, "let most = self.config.read_ahead / 2;", "let most = u64::MAX;")],
+    ),
+    (
+        "warmed blocks count as misses",
+        [(NODE, "let counted = u64::from(missed);", "let counted = 1;")],
+    ),
+    (
+        "a cancelled S3 read keeps its connection",
+        [(ORIGIN, "impl<T> Drop for Cancelling<T> {\n    fn drop(&mut self) {\n        self.0.abort();\n    }\n}",
+                  "impl<T> Drop for Cancelling<T> {\n    fn drop(&mut self) {}\n}")],
+    ),
+    (
+        "event times with multi-byte fractions panic",
+        [(SQS, "let fraction: String = fraction.chars().chain(std::iter::repeat('0')).take(3).collect();",
+               "let fraction = format!(\"{fraction:0<3}\")[..3].to_string();")],
     ),
     (
         "request IDs never reach nodes",

@@ -504,9 +504,9 @@ pub fn split_path(path: &str) -> (String, String) {
 /// Bodies at most this long go out in the same write as their head.
 const COALESCED_BODY: usize = 64 << 10;
 
-/// A response's status line and headers, ending with the blank line.
-/// A response's head. A response to the client request `request_id` names
-/// it, and when S3 gave the response no ID of its own, names it as S3's.
+/// A response's status line and headers, ending with the blank line. A
+/// response to the client request `request_id` names it, and when S3 gave
+/// the response no ID of its own, names it as S3's too.
 fn response_head(
     status: u16,
     headers: &[(String, String)],

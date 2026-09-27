@@ -8,7 +8,7 @@
 use crate::log;
 use crate::metrics::{Metrics, NodeFailure};
 use crate::peers::{Exchanged, NodeBody, Peers};
-use crate::protocol::{Hint, NodeAnswer, NodeRequest, RequestId, Versions};
+use crate::protocol::{self, Hint, NodeAnswer, NodeRequest, RequestId, Versions};
 use s3_accelerator_core::Time;
 use s3_accelerator_core::gateway::{self, ClientRequestId, Gateway, NodeRequestId};
 use s3_accelerator_core::node::{HotHint, Read};
@@ -400,6 +400,7 @@ fn start(engine: &SharedGateway, work: Work) {
                         log!(
                             Warn,
                             "reading from a node failed",
+                            request = protocol::logged(request_id),
                             node = node.0,
                             error = error
                         );
