@@ -139,6 +139,31 @@ fn preconditions_come_before_an_unsatisfiable_range() {
     assert_eq!(sim.read(request).unwrap().0.status, 304);
 }
 
+/// A conditional read whose range lies past the object's end has its home
+/// fetch the metadata alone. Writes through the home overtake that fetch
+/// every tick, and the fetch still answers the read that started it.
+#[test]
+fn writes_that_overtake_a_metadata_fetch_leave_its_read_answered() {
+    let mut sim = Simulator::new(1, Options::scenario());
+    let key = key(TTL_BUCKET, "busy");
+    sim.put(&key, 100);
+    let request = Request {
+        if_match: Some(ETag("\"stale\"".into())),
+        range: Some(ByteRange::From { first: 500 }),
+        ..Request::get(key.clone())
+    };
+    let read = sim.start(request);
+    for size in 100..300 {
+        if let Some((head, _)) = sim.take_answer(read) {
+            assert_eq!(head.status, 412);
+            return;
+        }
+        sim.write_at_once(0, &key, size).unwrap();
+        sim.step().unwrap();
+    }
+    panic!("writes starved the read");
+}
+
 /// A request that planned two fills, both of which fail `If-Match`, goes
 /// back to the gateway once.
 #[test]
@@ -924,6 +949,32 @@ fn a_purge_that_rewrites_the_metadata_file_stays_purged() {
     sim.restart(0).unwrap();
     let before = sim.summary().origin_requests;
     sim.read(Request::head(keys[7].clone())).unwrap();
+    assert_eq!(sim.summary().origin_requests, before + 1);
+}
+
+/// A crash leaves the metadata file holding a key's metadata and, after
+/// it, the purge that dropped it. The restarted node replays both, and
+/// the key stays forgotten.
+#[test]
+fn a_crash_replays_a_purge_after_the_metadata_it_drops() {
+    let mut options = Options::scenario();
+    options.nodes = 1;
+    options.gateway_metadata_capacity = 1;
+    let mut sim = Simulator::new(1, options);
+    let (purged, other) = (key(IMMUTABLE_BUCKET, "k0"), key(IMMUTABLE_BUCKET, "k1"));
+    for key in [&purged, &other] {
+        sim.put(key, 100);
+        sim.read(Request::head(key.clone())).unwrap();
+    }
+    assert_eq!(sim.metadata_file_entries(0), 2);
+    sim.purge(&purged).unwrap();
+    assert_eq!(sim.metadata_file_entries(0), 3);
+    // The gateway, which keeps one object's metadata, keeps k1's.
+    sim.read(Request::head(other.clone())).unwrap();
+    sim.crash(0).unwrap();
+    sim.restart(0).unwrap();
+    let before = sim.summary().origin_requests;
+    sim.read(Request::head(purged)).unwrap();
     assert_eq!(sim.summary().origin_requests, before + 1);
 }
 

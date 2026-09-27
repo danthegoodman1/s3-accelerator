@@ -199,3 +199,25 @@ fn clients_back_off_from_a_body_that_ends_early() {
         panic!("{failure}");
     }
 }
+
+/// Seed 6276: writes through the home, every few ticks, overtook each of
+/// its metadata-only fetches for a conditional read past the object's end,
+/// and the home fetched again each time, so the read never finished.
+/// `writes_that_overtake_a_metadata_fetch_leave_its_read_answered` pins it.
+#[test]
+fn a_read_outlasts_writes_that_overtake_its_fetch() {
+    if let Err(failure) = Simulator::from_seed(6276).run() {
+        panic!("{failure}");
+    }
+}
+
+/// Seed 83402: a gateway started a response from metadata still fresh
+/// enough to use, of a version S3 had just replaced, and the part its
+/// read-ahead window asked for next found S3 without it, so the response
+/// ended early, as the spec allows.
+#[test]
+fn a_response_from_fresh_but_replaced_metadata_can_end_early() {
+    if let Err(failure) = Simulator::from_seed(83402).run() {
+        panic!("{failure}");
+    }
+}

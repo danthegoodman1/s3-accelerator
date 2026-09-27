@@ -3746,14 +3746,16 @@ impl Simulator {
                 .saturating_sub(self.options.staleness(&pending.read.key));
             properties::check_early_end(&self.origin, &pending.read, from, self.now, &head, &body)
                 .map_err(|message| self.failure(message))?;
-            // A response asks for the rest of its body as it goes, so a
-            // write after it was sent can leave S3 without its version.
-            let changed = self
+            // A response asks for the rest of its body as it goes, so it
+            // ends early once S3 no longer holds its version: after a write
+            // while it streams, or one before it that the gateway's
+            // metadata, fresh enough to use, predates.
+            let replaced = self
                 .origin
                 .states_during(&pending.read.key, sent, self.now)
-                .len()
-                > 1;
-            if unexplained && !changed {
+                .iter()
+                .any(|state| state.map(|object| &object.etag) != head.etag.as_ref());
+            if unexplained && !replaced {
                 return Err(self.failure(format!(
                     "{request:?} ended early with no fault to explain it"
                 )));

@@ -2313,15 +2313,24 @@ impl Node {
         let meta = metadata(&head);
         let has_meta = meta.is_some();
         if !relay {
-            if superseded {
-                self.serve(now, request);
-            } else if let Some(meta) = meta {
-                self.know(key, meta, sent);
-                self.serve(now, request);
-            } else {
-                self.waiting.remove(&request);
-                let head = ResponseHead::status(head.status);
-                self.respond(request, head, Vec::new(), Holds::default(), None);
+            match meta {
+                // A write overtook the fetch, so the home keeps none of its
+                // metadata. The request that started the fetch arrived
+                // before the write, so the fetch still answers it: fetching
+                // again could starve it while writes keep coming.
+                Some(meta) if superseded => {
+                    let shared = shared(&meta, sent, now);
+                    self.plan(request, &key, &meta, shared);
+                }
+                Some(meta) => {
+                    self.know(key, meta, sent);
+                    self.serve(now, request);
+                }
+                None => {
+                    self.waiting.remove(&request);
+                    let head = ResponseHead::status(head.status);
+                    self.respond(request, head, Vec::new(), Holds::default(), None);
+                }
             }
             return self.resume(now, waiters, sent, &head, has_meta);
         }

@@ -1359,10 +1359,14 @@ mod tests {
         gateway.on_ring(Time(20), ring.clone(), down.clone());
         gateway.on_ring_version(Time(30), NodeId(1), ring.version(), down_version(&down));
         assert_eq!(fetches(&mut gateway), 0);
-        let key = ObjectKey {
-            bucket: "b".into(),
-            key: "k".into(),
-        };
+        // A key whose home is node 2, which the gateway now tries last.
+        let key = (0..)
+            .map(|index| ObjectKey {
+                bucket: "b".into(),
+                key: format!("k{index}"),
+            })
+            .find(|key| ring.owner(Placement::Home(key).hash()) == Some(NodeId(2)))
+            .expect("some key's home is node 2");
         assert_eq!(gateway.pass_candidates(&key).last(), Some(&NodeId(2)));
         // Node 2 answers, so it is up, whatever the ring said.
         gateway.on_ring_version(Time(40), NodeId(2), ring.version(), down_version(&down));
