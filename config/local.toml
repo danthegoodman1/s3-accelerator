@@ -11,7 +11,7 @@ secret_access_key = "local-credential"
 [[clients]]
 access_key_id = "local-identity"
 secret_access_key = "local-credential"
-grants = [{ bucket = "*" }]
+grants = [{ bucket = "*", access = "admin" }]
 
 [cache]
 block_size = 65536

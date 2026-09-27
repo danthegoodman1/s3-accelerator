@@ -2,7 +2,8 @@
 
 mod common;
 
-use common::{send, signed, start};
+use common::{object, presigned, send, signed, start};
+use s3_accelerator::sigv4::{self, Credentials, Signer, UNSIGNED_PAYLOAD};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -122,6 +123,178 @@ async fn an_oversized_key_list_is_refused_before_it_is_read() {
             assert!(response.starts_with("HTTP/1.1 400"), "{response}");
             assert!(response.contains("EntityTooLarge"), "{response}");
             assert_eq!(origin.requests.get(), 0);
+        })
+        .await;
+}
+
+/// A bucket whose blocks go to disk on their first read, so the second
+/// read of an object is a hit.
+const FIRST_READ: &str = "[cache.buckets.bucket]\nimmutable = true\nadmit_on_first_read = true";
+
+/// A presigned URL reads and writes without credentials: its GETs come
+/// from the cache after the first, its PUT reaches S3 without the
+/// signature's parameters, and an altered or expired URL gets 403.
+#[tokio::test(flavor = "current_thread")]
+async fn a_presigned_url_reads_and_writes_without_credentials() {
+    LocalSet::new()
+        .run_until(async {
+            let (port, origin) = start(r#"{ bucket = "bucket" }"#, FIRST_READ).await;
+            let host = format!("127.0.0.1:{port}");
+            let client = reqwest::Client::new();
+            let status = |url: String, method: reqwest::Method| {
+                let request = client.request(method, url);
+                async move { request.send().await.unwrap().status().as_u16() }
+            };
+            let get = presigned(port, &host, ("GET", "/bucket/k", ""), 0, 300);
+            for _ in 0..2 {
+                let response = client.get(&get).send().await.unwrap();
+                assert_eq!(response.status().as_u16(), 200);
+                assert!(response.bytes().await.unwrap() == object());
+            }
+            assert_eq!(origin.requests.get(), 1);
+            let head = presigned(port, &host, ("HEAD", "/bucket/k", ""), 0, 300);
+            assert_eq!(status(head, reqwest::Method::HEAD).await, 200);
+            let put = presigned(port, &host, ("PUT", "/bucket/new", ""), 0, 300);
+            let response = client
+                .put(&put)
+                .body(b"written".to_vec())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(origin.written.borrow()["/bucket/new"].1, b"written");
+            assert!(
+                origin
+                    .queries
+                    .borrow()
+                    .iter()
+                    .all(|query| !query.contains("X-Amz"))
+            );
+            let altered = get.replace("/bucket/k?", "/bucket/other?");
+            assert_eq!(status(altered, reqwest::Method::GET).await, 403);
+            let expired = presigned(port, &host, ("GET", "/bucket/k", ""), 120, 60);
+            assert_eq!(status(expired, reqwest::Method::GET).await, 403);
+        })
+        .await;
+}
+
+/// `response-*` parameters set headers of a read's response, on a hit as
+/// on the miss before it.
+#[tokio::test(flavor = "current_thread")]
+async fn response_overrides_set_a_reads_headers() {
+    LocalSet::new()
+        .run_until(async {
+            let (port, origin) = start(r#"{ bucket = "bucket" }"#, FIRST_READ).await;
+            let query = "response-content-type=text%2Fplain\
+                &response-content-disposition=attachment%3B%20filename%3D%22k.txt%22";
+            for _ in 0..2 {
+                let url = format!("http://127.0.0.1:{port}/bucket/k?{query}");
+                let mut request = reqwest::Client::new().get(url);
+                for (name, value) in signed(port, "GET", "/bucket/k", query, &[]) {
+                    request = request.header(name, value);
+                }
+                let response = request.send().await.unwrap();
+                assert_eq!(response.status().as_u16(), 200);
+                let header = |name: &str| response.headers()[name].to_str().unwrap().to_string();
+                assert_eq!(header("content-type"), "text/plain");
+                assert_eq!(
+                    header("content-disposition"),
+                    r#"attachment; filename="k.txt""#
+                );
+            }
+            assert_eq!(origin.requests.get(), 1);
+        })
+        .await;
+}
+
+/// A request to a subdomain of one of the gateway's domains names its
+/// bucket there, signed or presigned.
+#[tokio::test(flavor = "current_thread")]
+async fn a_virtual_hosted_request_names_its_bucket_in_its_host() {
+    LocalSet::new()
+        .run_until(async {
+            let (port, origin) = start(r#"{ bucket = "bucket" }"#, "").await;
+            let host = format!("bucket.s3.test:{port}");
+            let signer = Signer {
+                credentials: Credentials {
+                    access_key_id: "reader".into(),
+                    secret_access_key: "reader-secret".into(),
+                },
+                region: "us-east-1".into(),
+                service: "s3",
+            };
+            let mut headers = vec![("host".to_string(), host.clone())];
+            signer.sign(
+                "GET",
+                "/k",
+                "",
+                &mut headers,
+                UNSIGNED_PAYLOAD,
+                sigv4::unix_now(),
+            );
+            let mut request = reqwest::Client::new().get(format!("http://127.0.0.1:{port}/k"));
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            assert!(response.bytes().await.unwrap() == object());
+            assert_eq!(origin.paths.borrow().last().unwrap(), "/bucket/k");
+            let url = presigned(port, &host, ("HEAD", "/k", ""), 0, 300);
+            let response = reqwest::Client::new()
+                .head(url)
+                .header("host", &host)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+        })
+        .await;
+}
+
+/// Grants give read, write or admin access to a prefix. A read grant
+/// reads its prefix and writes nothing; a listing is checked against the
+/// prefix it lists; every key a `DeleteObjects` names needs a write grant;
+/// and only an admin grant on the whole bucket changes the bucket.
+#[tokio::test(flavor = "current_thread")]
+async fn grants_give_each_level_of_access_to_their_prefix() {
+    LocalSet::new()
+        .run_until(async {
+            let grants = r#"{ bucket = "bucket", prefix = "public/", access = "read" },
+                            { bucket = "bucket", prefix = "shared/" }"#;
+            let (port, _origin) = start(grants, "").await;
+            let status = |method: &'static str, path: &'static str, query: &'static str| async move {
+                send(port, method, path, query, &[], Vec::new()).await.0
+            };
+            assert_eq!(status("GET", "/bucket/public/a", "").await, 200);
+            assert_eq!(status("PUT", "/bucket/public/a", "").await, 403);
+            assert_eq!(status("PUT", "/bucket/shared/a", "").await, 200);
+            assert_eq!(status("GET", "/bucket", "list-type=2&prefix=public%2F").await, 200);
+            assert_eq!(status("GET", "/bucket", "list-type=2&prefix=shared%2Fx").await, 200);
+            assert_eq!(status("GET", "/bucket", "list-type=2").await, 403);
+            assert_eq!(status("GET", "/bucket", "list-type=2&prefix=secret%2F").await, 403);
+            assert_eq!(status("HEAD", "/bucket", "").await, 200);
+            assert_eq!(status("PUT", "/bucket", "policy").await, 403);
+            assert_eq!(status("DELETE", "/bucket", "").await, 403);
+            let delete = |keys: &[&str]| {
+                let objects: String = keys
+                    .iter()
+                    .map(|key| format!("<Object><Key>{key}</Key></Object>"))
+                    .collect();
+                let body = format!("<Delete>{objects}</Delete>").into_bytes();
+                async move { send(port, "POST", "/bucket", "delete", &[], body).await.0 }
+            };
+            assert_eq!(delete(&["shared/a", "secret/b"]).await, 403);
+            assert_eq!(delete(&["shared/a", "public/a"]).await, 403);
+            assert_eq!(delete(&["shared/a"]).await, 200);
+            // Changing the bucket takes an admin grant, even beside a write
+            // grant on the whole bucket.
+            for (access, allowed) in [("write", 403), ("admin", 200)] {
+                let grant = format!(r#"{{ bucket = "bucket", access = "{access}" }}"#);
+                let (port, _) = start(&grant, "").await;
+                let policy = send(port, "PUT", "/bucket", "policy", &[], b"{}".to_vec()).await;
+                assert_eq!(policy.0, allowed, "{access}");
+            }
         })
         .await;
 }

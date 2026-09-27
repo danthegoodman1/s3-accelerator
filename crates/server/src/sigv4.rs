@@ -13,6 +13,18 @@ pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 pub const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 /// How far a request's signing time may be from now, in seconds.
 const MAX_SKEW: i64 = 15 * 60;
+/// How long a presigned URL may last, in seconds: seven days.
+pub const MAX_EXPIRES: i64 = 7 * 24 * 60 * 60;
+/// The query parameters that carry a presigned URL's signature.
+pub const PRESIGN_PARAMETERS: [&str; 7] = [
+    "X-Amz-Algorithm",
+    "X-Amz-Credential",
+    "X-Amz-Date",
+    "X-Amz-Expires",
+    "X-Amz-SignedHeaders",
+    "X-Amz-Signature",
+    "X-Amz-Security-Token",
+];
 
 /// Everything but the unreserved characters of RFC 3986.
 const ENCODE: &AsciiSet = &NON_ALPHANUMERIC
@@ -92,6 +104,40 @@ impl Authorization {
             }
         }
         let credential = credential.ok_or(AuthError::Malformed("Credential"))?;
+        let signed_headers = signed_headers.ok_or(AuthError::Malformed("SignedHeaders"))?;
+        let signature = signature.ok_or(AuthError::Malformed("Signature"))?;
+        Authorization::of(credential, signed_headers, signature)
+    }
+
+    /// A presigned URL's signature, from its query parameters.
+    pub fn from_query(query: &str) -> Result<Authorization, AuthError> {
+        let parameters = decoded_query(query);
+        let get = |name: &'static str| {
+            parameters
+                .iter()
+                .find(|(parameter, _)| parameter == name)
+                .map(|(_, value)| value.as_str())
+                .ok_or(AuthError::Malformed(name))
+        };
+        if get("X-Amz-Algorithm")? != "AWS4-HMAC-SHA256" {
+            return Err(AuthError::Malformed("X-Amz-Algorithm"));
+        }
+        if get("X-Amz-Security-Token").is_ok() {
+            // The gateway issues no session credentials.
+            return Err(AuthError::Malformed("X-Amz-Security-Token"));
+        }
+        Authorization::of(
+            get("X-Amz-Credential")?,
+            get("X-Amz-SignedHeaders")?,
+            get("X-Amz-Signature")?,
+        )
+    }
+
+    fn of(
+        credential: &str,
+        signed_headers: &str,
+        signature: &str,
+    ) -> Result<Authorization, AuthError> {
         let mut scope = credential.split('/');
         let mut part = || scope.next().ok_or(AuthError::Malformed("Credential"));
         let (access_key_id, date, region, service, terminator) =
@@ -104,30 +150,92 @@ impl Authorization {
             date: date.to_string(),
             region: region.to_string(),
             service: service.to_string(),
-            signed_headers: signed_headers
-                .ok_or(AuthError::Malformed("SignedHeaders"))?
-                .split(';')
-                .map(str::to_string)
-                .collect(),
-            signature: signature
-                .ok_or(AuthError::Malformed("Signature"))?
-                .to_string(),
+            signed_headers: signed_headers.split(';').map(str::to_string).collect(),
+            signature: signature.to_string(),
         })
     }
 }
 
-/// Checks a client's signed request. `lookup` finds the client with an
-/// access key, and its secret; `now` is Unix seconds.
+/// Whether a request carries its signature in its query: a presigned URL.
+pub fn is_presigned(query: &str) -> bool {
+    query
+        .split('&')
+        .any(|pair| pair.split('=').next() == Some("X-Amz-Algorithm"))
+}
+
+/// A query's parameters, each name and value decoded.
+fn decoded_query(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let decode = |part: &str| percent_decode_str(part).decode_utf8_lossy().into_owned();
+            (decode(name), decode(value))
+        })
+        .collect()
+}
+
+/// Checks a client's signed request: its `Authorization` header, or a
+/// presigned URL's query. `lookup` finds the client with an access key,
+/// and its secret; `now` is Unix seconds.
 pub fn verify<'c, C: ?Sized>(
     request: &Signable,
     now: i64,
     lookup: impl Fn(&str) -> Option<(&'c C, &'c str)>,
 ) -> Result<&'c C, AuthError> {
-    let value = header(request.headers, "authorization").ok_or(AuthError::Missing)?;
-    let authorization = Authorization::parse(value)?;
-    let amz_date =
-        header(request.headers, "x-amz-date").ok_or(AuthError::Malformed("x-amz-date"))?;
-    let signed_at = parse_amz_date(amz_date).ok_or(AuthError::Malformed("x-amz-date"))?;
+    if let Some(value) = header(request.headers, "authorization") {
+        let authorization = Authorization::parse(value)?;
+        let amz_date =
+            header(request.headers, "x-amz-date").ok_or(AuthError::Malformed("x-amz-date"))?;
+        let signed_at = parse_amz_date(amz_date).ok_or(AuthError::Malformed("x-amz-date"))?;
+        if (now - signed_at).abs() > MAX_SKEW {
+            return Err(AuthError::Expired);
+        }
+        return check(request, &authorization, amz_date, lookup);
+    }
+    if !is_presigned(request.query) {
+        return Err(AuthError::Missing);
+    }
+    let authorization = Authorization::from_query(request.query)?;
+    let parameters = decoded_query(request.query);
+    let get = |name: &str| {
+        parameters
+            .iter()
+            .find(|(parameter, _)| parameter == name)
+            .map(|(_, value)| value.as_str())
+    };
+    let amz_date = get("X-Amz-Date").ok_or(AuthError::Malformed("X-Amz-Date"))?;
+    let signed_at = parse_amz_date(amz_date).ok_or(AuthError::Malformed("X-Amz-Date"))?;
+    let expires = get("X-Amz-Expires")
+        .and_then(|expires| expires.parse::<i64>().ok())
+        .filter(|expires| (1..=MAX_EXPIRES).contains(expires))
+        .ok_or(AuthError::Malformed("X-Amz-Expires"))?;
+    // Valid from its signing, give or take the skew, until it expires.
+    if now + MAX_SKEW < signed_at || now > signed_at + expires {
+        return Err(AuthError::Expired);
+    }
+    // The signature covers every parameter but itself, and not the body.
+    let query: Vec<&str> = request
+        .query
+        .split('&')
+        .filter(|pair| pair.split('=').next() != Some("X-Amz-Signature"))
+        .collect();
+    let unsigned = Signable {
+        query: &query.join("&"),
+        payload_hash: UNSIGNED_PAYLOAD,
+        ..*request
+    };
+    check(&unsigned, &authorization, amz_date, lookup)
+}
+
+/// Checks `request`'s signature against the one `authorization` names.
+fn check<'c, C: ?Sized>(
+    request: &Signable,
+    authorization: &Authorization,
+    amz_date: &str,
+    lookup: impl Fn(&str) -> Option<(&'c C, &'c str)>,
+) -> Result<&'c C, AuthError> {
     if !amz_date.starts_with(&authorization.date) || authorization.service != "s3" {
         return Err(AuthError::Malformed("Credential"));
     }
@@ -137,9 +245,6 @@ pub fn verify<'c, C: ?Sized>(
         .any(|name| name == "host")
     {
         return Err(AuthError::Malformed("SignedHeaders"));
-    }
-    if (now - signed_at).abs() > MAX_SKEW {
-        return Err(AuthError::Expired);
     }
     let (client, secret) =
         lookup(&authorization.access_key_id).ok_or(AuthError::UnknownAccessKey)?;
@@ -182,6 +287,51 @@ impl Signer {
         now: i64,
     ) {
         sign(self, method, path, query, headers, payload_hash, now);
+    }
+
+    /// The query of a presigned URL for a request to `host`, valid for
+    /// `expires` seconds from `now`: `query` followed by the parameters of
+    /// a signature that covers the host and not the body.
+    pub fn presign(
+        &self,
+        (method, path, query): (&str, &str, &str),
+        host: &str,
+        expires: i64,
+        now: i64,
+    ) -> String {
+        let amz_date = format_amz_date(now);
+        let credential = format!(
+            "{}/{}/{}/{}/aws4_request",
+            self.credentials.access_key_id,
+            &amz_date[..8],
+            self.region,
+            self.service
+        );
+        let mut parameters: Vec<String> = query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(str::to_string)
+            .collect();
+        parameters.extend([
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256".to_string(),
+            format!("X-Amz-Credential={}", encode(&credential)),
+            format!("X-Amz-Date={amz_date}"),
+            format!("X-Amz-Expires={expires}"),
+            "X-Amz-SignedHeaders=host".to_string(),
+        ]);
+        let query = parameters.join("&");
+        let headers = vec![("host".to_string(), host.to_string())];
+        let request = Signable {
+            method,
+            path,
+            query: &query,
+            headers: &headers,
+            payload_hash: UNSIGNED_PAYLOAD,
+        };
+        let secret = &self.credentials.secret_access_key;
+        let scope = (self.region.as_str(), self.service);
+        let signature = signature(&request, &["host"], &amz_date, scope, secret);
+        format!("{query}&X-Amz-Signature={signature}")
     }
 }
 
@@ -418,6 +568,70 @@ mod tests {
                 SECRET
             ),
             "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+        );
+    }
+
+    /// AWS's presigned URL example: a GET of `test.txt` valid for a day.
+    const PRESIGNED: &str = "X-Amz-Algorithm=AWS4-HMAC-SHA256\
+        &X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request\
+        &X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host\
+        &X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404";
+
+    fn verify_presigned(query: &str, now: i64) -> Result<(), AuthError> {
+        let headers = headers(&[("Host", "examplebucket.s3.amazonaws.com")]);
+        let request = Signable {
+            method: "GET",
+            path: "/test.txt",
+            query,
+            headers: &headers,
+            payload_hash: UNSIGNED_PAYLOAD,
+        };
+        let lookup = |id: &str| (id == "AKIAIOSFODNN7EXAMPLE").then_some((&(), SECRET));
+        verify(&request, now, lookup).map(|_| ())
+    }
+
+    #[test]
+    fn presigns_the_presigned_url_example() {
+        let signer = Signer {
+            credentials: Credentials {
+                access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
+                secret_access_key: SECRET.into(),
+            },
+            region: "us-east-1".into(),
+            service: "s3",
+        };
+        let signed = parse_amz_date("20130524T000000Z").unwrap();
+        let query = signer.presign(
+            ("GET", "/test.txt", ""),
+            "examplebucket.s3.amazonaws.com",
+            86_400,
+            signed,
+        );
+        assert_eq!(query, PRESIGNED);
+    }
+
+    #[test]
+    fn verifies_the_presigned_url_example_until_it_expires() {
+        let signed = parse_amz_date("20130524T000000Z").unwrap();
+        assert_eq!(verify_presigned(PRESIGNED, signed + 3_600), Ok(()));
+        assert_eq!(verify_presigned(PRESIGNED, signed + 86_400), Ok(()));
+        assert_eq!(
+            verify_presigned(PRESIGNED, signed + 86_401),
+            Err(AuthError::Expired)
+        );
+        assert_eq!(
+            verify_presigned(PRESIGNED, signed - 3_600),
+            Err(AuthError::Expired)
+        );
+        let altered = PRESIGNED.replace("Expires=86400", "Expires=86401");
+        assert_eq!(
+            verify_presigned(&altered, signed + 3_600),
+            Err(AuthError::SignatureMismatch)
+        );
+        let too_long = PRESIGNED.replace("Expires=86400", "Expires=604801");
+        assert_eq!(
+            verify_presigned(&too_long, signed + 3_600),
+            Err(AuthError::Malformed("X-Amz-Expires"))
         );
     }
 

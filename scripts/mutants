@@ -42,6 +42,7 @@ PASSTHROUGH = "crates/server/src/passthrough.rs"
 SQS = "crates/server/src/sqs.rs"
 TLS = "crates/server/src/tls.rs"
 PEERS = "crates/server/src/peers.rs"
+SIGV4 = "crates/server/src/sigv4.rs"
 STEP_TIMEOUT = 600
 
 MUTANTS = [
@@ -749,6 +750,60 @@ MUTANTS = [
     (
         "an upload with the client's encryption key is warmed",
         [(PASSTHROUGH, '&& header(&forward.headers, "x-amz-server-side-encryption-customer-key",).is_none()', "")],
+    ),
+    (
+        "presigned URLs are refused",
+        [(SIGV4, "if !is_presigned(request.query) {", "if true {")],
+    ),
+    (
+        "a presigned URL outlives its expiry",
+        [(SIGV4, "if now + MAX_SKEW < signed_at || now > signed_at + expires {",
+                 "if now + MAX_SKEW < signed_at {")],
+    ),
+    (
+        "a presigned URL's parameters reach S3",
+        [(SERVER, 'normal.query = kept.join("&");', "let _ = kept;")],
+    ),
+    (
+        "cached reads ignore response overrides",
+        [(SERVER, "headers.extend(overrides.iter().cloned());", "let _ = overrides;")],
+    ),
+    (
+        "virtual-hosted requests are read path-style",
+        [(SERVER, 'normal.path = format!("/{bucket}{}", head.path);', "let _ = bucket;")],
+    ),
+    (
+        "a read grant writes",
+        [(CONFIG, 'grant.access >= access && (grant.bucket == "*" || grant.bucket == bucket) && key.starts_with(&grant.prefix)',
+                  'true && (grant.bucket == "*" || grant.bucket == bucket) && key.starts_with(&grant.prefix)')],
+    ),
+    (
+        "listings skip the prefix check",
+        [(SERVER, "Need::List(prefix) => client.may(Access::Read, &bucket, &prefix),",
+                  "Need::List(_) => client.may_reach(Access::Read, &bucket),")],
+    ),
+    (
+        "DeleteObjects deletes keys outside the grants",
+        [(SERVER, ".all(|key| request.client.may(Access::Write, request.bucket, key))",
+                  ".all(|_| true)")],
+    ),
+    (
+        "a write grant changes its bucket",
+        [(SERVER, 'Need::Admin => client.may(Access::Admin, &bucket, ""),',
+                  'Need::Admin => client.may(Access::Write, &bucket, ""),')],
+    ),
+    (
+        "the home never asks S3 for checksums",
+        [(ORIGIN, 'let mut headers = vec![("x-amz-checksum-mode".to_string(), "ENABLED".to_string())];',
+                  "let mut headers = Vec::new();")],
+    ),
+    (
+        "checksums stay out of the metadata",
+        [(ORIGIN, "|| is_checksum_header(&name)", "")],
+    ),
+    (
+        "checksums go to reads that did not ask or read a range",
+        [(SERVER, "if !(self.checksums && status == 200) {", "if false {")],
     ),
     (
         "reads waiting on a newly down node wait out the timeout",

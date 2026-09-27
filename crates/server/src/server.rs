@@ -2,7 +2,7 @@
 //! `GetObject` and `HeadObject` through the core. Other operations pass
 //! through a storage node, which signs them for S3.
 
-use crate::config::{Client, Config};
+use crate::config::{Access, Client, Config};
 use crate::disk::Disk;
 use crate::gateway_engine::{Event, GatewayEngine, SharedGateway};
 use crate::http::{Connection, Framing, RequestHead, Response};
@@ -18,6 +18,7 @@ use crate::sqs::Queue;
 use crate::tls::{self, Connector, Tls};
 use crate::zero_copy::{self, Short};
 use bytes::Bytes;
+use percent_encoding::percent_decode_str;
 use s3_accelerator_core::Time;
 use s3_accelerator_core::membership::{Membership, Peer};
 use s3_accelerator_core::node::Node;
@@ -36,6 +37,8 @@ use tokio::sync::watch;
 struct Context {
     gateway: SharedGateway,
     clients: Vec<Client>,
+    /// Domains the gateway takes virtual-hosted-style requests for.
+    domains: Vec<String>,
 }
 
 /// The largest `DeleteObjects` body the gateway reads: S3 takes at most
@@ -228,9 +231,15 @@ pub async fn run_with(
     };
     if let (Some(_), Some(listener)) = (&config.gateway, listeners.gateway) {
         let gateway = GatewayEngine::new(config.ring(), config.cache.gateway_config(), peers);
+        let domains = config
+            .gateway
+            .as_ref()
+            .map(|gateway| gateway.domains.clone())
+            .unwrap_or_default();
         let context = Rc::new(Context {
             gateway,
             clients: config.clients,
+            domains,
         });
         serve_clients(listener, context, clients, stopped_signal(stopped)).await?;
     }
@@ -301,14 +310,19 @@ async fn serve_connection(mut connection: Connection, context: &Context) -> io::
         // The signature covers the head, so a request is authenticated and
         // authorized before its body is read. A request answered before its
         // body is read closes the connection.
-        let refusal = authenticate(&head, context).and_then(|client| authorize(&head, client));
-        let reusable = match refusal {
+        let authorized = authenticate(&head, context).and_then(|client| {
+            let head = normalize(&head, &context.domains);
+            authorize(&head, client).map(|()| (head, client))
+        });
+        let reusable = match authorized {
             Err(response) => {
                 let keep_alive = head.keep_alive && len == 0;
                 connection.write_response(&response, keep_alive).await?;
                 keep_alive
             }
-            Ok(()) => handle(&mut connection, &head, len, context).await? && head.keep_alive,
+            Ok((normal, client)) => {
+                handle(&mut connection, &normal, client, len, context).await? && head.keep_alive
+            }
         };
         if !reusable {
             // The client may still be sending a body; draining it lets the
@@ -322,13 +336,18 @@ async fn serve_connection(mut connection: Connection, context: &Context) -> io::
     Ok(())
 }
 
-/// The client that signed the request's head.
+/// The client that signed the request's head, in its `Authorization`
+/// header or, for a presigned URL, its query.
 fn authenticate<'c>(head: &RequestHead, context: &'c Context) -> Result<&'c Client, Response> {
-    if header(&head.headers, "authorization").is_none() {
+    let signed_header = header(&head.headers, "authorization").is_some();
+    if !signed_header && !sigv4::is_presigned(&head.query) {
         return Err(auth_error(AuthError::Missing));
     }
-    let Some(payload_hash) = header(&head.headers, "x-amz-content-sha256") else {
-        return Err(error(400, "InvalidRequest", "missing x-amz-content-sha256"));
+    let payload_hash = match header(&head.headers, "x-amz-content-sha256") {
+        Some(payload_hash) => payload_hash,
+        // A presigned URL signs no body.
+        None if !signed_header => sigv4::UNSIGNED_PAYLOAD,
+        None => return Err(error(400, "InvalidRequest", "missing x-amz-content-sha256")),
     };
     if payload_hash.starts_with("STREAMING-AWS4-HMAC-SHA256") {
         return Err(error(501, "NotImplemented", "signed streaming uploads"));
@@ -350,16 +369,128 @@ fn authenticate<'c>(head: &RequestHead, context: &'c Context) -> Result<&'c Clie
     sigv4::verify(&signable, sigv4::unix_now(), lookup).map_err(auth_error)
 }
 
-/// Whether the client's grants cover the object, and a copy's source.
+/// The request as the gateway serves it once its signature checks out:
+/// path-style, with its bucket first in the path; without a presigned
+/// URL's signature, which S3 must not see beside the node's; and with a
+/// presigned body's payload hash.
+fn normalize(head: &RequestHead, domains: &[String]) -> RequestHead {
+    let mut normal = head.clone();
+    if let Some(bucket) = virtual_bucket(header(&head.headers, "host"), domains) {
+        normal.path = format!("/{bucket}{}", head.path);
+    }
+    if sigv4::is_presigned(&head.query) {
+        let kept: Vec<&str> = head
+            .query
+            .split('&')
+            .filter(|pair| {
+                !sigv4::PRESIGN_PARAMETERS.contains(&pair.split('=').next().unwrap_or(""))
+            })
+            .collect();
+        normal.query = kept.join("&");
+        if header(&head.headers, "x-amz-content-sha256").is_none() {
+            let unsigned = (
+                "x-amz-content-sha256".to_string(),
+                sigv4::UNSIGNED_PAYLOAD.to_string(),
+            );
+            normal.headers.push(unsigned);
+        }
+    }
+    normal
+}
+
+/// The bucket a virtual-hosted-style request names: what precedes one of
+/// the gateway's domains in its `Host`.
+fn virtual_bucket(host: Option<&str>, domains: &[String]) -> Option<String> {
+    let host = host?.to_ascii_lowercase();
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => name,
+        _ => host.as_str(),
+    };
+    domains.iter().find_map(|domain| {
+        let bucket = name.strip_suffix(domain.as_str())?.strip_suffix('.')?;
+        (!bucket.is_empty()).then(|| bucket.to_string())
+    })
+}
+
+/// What a request needs of the client's grants.
+enum Need {
+    /// Access to its object.
+    Object(Access),
+    /// Reading the prefix it lists.
+    List(String),
+    /// Access to part of its bucket: for `DeleteObjects`, whose keys the
+    /// grants must each cover, and for requests that reveal only that the
+    /// bucket exists.
+    Part(Access),
+    /// Changing or deleting the bucket.
+    Admin,
+}
+
+/// Query parameters a listing may carry.
+const LISTING: [&str; 17] = [
+    "continuation-token",
+    "delimiter",
+    "encoding-type",
+    "fetch-owner",
+    "key-marker",
+    "list-type",
+    "marker",
+    "max-keys",
+    "max-uploads",
+    "optional-object-attributes",
+    "prefix",
+    "start-after",
+    "upload-id-marker",
+    "uploads",
+    "version-id-marker",
+    "versions",
+    "x-id",
+];
+
+fn need(head: &RequestHead, key: &str) -> Need {
+    let reads = head.method == "GET" || head.method == "HEAD";
+    if !key.is_empty() {
+        return Need::Object(if reads { Access::Read } else { Access::Write });
+    }
+    let parameters: Vec<(&str, &str)> = head
+        .query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+        .collect();
+    let names: Vec<&str> = parameters.iter().map(|(name, _)| *name).collect();
+    match head.method.as_str() {
+        "HEAD" if names.is_empty() => Need::Part(Access::Read),
+        "GET" if names == ["location"] => Need::Part(Access::Read),
+        "GET" if names.iter().all(|name| LISTING.contains(name)) => {
+            let prefix = parameters
+                .iter()
+                .find(|(name, _)| *name == "prefix")
+                .map(|(_, prefix)| percent_decode_str(prefix).decode_utf8_lossy().into_owned());
+            Need::List(prefix.unwrap_or_default())
+        }
+        "POST" if names.contains(&"delete") => Need::Part(Access::Write),
+        _ => Need::Admin,
+    }
+}
+
+/// Whether the client's grants cover what the request does, and a copy's
+/// source.
 fn authorize(head: &RequestHead, client: &Client) -> Result<(), Response> {
     let (bucket, key) = split_path(&head.path);
-    if !client.may_access(&bucket, &key) {
+    let allowed = match need(head, &key) {
+        Need::Object(access) => client.may(access, &bucket, &key),
+        Need::List(prefix) => client.may(Access::Read, &bucket, &prefix),
+        Need::Part(access) => client.may_reach(access, &bucket),
+        Need::Admin => client.may(Access::Admin, &bucket, ""),
+    };
+    if !allowed {
         return Err(error(403, "AccessDenied", "Access Denied"));
     }
     // A copy reads its source, so the grants must cover the source too.
     if let Some(source) = header(&head.headers, "x-amz-copy-source") {
         let (source_bucket, source_key) = copy_source(source);
-        if !client.may_access(&source_bucket, &source_key) {
+        if !client.may(Access::Read, &source_bucket, &source_key) {
             return Err(error(403, "AccessDenied", "Access Denied"));
         }
     }
@@ -371,6 +502,7 @@ fn authorize(head: &RequestHead, client: &Client) -> Result<(), Response> {
 async fn handle(
     connection: &mut Connection,
     head: &RequestHead,
+    client: &Client,
     len: u64,
     context: &Context,
 ) -> io::Result<bool> {
@@ -404,10 +536,16 @@ async fn handle(
                 .await?;
             return Ok(true);
         }
-        return read(connection, request, head.keep_alive, context).await;
+        let presenting = Presenting {
+            overrides: overrides(&head.query),
+            checksums: header(&head.headers, "x-amz-checksum-mode")
+                .is_some_and(|mode| mode.eq_ignore_ascii_case("enabled")),
+        };
+        return read(connection, request, &presenting, head.keep_alive, context).await;
     }
     let request = Passing {
         head,
+        client,
         payload_hash,
         digest,
         len,
@@ -473,10 +611,14 @@ fn cacheable(head: &RequestHead, bucket: &str, key: &str) -> Option<Request> {
         "HEAD" => Method::Head,
         _ => return None,
     };
-    let only_operation_id = head
-        .query
-        .split('&')
-        .all(|pair| pair.is_empty() || pair.starts_with("x-id="));
+    // The cache serves reads that name only their operation and the
+    // response headers they set.
+    let served_query = head.query.split('&').all(|pair| {
+        let name = pair.split('=').next().unwrap_or("");
+        pair.is_empty()
+            || name == "x-id"
+            || OVERRIDES.iter().any(|(parameter, _)| *parameter == name)
+    });
     let unsupported = [
         "if-modified-since",
         "if-unmodified-since",
@@ -484,7 +626,7 @@ fn cacheable(head: &RequestHead, bucket: &str, key: &str) -> Option<Request> {
     ];
     if bucket.is_empty()
         || key.is_empty()
-        || !only_operation_id
+        || !served_query
         || unsupported
             .iter()
             .any(|name| header(&head.headers, name).is_some())
@@ -509,6 +651,7 @@ fn cacheable(head: &RequestHead, bucket: &str, key: &str) -> Option<Request> {
 async fn read(
     connection: &mut Connection,
     request: Request,
+    presenting: &Presenting,
     keep_alive: bool,
     context: &Context,
 ) -> io::Result<bool> {
@@ -519,15 +662,16 @@ async fn read(
     while let Some(event) = events.recv().await {
         match event {
             Event::Respond(head) => {
-                connection
-                    .write_response(&answer(&head, method), true)
-                    .await?;
+                let mut response = answer(&head, method);
+                response.headers = presenting.present(response.status, response.headers);
+                connection.write_response(&response, true).await?;
                 return Ok(true);
             }
             Event::Start(head) => {
                 let framing = Framing::Length(head.content_length);
+                let headers = presenting.present(head.status, client_headers(&head));
                 connection
-                    .write_response_head(head.status, &client_headers(&head), framing, keep_alive)
+                    .write_response_head(head.status, &headers, framing, keep_alive)
                     .await?;
                 remaining = Some(head.content_length);
             }
@@ -600,9 +744,62 @@ fn answer(head: &ResponseHead, method: Method) -> Response {
     }
 }
 
+/// Query parameters that set a header of a read's response, and the
+/// header each sets.
+const OVERRIDES: [(&str, &str); 6] = [
+    ("response-cache-control", "Cache-Control"),
+    ("response-content-disposition", "Content-Disposition"),
+    ("response-content-encoding", "Content-Encoding"),
+    ("response-content-language", "Content-Language"),
+    ("response-content-type", "Content-Type"),
+    ("response-expires", "Expires"),
+];
+
+/// The headers a read's `response-*` parameters set.
+fn overrides(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter_map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let (_, header) = OVERRIDES.iter().find(|(parameter, _)| *parameter == name)?;
+            let value = percent_decode_str(value).decode_utf8_lossy().into_owned();
+            Some((header.to_string(), value))
+        })
+        .collect()
+}
+
+/// How the gateway presents a read's answer: with the headers its
+/// `response-*` parameters set, and with the object's checksums if it
+/// asked for them.
+struct Presenting {
+    overrides: Vec<(String, String)>,
+    checksums: bool,
+}
+
+impl Presenting {
+    /// The headers of an answer with `status`. S3 sends checksums only for
+    /// a whole object, and applies overrides only to a success.
+    fn present(&self, status: u16, mut headers: Vec<(String, String)>) -> Vec<(String, String)> {
+        if !(self.checksums && status == 200) {
+            headers.retain(|(name, _)| !origin::is_checksum_header(name));
+        }
+        if (200..300).contains(&status) {
+            let overrides = &self.overrides;
+            headers.retain(|(name, _)| {
+                !overrides
+                    .iter()
+                    .any(|(set, _)| set.eq_ignore_ascii_case(name))
+            });
+            headers.extend(overrides.iter().cloned());
+        }
+        headers
+    }
+}
+
 /// A request the gateway passes to S3 through a storage node.
 struct Passing<'a> {
     head: &'a RequestHead,
+    client: &'a Client,
     payload_hash: &'a str,
     /// The body's SHA-256, when the client signed it.
     digest: Option<String>,
@@ -653,6 +850,18 @@ async fn pass(
             {
                 connection
                     .write_response(&hash_mismatch(), head.keep_alive)
+                    .await?;
+                return Ok(true);
+            }
+            // The grants must cover every key the list deletes.
+            let named = listed_keys(&String::from_utf8_lossy(&body));
+            if !named
+                .iter()
+                .all(|key| request.client.may(Access::Write, request.bucket, key))
+            {
+                let response = error(403, "AccessDenied", "Access Denied");
+                connection
+                    .write_response(&response, head.keep_alive)
                     .await?;
                 return Ok(true);
             }

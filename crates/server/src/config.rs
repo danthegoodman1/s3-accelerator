@@ -119,6 +119,11 @@ fn default_weight() -> u32 {
 pub struct GatewayConfig {
     /// Where S3 clients connect, such as `127.0.0.1:9000`.
     pub listen: String,
+    /// Domains the gateway takes virtual-hosted-style requests for: a
+    /// request to `bucket.s3.example.com` names `bucket` when this holds
+    /// `s3.example.com`. Other requests are path-style.
+    #[serde(default)]
+    pub domains: Vec<String>,
     /// Clients connect over TLS when set, and over plaintext otherwise.
     pub tls: Option<TlsConfig>,
 }
@@ -254,6 +259,10 @@ pub struct Client {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grant {
+    /// What the grant allows: `read`, `write` (the default, which reads
+    /// too) or `admin`, which also changes and deletes the bucket itself.
+    #[serde(default)]
+    pub access: Access,
     /// A bucket name, or `*` for every bucket.
     pub bucket: String,
     /// Keys the grant covers start with this.
@@ -261,13 +270,37 @@ pub struct Grant {
     pub prefix: String,
 }
 
+/// What a grant allows, each level including the ones before it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum Access {
+    /// Reading objects and listing them.
+    Read,
+    /// Writing and deleting objects.
+    #[default]
+    Write,
+    /// Changing and deleting the bucket: its policy, lifecycle and other
+    /// settings.
+    Admin,
+}
+
 impl Client {
-    /// Whether a grant covers `key` in `bucket`. Requests about a bucket
-    /// rather than an object pass an empty key.
-    pub fn may_access(&self, bucket: &str, key: &str) -> bool {
+    /// Whether a grant gives `access` to `key` in `bucket`. A listing
+    /// passes the prefix it lists, and a request about the bucket itself
+    /// an empty key, which only a grant on the whole bucket covers.
+    pub fn may(&self, access: Access, bucket: &str, key: &str) -> bool {
         self.grants.iter().any(|grant| {
-            (grant.bucket == "*" || grant.bucket == bucket) && key.starts_with(&grant.prefix)
+            grant.access >= access
+                && (grant.bucket == "*" || grant.bucket == bucket)
+                && key.starts_with(&grant.prefix)
         })
+    }
+
+    /// Whether some grant gives `access` to part of `bucket`.
+    pub fn may_reach(&self, access: Access, bucket: &str) -> bool {
+        self.grants
+            .iter()
+            .any(|grant| grant.access >= access && (grant.bucket == "*" || grant.bucket == bucket))
     }
 }
 
@@ -519,9 +552,11 @@ mod tests {
         )
         .unwrap();
         let client = &config.clients[0];
-        assert!(client.may_access("logs", "2026/01/a"));
-        assert!(!client.may_access("logs", "2025/12/a"));
-        assert!(!client.may_access("other", "2026/01/a"));
+        assert!(client.may(Access::Write, "logs", "2026/01/a"));
+        assert!(!client.may(Access::Admin, "logs", "2026/01/a"));
+        assert!(!client.may(Access::Read, "logs", "2025/12/a"));
+        assert!(!client.may(Access::Read, "other", "2026/01/a"));
+        assert!(client.may_reach(Access::Write, "logs"));
         assert_eq!(config.check(), Ok(()));
         let node = config.cache.node_config();
         assert_eq!(node.buckets["parquet"].freshness, Freshness::Immutable);

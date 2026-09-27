@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{Server, data_dir, object, send, start, start_origin};
+use common::{CHECKSUM, Server, data_dir, object, send, signed, start, start_origin};
 use s3_accelerator::disk::decode_record;
 use std::time::Duration;
 use tokio::task::LocalSet;
@@ -107,6 +107,39 @@ async fn small_blocks_take_space_that_held_larger_ones() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             assert_eq!(recorded(), keys.len(), "small blocks recorded");
+        })
+        .await;
+}
+
+/// The home keeps an object's checksums with its metadata: a whole-object
+/// read that asks for them gets them, from the cache as from S3, and a
+/// range or a read that doesn't ask gets none.
+#[tokio::test(flavor = "current_thread")]
+async fn checksums_come_back_on_whole_object_reads_that_ask() {
+    LocalSet::new()
+        .run_until(async {
+            let first_read = "[cache.buckets.bucket]\nimmutable = true\nadmit_on_first_read = true";
+            let (port, origin) = start(r#"{ bucket = "bucket" }"#, first_read).await;
+            let get = |extra: Vec<(&'static str, &'static str)>| async move {
+                let url = format!("http://127.0.0.1:{port}/bucket/k");
+                let mut request = reqwest::Client::new().get(url);
+                for (name, value) in signed(port, "GET", "/bucket/k", "", &extra) {
+                    request = request.header(name, value);
+                }
+                let response = request.send().await.unwrap();
+                let checksum = response
+                    .headers()
+                    .get("x-amz-checksum-crc32")
+                    .map(|value| value.to_str().unwrap().to_string());
+                (response.status().as_u16(), checksum)
+            };
+            let asking = ("x-amz-checksum-mode", "ENABLED");
+            for _ in 0..2 {
+                assert_eq!(get(vec![asking]).await, (200, Some(CHECKSUM.to_string())));
+            }
+            assert_eq!(origin.requests.get(), 1);
+            assert_eq!(get(Vec::new()).await, (200, None));
+            assert_eq!(get(vec![asking, ("range", "bytes=0-9")]).await, (206, None));
         })
         .await;
 }

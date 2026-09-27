@@ -26,6 +26,8 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 pub const ETAG: &str = "\"0123456789abcdef\"";
+/// The CRC32 the fake S3 gives every object, when asked.
+pub const CHECKSUM: &str = "AAAAAA==";
 pub const SIZE: usize = 300_000;
 
 pub fn object() -> Vec<u8> {
@@ -50,8 +52,9 @@ pub const LISTING: &str = "<ListBucketResult><Name>bucket</Name></ListBucketResu
 pub struct Origin {
     pub requests: Cell<u64>,
     pub deleted: Cell<bool>,
-    /// Each request's path, as it arrived.
+    /// Each request's path and query, as they arrived.
     pub paths: RefCell<Vec<String>>,
+    pub queries: RefCell<Vec<String>>,
     /// How long it waits before each answer.
     pub delay: Cell<std::time::Duration>,
     /// The size of its objects, and whether each path has its own content
@@ -76,6 +79,7 @@ impl Default for Origin {
             requests: Cell::default(),
             deleted: Cell::default(),
             paths: RefCell::default(),
+            queries: RefCell::default(),
             delay: Cell::default(),
             size: Cell::new(SIZE),
             distinct: Cell::default(),
@@ -142,6 +146,7 @@ async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
                 };
                 origin.requests.set(origin.requests.get() + 1);
                 origin.paths.borrow_mut().push(head.path.clone());
+                origin.queries.borrow_mut().push(head.query.clone());
                 let mut headers = Vec::new();
                 if head.method == "PUT" {
                     let etag = format!("\"written-{}\"", origin.uploads.borrow().len());
@@ -165,7 +170,15 @@ async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
                     "GET" | "HEAD" if origin.deleted.get() => (404, Vec::new()),
                     "GET" | "HEAD" => {
                         headers.push(("ETag".to_string(), etag.clone()));
-                        read(&head.headers, &object, &etag, &mut headers)
+                        let (status, body) = read(&head.headers, &object, &etag, &mut headers);
+                        let asked =
+                            s3_accelerator::http::header(&head.headers, "x-amz-checksum-mode")
+                                .is_some_and(|mode| mode == "ENABLED");
+                        if asked && status == 200 {
+                            headers.push(("x-amz-checksum-crc32".into(), CHECKSUM.into()));
+                            headers.push(("x-amz-checksum-type".into(), "FULL_OBJECT".into()));
+                        }
+                        (status, body)
                     }
                     _ => (200, Vec::new()),
                 };
@@ -450,6 +463,7 @@ impl Server {
             nodes = [{{ id = 0, address = "{node_address}" }}]
             [gateway]
             listen = "unused"
+            domains = ["s3.test"]
             [node]
             id = 0
             data_dir = "{}"
@@ -527,6 +541,28 @@ pub fn signed_payload(
         sigv4::unix_now(),
     );
     headers
+}
+
+/// A URL `reader` presigned for a request to `host`, which reaches the
+/// server at `port`, signed `age` seconds ago and valid for `expires`.
+pub fn presigned(
+    port: u16,
+    host: &str,
+    (method, path, query): (&str, &str, &str),
+    age: i64,
+    expires: i64,
+) -> String {
+    let signer = Signer {
+        credentials: Credentials {
+            access_key_id: "reader".into(),
+            secret_access_key: "reader-secret".into(),
+        },
+        region: "us-east-1".into(),
+        service: "s3",
+    };
+    let now = sigv4::unix_now() - age;
+    let query = signer.presign((method, path, query), host, expires, now);
+    format!("http://127.0.0.1:{port}{path}?{query}")
 }
 
 /// Sends a signed request and returns the status and body.

@@ -137,7 +137,7 @@ The core decides what a node admits and evicts and which slot each block fills. 
 
 ### Auth
 
-- **Client credentials:** the Gateway validates SigV4 headers and presigned URLs against its own credential store. Each credential maps to bucket and prefix grants.
+- **Client credentials:** the Gateway checks SigV4 signatures against its own credential store, in the `Authorization` header or in a presigned URL's query. A presigned URL lasts up to seven days, signs no body, and works for any method; anyone holding one needs no credentials. Each credential maps to grants of a bucket and a key prefix, each at a level: `read` reads objects and lists them, `write` (the default) also writes and deletes them, and `admin` also changes and deletes the bucket, which takes a grant on the whole bucket. A listing needs a grant on the prefix it lists, and `DeleteObjects` a write grant on every key it names.
 - **Every read is authorized, hits included,** because S3 never sees a cache hit.
 - **Access to S3:** only storage nodes hold S3 credentials: the access key `[origin]` names. The Gateway authenticates and authorizes each request the cache doesn't serve and passes it through the object's home, or the node a bucket's request goes through, which re-signs it and forwards it to S3 with any checksums intact. A body signed chunk by chunk (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, with or without a trailer) gets 501, since re-signing would break its chunk signatures; an unsigned body with trailing checksums (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`) passes through.
 - **Gateway identity:** every request to a node carries the cluster's shared secret, which the node checks in constant time, and with `[cluster.tls]` each member also presents a certificate the cluster's CA signed. A node serves any member that holds the secret, so a compromised gateway reaches whatever the cluster's S3 credentials reach.
@@ -145,9 +145,11 @@ The core decides what a node admits and evicts and which slot each block fills. 
 
 ### S3 API
 
-- **Served from cache:** `GetObject` (including ranges and conditionals on one strong ETag) and `HeadObject`. Reads with `versionId`, `partNumber` or another query parameter besides `x-id`, with `If-Modified-Since` or `If-Unmodified-Since`, or with a wildcard, list or weak ETag in `If-Match` or `If-None-Match` pass through to S3.
+- **Served from cache:** `GetObject` (including ranges and conditionals on one strong ETag) and `HeadObject`. Reads with `versionId`, `partNumber` or another query parameter besides `x-id` and the response overrides, with `If-Modified-Since` or `If-Unmodified-Since`, or with a wildcard, list or weak ETag in `If-Match` or `If-None-Match` pass through to S3.
 - **Proxied to S3** through storage nodes: every other operation.
-- **Response overrides** (`response-content-*`) are applied per request.
+- **Response overrides:** a read's `response-*` parameters set its response's `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language`, `Content-Type` and `Expires`. The gateway applies them to reads the cache serves, and S3 to the rest.
+- **Addressing:** path-style, and virtual-hosted-style for the domains `[gateway] domains` lists: a request to `bucket.s3.example.com` names `bucket` when the list holds `s3.example.com`.
+- **Checksums:** homes ask S3 for full-object checksums on every read and keep them with the metadata. A whole-object read that asks for them (`x-amz-checksum-mode: ENABLED`) gets them, from the cache as from S3. A range gets none, as from S3, and so does a read of metadata that a ranged first fetch set.
 - **Gateways route requests themselves,** so clients never see redirects.
 
 ## Implementation

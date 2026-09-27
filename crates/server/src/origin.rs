@@ -86,7 +86,9 @@ impl Origin {
     /// left arriving. A failure to reach S3 answers 503.
     pub async fn read(&self, request: &Request, hold: Option<u64>) -> (ResponseHead, OriginBody) {
         let failed = || (ResponseHead::status(503), OriginBody::Held(Bytes::new()));
-        let mut headers = Vec::new();
+        // S3 answers a whole object with its checksums, which the home
+        // keeps with the metadata.
+        let mut headers = vec![("x-amz-checksum-mode".to_string(), "ENABLED".to_string())];
         if let Some(range) = request.range {
             headers.push(("range".to_string(), format_range(range)));
         }
@@ -290,5 +292,13 @@ pub fn is_object_header(name: &str) -> bool {
         "x-amz-website-redirect-location",
     ];
     let name = name.to_ascii_lowercase();
-    name.starts_with("x-amz-meta-") || OBJECT_HEADERS.contains(&name.as_str())
+    name.starts_with("x-amz-meta-")
+        || is_checksum_header(&name)
+        || OBJECT_HEADERS.contains(&name.as_str())
+}
+
+/// An object's full-object checksum, or its type, which S3 sends for a
+/// whole object when asked with `x-amz-checksum-mode: ENABLED`.
+pub fn is_checksum_header(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("x-amz-checksum-")
 }
