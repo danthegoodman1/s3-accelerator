@@ -441,6 +441,12 @@ enum Message {
     RingResponse {
         ring: Ring,
     },
+    /// A ring request that found its node down, as a refused connection.
+    RingFailed,
+    /// A write one node passes to another.
+    WriteNotice {
+        key: ObjectKey,
+    },
     /// A node's read of a previous owner, which it numbered `origin` in its
     /// run `run`, and the answers.
     PeerRequest {
@@ -620,6 +626,8 @@ pub struct Simulator {
     left: BTreeSet<usize>,
     /// Starting nodes waiting for a seed's ring before they join.
     joining: BTreeSet<usize>,
+    /// Nodes started knowing only some others.
+    given_seeds: BTreeMap<usize, Vec<usize>>,
     /// The node a gateway that lost track of the ring asks next.
     ring_seeds: usize,
     /// Each node's run: how many times it has stopped.
@@ -755,6 +763,7 @@ impl Simulator {
             leaving: BTreeMap::new(),
             left: BTreeSet::new(),
             joining: BTreeSet::new(),
+            given_seeds: BTreeMap::new(),
             ring_seeds: 0,
             runs: vec![0; options.nodes],
             retired: vec![node::Stats::default(); options.nodes],
@@ -895,13 +904,24 @@ impl Simulator {
     /// ring: to the model of S3, then to the home, which learns the write
     /// succeeded.
     pub fn write_through(&mut self, key: &ObjectKey, size: u64) -> Result<(), Failure> {
+        self.write_through_via(0, key, size)
+    }
+
+    /// Writes an object through `gateway` and the key's home under its
+    /// ring.
+    pub fn write_through_via(
+        &mut self,
+        gateway: usize,
+        key: &ObjectKey,
+        size: u64,
+    ) -> Result<(), Failure> {
         self.origin.put(self.now, key, size, &mut self.writers);
-        let home = self.gateways[0]
+        let home = self.gateways[gateway]
             .ring()
             .owner(Placement::Home(key).hash())
             .expect("a node")
             .0 as usize;
-        self.gateways[0].on_write(Time(self.now), key);
+        self.gateways[gateway].on_write(Time(self.now), key);
         // A home that is down lost its metadata with its memory.
         let Some(node) = self.nodes[home].as_mut() else {
             return Ok(());
@@ -968,7 +988,16 @@ impl Simulator {
     /// Starts a new node with an empty disk, which joins through the nodes
     /// it knows. Returns its index.
     pub fn add_node(&mut self) -> Result<usize, Failure> {
+        self.add_node_knowing(None)
+    }
+
+    /// Starts a new node that knows only `seeds`, as a config that names
+    /// only some nodes, or every node if `None`.
+    pub fn add_node_knowing(&mut self, seeds: Option<Vec<usize>>) -> Result<usize, Failure> {
         let node = self.nodes.len();
+        if let Some(seeds) = seeds {
+            self.given_seeds.insert(node, seeds);
+        }
         let config = self.options.node_config();
         self.nodes.push(None);
         self.memberships.push(None);
@@ -1115,7 +1144,7 @@ impl Simulator {
         let seed = self.membership_seeds.next_u64();
         let ring = match self.options.membership {
             true => {
-                let known: Vec<Peer> = self.members().map(|node| peer(node, 0)).collect();
+                let known: Vec<Peer> = self.seeds(node).map(|node| peer(node, 0)).collect();
                 let me = peer(node, self.runs[node]);
                 let config = self.options.membership_config();
                 let membership = Membership::new(Time(self.now), me, &known, config, seed);
@@ -1139,7 +1168,7 @@ impl Simulator {
             return;
         }
         self.joining.insert(node);
-        let seeds: Vec<usize> = self.members().filter(|&seed| seed != node).collect();
+        let seeds: Vec<usize> = self.seeds(node).filter(|&seed| seed != node).collect();
         for seed in seeds {
             let message = Message::RingRequest {
                 from: Address::Node(node),
@@ -1169,9 +1198,17 @@ impl Simulator {
         (0..self.nodes.len()).filter(|node| !self.left.contains(node))
     }
 
+    /// The nodes `node` knows when it starts, as its config names them:
+    /// those it was given, or every member.
+    fn seeds(&self, node: usize) -> impl Iterator<Item = usize> + use<'_> {
+        let given = self.given_seeds.get(&node);
+        self.members()
+            .filter(move |seed| given.is_none_or(|given| *seed == node || given.contains(seed)))
+    }
+
     /// Announces a node's membership to every node it knows.
     fn join(&mut self, node: usize) {
-        let seeds: Vec<NodeId> = self.members().map(|node| NodeId(node as u64)).collect();
+        let seeds: Vec<NodeId> = self.seeds(node).map(|node| NodeId(node as u64)).collect();
         if let Some(membership) = self.memberships[node].as_mut() {
             membership.join(Time(self.now), &seeds);
         }
@@ -1301,6 +1338,7 @@ impl Simulator {
             summary.verified_blocks += stats.verified_blocks;
             summary.corrupt_blocks += stats.corrupt_blocks;
             summary.peer_requests += stats.peer_requests;
+            summary.peer_timeouts += stats.peer_timeouts;
             summary.peer_metadata += stats.peer_metadata;
             summary.peer_bytes += stats.peer_bytes;
             summary.node_reads.push(stats.reads);
@@ -1724,6 +1762,14 @@ impl Simulator {
 
     fn deliver(&mut self, to: Address, message: Message) -> Result<(), Failure> {
         let now = Time(self.now);
+        if let (Address::Node(node), Message::RingRequest { from }) = (to, &message)
+            && self.nodes[node].is_none()
+            && matches!(from, Address::Gateway(_))
+        {
+            let from = *from;
+            self.send(to, from, Message::RingFailed);
+            return Ok(());
+        }
         if let Address::Node(node) = to {
             let stale = match &message {
                 Message::OriginResponse { run, .. }
@@ -1789,6 +1835,14 @@ impl Simulator {
             }
             (Address::Node(node), Message::RingResponse { ring }) => {
                 self.finish_joining(node, Some(ring))
+            }
+            (Address::Gateway(gateway), Message::RingFailed) => {
+                self.gateways[gateway].on_ring_failed(now);
+                self.drain_gateway(gateway)
+            }
+            (Address::Node(node), Message::WriteNotice { key }) => {
+                self.node(node).on_write_from(now, &key, true);
+                self.drain_node(node)
             }
             (Address::Node(node), Message::Gossip { packet }) => {
                 if let Some(membership) = self.memberships[node].as_mut() {
@@ -2155,6 +2209,10 @@ impl Simulator {
                         return Err(self.failure(format!("node {node} answered {request:?} twice")));
                     };
                     self.answer_request(node, requester, NodeAnswer::Stale);
+                }
+                node::Action::PassWrite { node: to, key } => {
+                    let message = Message::WriteNotice { key };
+                    self.send(Address::Node(node), Address::Node(to.0 as usize), message);
                 }
                 node::Action::PeerFetch { origin, peer, read } => {
                     let asks_metadata = matches!(read, Read::Known(_));
@@ -2648,6 +2706,7 @@ pub struct Summary {
     /// Reads nodes sent previous owners, objects whose metadata a previous
     /// home supplied, and body bytes served from previous owners' blocks.
     pub peer_requests: u64,
+    pub peer_timeouts: u64,
     pub peer_metadata: u64,
     pub peer_bytes: u64,
     /// A digest of every response: its request, tick, status and body.

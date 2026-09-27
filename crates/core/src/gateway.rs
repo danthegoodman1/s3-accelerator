@@ -245,6 +245,13 @@ impl Gateway {
         self.actions.push(Action::FetchRing { node: from });
     }
 
+    /// A ring fetch failed: the next answer with another version, or the
+    /// next read no node can serve, asks again.
+    pub fn on_ring_failed(&mut self, now: Time) {
+        self.now = self.now.max(now);
+        self.fetching_ring = None;
+    }
+
     /// A node sent its ring. Reads in progress keep the nodes they went
     /// to; later ones go by this ring.
     pub fn on_ring(&mut self, now: Time, ring: Ring) {
@@ -1008,6 +1015,29 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A gateway fetches a ring whose version differs, one fetch at a time;
+    /// a fetch that fails lets the next answer ask again.
+    #[test]
+    fn a_failed_ring_fetch_lets_the_next_answer_ask_again() {
+        let mut gateway = gateway();
+        let fetches = |gateway: &mut Gateway| {
+            gateway
+                .drain()
+                .into_iter()
+                .filter(|action| matches!(action, Action::FetchRing { .. }))
+                .count()
+        };
+        gateway.on_ring_version(Time(10), NodeId(1), 7);
+        assert_eq!(fetches(&mut gateway), 1);
+        gateway.on_ring_version(Time(20), NodeId(2), 7);
+        assert_eq!(fetches(&mut gateway), 0);
+        gateway.on_ring_failed(Time(30));
+        gateway.on_ring_version(Time(40), NodeId(2), 7);
+        assert_eq!(fetches(&mut gateway), 1);
+        gateway.on_ring_version(Time(50), NodeId(1), 1);
+        assert_eq!(fetches(&mut gateway), 0);
     }
 
     /// A node answers the same request twice while the gateway forwards

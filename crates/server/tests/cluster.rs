@@ -191,3 +191,36 @@ async fn a_gateway_reaches_nodes_its_config_never_named() {
         })
         .await;
 }
+
+/// A node starts and serves while its config names another node whose
+/// address does not resolve, as when that node's DNS name is gone.
+#[tokio::test(flavor = "current_thread")]
+async fn a_node_starts_while_another_address_does_not_resolve() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            let cluster =
+                Cluster::with_nodes(&data_dir(), origin_port, CLUSTER_CACHE, 1, GOSSIP, &[]);
+            let gone = r#"{ id = 1, address = "no-such-node.invalid:9100" }"#;
+            for config in [&cluster.node, &cluster.gateway] {
+                let text = std::fs::read_to_string(config).unwrap();
+                let text: Vec<String> = text
+                    .lines()
+                    .map(|line| match line.trim_start().starts_with("nodes = [") {
+                        true => line.replace(" }]", &format!(" }}, {gone}]")),
+                        false => line.to_string(),
+                    })
+                    .collect();
+                std::fs::write(config, text.join("\n")).unwrap();
+            }
+            let _node = cluster.start_node().await;
+            let _gateway = cluster.start_gateway().await;
+            let mut answer = cluster.get("k").await;
+            // The gateway may first try the node it cannot reach.
+            if answer.0 >= 500 {
+                answer = cluster.get("k").await;
+            }
+            assert_eq!(answer, (200, origin.object("/bucket/k")));
+        })
+        .await;
+}

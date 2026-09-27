@@ -117,7 +117,10 @@ impl GatewayEngine {
             (home, this.peers.clone())
         };
         if let Some(home) = home {
-            let request = NodeRequest::Written(key.clone());
+            let request = NodeRequest::Written {
+                key: key.clone(),
+                passed_on: false,
+            };
             tokio::task::spawn_local(async move {
                 match peers.exchange(home, &request).await {
                     Ok(exchanged) => peers.idle(exchanged.body),
@@ -294,11 +297,15 @@ fn start(engine: &SharedGateway, work: Work) {
                     Ok(Ok(_)) => {
                         eprintln!("node {} answered a ring request out of protocol", node.0)
                     }
-                    // The next answer with another version asks again.
                     Ok(Err(error)) => eprintln!("fetching node {}'s ring: {error}", node.0),
                     Err(_) => eprintln!("fetching node {}'s ring: timed out", node.0),
                 }
             }
+            // The next answer with another version, or the next read no
+            // node can serve, asks again.
+            let mut this = engine.borrow_mut();
+            let now = this.now();
+            this.gateway.on_ring_failed(now);
         });
     }
 }

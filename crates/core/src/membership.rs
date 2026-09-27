@@ -196,7 +196,12 @@ impl Membership {
     /// own, while it goes on serving. `leave` then stops its gossip.
     pub fn start_leaving(&mut self, now: Time) {
         self.now = self.now.max(now);
-        self.me.leaving = true;
+        // foca renews the identity when the cluster declared this node
+        // down, so its identity is the current one.
+        self.me = Peer {
+            leaving: true,
+            ..self.foca.identity().clone()
+        };
         let mut runtime = Collected::default();
         let _ = self.foca.change_identity(self.me.clone(), &mut runtime);
         self.apply(runtime);
@@ -592,6 +597,30 @@ mod tests {
         cluster.run(7_000);
         for id in [1, 2, 3] {
             assert_eq!(cluster.members(id), [1, 2, 3], "node {id}");
+        }
+    }
+
+    /// A node the others declared down rejoins under a renewed identity,
+    /// and can still leave: its leaving identity is the renewed one.
+    #[test]
+    fn a_node_that_rejoined_can_still_leave() {
+        let mut cluster = Cluster::new(&[1, 2, 3]);
+        cluster.run(1_000);
+        cluster.cut.insert(3);
+        cluster.run(1_800);
+        cluster.cut.clear();
+        cluster.run(4_000);
+        assert!(
+            cluster.nodes[&3].foca.identity().run > 0,
+            "node 3 never rejoined"
+        );
+        assert_eq!(cluster.members(1), [1, 2, 3]);
+        let now = Time(cluster.now);
+        cluster.nodes.get_mut(&3).unwrap().start_leaving(now);
+        cluster.collect(3);
+        cluster.run(4_500);
+        for id in [1, 2, 3] {
+            assert_eq!(cluster.members(id), [1, 2], "node {id}");
         }
     }
 

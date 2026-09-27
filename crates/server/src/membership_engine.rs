@@ -14,7 +14,7 @@ use s3_accelerator_core::membership::{self, Membership};
 use s3_accelerator_core::placement::NodeId;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -28,9 +28,10 @@ pub struct MembershipEngine {
     started: Instant,
     membership: Membership,
     socket: Rc<UdpSocket>,
-    /// Where each node listens for gossip: its cluster address, from the
-    /// config or from gossip.
-    addresses: BTreeMap<NodeId, SocketAddr>,
+    /// Where each node listens for gossip, its cluster address, as last
+    /// resolved from the address membership gives, and names resolving.
+    resolved: BTreeMap<NodeId, (String, SocketAddr)>,
+    resolving: BTreeMap<NodeId, String>,
     node: SharedNode,
     peers: Rc<Peers>,
 }
@@ -49,7 +50,6 @@ pub async fn run(
     node: SharedNode,
     peers: Rc<Peers>,
     socket: UdpSocket,
-    addresses: BTreeMap<NodeId, SocketAddr>,
     seeds: Vec<NodeId>,
 ) -> SharedMembership {
     let me = NodeId(membership.me().id);
@@ -71,7 +71,8 @@ pub async fn run(
         started,
         membership,
         socket: Rc::new(socket),
-        addresses,
+        resolved: BTreeMap::new(),
+        resolving: BTreeMap::new(),
         node,
         peers,
     }));
@@ -134,17 +135,57 @@ pub fn leave(engine: &SharedMembership) {
     apply(engine);
 }
 
+/// Learns the addresses membership now gives, such as of a node just
+/// heard from or restarted elsewhere, before any packet goes to it. A name
+/// resolves off this thread's critical path, and packets to a node wait for
+/// nothing: until its address resolves, they are lost, as gossip allows.
+fn refresh(engine: &SharedMembership) {
+    let mut this = engine.borrow_mut();
+    let addresses = this.membership.addresses();
+    this.peers.learn(&addresses);
+    for (id, address) in addresses {
+        let known = this
+            .resolved
+            .get(&id)
+            .is_some_and(|(known, _)| *known == address);
+        if known || this.resolving.get(&id) == Some(&address) {
+            continue;
+        }
+        if let Ok(resolved) = address.parse::<SocketAddr>() {
+            this.resolved.insert(id, (address, resolved));
+            continue;
+        }
+        this.resolving.insert(id, address.clone());
+        let engine = engine.clone();
+        tokio::task::spawn_local(async move {
+            let resolved = tokio::net::lookup_host(address.as_str()).await;
+            let mut this = engine.borrow_mut();
+            if this.resolving.get(&id) != Some(&address) {
+                return;
+            }
+            this.resolving.remove(&id);
+            match resolved.map(|mut all| all.next()) {
+                Ok(Some(resolved)) => {
+                    this.resolved.insert(id, (address, resolved));
+                }
+                _ => eprintln!("node {}'s address {address} does not resolve", id.0),
+            }
+        });
+    }
+}
+
 /// Carries out membership's actions: packets go out over UDP, timers wait
 /// on this thread, and a new ring goes to the node.
 fn apply(engine: &SharedMembership) {
+    refresh(engine);
     let actions = engine.borrow_mut().membership.drain();
     for action in actions {
         match action {
             membership::Action::Send { to, packet } => {
                 let this = engine.borrow();
                 // Gossip tolerates lost packets, so a full socket drops one.
-                if let Some(&address) = this.addresses.get(&to) {
-                    let _ = this.socket.try_send_to(&packet, address);
+                if let Some((_, address)) = this.resolved.get(&to) {
+                    let _ = this.socket.try_send_to(&packet, *address);
                 }
             }
             membership::Action::Schedule { timer, at } => {
@@ -162,19 +203,8 @@ fn apply(engine: &SharedMembership) {
             }
             membership::Action::Ring(ring) => {
                 let (node, addresses) = {
-                    let mut this = engine.borrow_mut();
-                    let addresses = this.membership.addresses();
-                    this.peers.learn(&addresses);
-                    for (&id, address) in &addresses {
-                        let resolved = address
-                            .to_socket_addrs()
-                            .ok()
-                            .and_then(|mut all| all.next());
-                        if let Some(resolved) = resolved {
-                            this.addresses.insert(id, resolved);
-                        }
-                    }
-                    (this.node.clone(), addresses)
+                    let this = engine.borrow();
+                    (this.node.clone(), this.membership.addresses())
                 };
                 let members: Vec<u64> = ring.members().iter().map(|member| member.id.0).collect();
                 eprintln!("ring {:016x}: nodes {members:?}", ring.version());

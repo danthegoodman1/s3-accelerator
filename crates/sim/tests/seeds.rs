@@ -37,3 +37,13 @@ fn an_eviction_during_a_first_fetch_keeps_its_version() {
         panic!("{failure}");
     }
 }
+
+/// Seed 8590: a new home took a deleted object's metadata from its previous
+/// home, S3 answered its revalidation with 404, and the home asked the
+/// previous home again, around and around within one tick.
+#[test]
+fn a_change_s3_reveals_outweighs_a_previous_homes_metadata() {
+    if let Err(failure) = Simulator::from_seed(8590).run() {
+        panic!("{failure}");
+    }
+}

@@ -128,7 +128,7 @@ MUTANTS = [
     (
         "fallback outside the fallback window",
         [(NODE, "if self.now >= *until {\n            return None;\n        }", ""),
-         (NODE, "self.previous = None;\n            self.written.clear();", "self.written.clear();")],
+         (NODE, "self.previous = None;\n            // Blocks placed elsewhere", "// Blocks placed elsewhere")],
     ),
     (
         "owned blocks are evicted before disowned ones",
@@ -184,6 +184,53 @@ MUTANTS = [
     (
         "gateways learn no addresses from rings",
         [(GATEWAY_ENGINE, "peers.learn(&addresses);", "let _ = &addresses;")],
+    ),
+    (
+        "a joining node's previous ring gives way to its startup ring",
+        [(NODE, "let previous = match self.previous.take() {\n            Some((previous, _)) => previous,\n            None => replaced,\n        };",
+          "let _ = self.previous.take();\n        let previous = replaced;")],
+    ),
+    (
+        "a failed ring fetch holds up the next",
+        [(GATEWAY, "self.now = self.now.max(now);\n        self.fetching_ring = None;\n    }", "self.now = self.now.max(now);\n    }")],
+    ),
+    (
+        "a write through the old home stays there",
+        [(NODE, "self.actions.push(Action::PassWrite { node: home, key });", "let _ = key;")],
+    ),
+    (
+        "disowned marks outlive their blocks",
+        [(STORE, "Some(entry) if entry.seq != seq || entry.queue == Queue::None => {}", "Some(entry) if entry.queue == Queue::None => {}")],
+    ),
+    (
+        "a ring change leaves disowned marks",
+        [(STORE, "pub fn clear_disowned(&mut self) {\n        self.disowned.clear();\n    }", "pub fn clear_disowned(&mut self) {}")],
+    ),
+    (
+        "fill runs cross placements",
+        [(NODE, "&& !self.in_flight.contains_key(&block)\n                                && layout.placement(key, size, index).hash() == placement",
+          "&& !self.in_flight.contains_key(&block)")],
+    ),
+    (
+        "an unanswered previous owner is asked again",
+        [(NODE, "self.unreachable.extend(peer);", "let _ = peer;")],
+    ),
+    (
+        "a previous home's metadata ages from when it arrived",
+        [(NODE, "let validated = Time(sent.0.saturating_sub(meta.age));", "let validated = sent;")],
+    ),
+    (
+        "gossip addresses are learned only with a new ring",
+        [(MEMBERSHIP_ENGINE, "refresh(engine);\n    let actions", "let actions")],
+    ),
+    (
+        "an unresolvable address stops the node",
+        [(SERVER, "let socket = UdpSocket::bind(own).await?;",
+          "for address in config.addresses().values() {\n                tokio::net::lookup_host(address.as_str()).await?;\n            }\n            let socket = UdpSocket::bind(own).await?;")],
+    ),
+    (
+        "a change S3 reveals leaves a previous home's metadata usable",
+        [(NODE, "self.forget(&key);\n                self.changed(&key);", "self.forget(&key);")],
     ),
     (
         "gateways ignore ring versions",

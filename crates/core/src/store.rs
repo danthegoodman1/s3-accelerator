@@ -139,8 +139,9 @@ pub struct Store {
     small_bytes: u64,
     ghost: VecDeque<u64>,
     ghosts: BTreeMap<u64, u32>,
-    /// Blocks the node no longer owns, which eviction takes first.
-    disowned: VecDeque<BlockKey>,
+    /// Blocks the node no longer owns, which eviction takes first, with the
+    /// sequence number of the entry each was marked in.
+    disowned: VecDeque<(BlockKey, u64)>,
     next_seq: u64,
     evicted: Vec<(BlockKey, Location)>,
 }
@@ -450,24 +451,31 @@ impl Store {
             .blocks
             .iter()
             .filter(|(_, entry)| entry.queue != Queue::None && !owned(entry.placement))
-            .map(|(&key, _)| key)
+            .map(|(&key, entry)| (key, entry.seq))
             .collect();
+    }
+
+    /// Forgets which blocks are disowned, as when the ring changes again.
+    pub fn clear_disowned(&mut self) {
+        self.disowned.clear();
     }
 
     /// Evicts one block: a disowned one if any is unpinned, and otherwise
     /// by S3-FIFO. Returns false when every queued block is pinned.
     fn evict_one(&mut self) -> bool {
         for _ in 0..self.disowned.len() {
-            let Some(key) = self.disowned.pop_front() else {
+            let Some((key, seq)) = self.disowned.pop_front() else {
                 break;
             };
+            // A mark counts only for the entry it was made on.
             match self.blocks.get(&key) {
-                Some(entry) if entry.pins > 0 => self.disowned.push_back(key),
-                Some(entry) if entry.queue != Queue::None => {
+                Some(entry) if entry.seq != seq || entry.queue == Queue::None => {}
+                Some(entry) if entry.pins > 0 => self.disowned.push_back((key, seq)),
+                Some(_) => {
                     self.evict(key);
                     return true;
                 }
-                _ => {}
+                None => {}
             }
         }
         self.evict_by_frequency()
@@ -672,6 +680,38 @@ mod tests {
         fill(&mut store, 10, 16).unwrap();
         assert_eq!(evicted(&mut store), [key(0)]);
         store.unpin(key(3));
+    }
+
+    /// A mark counts only for the block it was made on: a block evicted
+    /// and stored again leaves nothing to evict first.
+    #[test]
+    fn disowned_marks_end_with_their_block() {
+        let mut store = store();
+        for index in 0..8 {
+            fill(&mut store, index, 16).unwrap();
+        }
+        store.disown(|_| false);
+        // Block 0's mark is for the entry it had before it was stored again.
+        store.remove(key(0));
+        fill(&mut store, 0, 16).unwrap();
+        store.hit(key(0));
+        store.hit(key(1));
+        fill(&mut store, 8, 16).unwrap();
+        assert_eq!(evicted(&mut store), [key(1)]);
+    }
+
+    /// Marks a ring change clears leave eviction to S3-FIFO.
+    #[test]
+    fn cleared_marks_leave_eviction_to_s3_fifo() {
+        let mut store = store();
+        for index in 0..8 {
+            fill(&mut store, index, 16).unwrap();
+        }
+        store.disown(|_| false);
+        store.hit(key(0));
+        store.clear_disowned();
+        fill(&mut store, 8, 16).unwrap();
+        assert_eq!(evicted(&mut store), [key(1)]);
     }
 
     #[test]

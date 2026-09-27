@@ -228,6 +228,9 @@ pub enum Action {
     /// The node gave up on S3 request `origin`: drop its response if it
     /// arrives.
     Cancel { origin: OriginRequestId },
+    /// Tell `node` of a write to `key` that passed through a gateway, with
+    /// `on_write_from` and `passed_on` set.
+    PassWrite { node: NodeId, key: ObjectKey },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -245,9 +248,11 @@ pub struct Stats {
     /// failed.
     pub verified_blocks: u64,
     pub corrupt_blocks: u64,
-    /// Reads sent to previous owners, objects whose metadata a previous
-    /// home supplied, and body bytes served from previous owners' blocks.
+    /// Reads sent to previous owners, those that went unanswered, objects
+    /// whose metadata a previous home supplied, and body bytes served from
+    /// previous owners' blocks.
     pub peer_requests: u64,
+    pub peer_timeouts: u64,
     pub peer_metadata: u64,
     pub peer_bytes: u64,
 }
@@ -263,6 +268,7 @@ impl std::ops::AddAssign for Stats {
         self.verified_blocks += other.verified_blocks;
         self.corrupt_blocks += other.corrupt_blocks;
         self.peer_requests += other.peer_requests;
+        self.peer_timeouts += other.peer_timeouts;
         self.peer_metadata += other.peer_metadata;
         self.peer_bytes += other.peer_bytes;
     }
@@ -286,8 +292,9 @@ pub struct Node {
     previous: Option<(Ring, Time)>,
     /// Previous owners that failed to answer since the last ring change.
     unreachable: BTreeSet<NodeId>,
-    /// Writes to keys this node knew nothing of, during the fallback
-    /// window: a previous home's metadata validated before one is stale.
+    /// Changes this node learned of within the last fallback window, from
+    /// a gateway's write or S3's answer: a previous home's metadata
+    /// validated before one is stale.
     written: BTreeMap<ObjectKey, Time>,
     config: Config,
     objects: BTreeMap<ObjectKey, Object>,
@@ -838,9 +845,26 @@ impl Node {
     /// A write to `key` passed through this node and succeeded: its
     /// metadata no longer holds.
     pub fn on_write(&mut self, now: Time, key: &ObjectKey) {
+        self.on_write_from(now, key, false);
+    }
+
+    /// As `on_write`, for a write another node passed on, which goes no
+    /// further. Otherwise, within the fallback window, the node passes the
+    /// write to the key's home under its other ring: a gateway told one
+    /// home of the write, and the other may hold or ask for the metadata.
+    pub fn on_write_from(&mut self, now: Time, key: &ObjectKey, passed_on: bool) {
         self.now = self.now.max(now);
-        if self.previous.is_some() {
-            self.written.insert(key.clone(), self.now);
+        self.changed(key);
+        if !passed_on && let Some((previous, _)) = &self.previous {
+            let placement = Placement::Home(key).hash();
+            let homes = [self.ring.owner(placement), previous.owner(placement)];
+            let mut told = BTreeSet::new();
+            for home in homes.into_iter().flatten() {
+                if home != self.id && told.insert(home) {
+                    let key = key.clone();
+                    self.actions.push(Action::PassWrite { node: home, key });
+                }
+            }
         }
         if self.policy(&key.bucket).freshness == Freshness::Immutable {
             let key = key.clone();
@@ -869,16 +893,23 @@ impl Node {
     }
 
     /// Membership changed the ring. The node keeps the previous one for
-    /// the fallback window.
+    /// the fallback window. Changes that follow while the window lasts,
+    /// such as while a joining node hears of the others, extend it and
+    /// keep the ring from before the first: its owners held the data.
     pub fn on_ring(&mut self, now: Time, ring: Ring) {
         self.now = self.now.max(now);
         if ring == self.ring {
             return;
         }
         let until = Time(self.now.0 + self.config.fallback_window);
-        let previous = std::mem::replace(&mut self.ring, ring);
+        let replaced = std::mem::replace(&mut self.ring, ring);
+        let previous = match self.previous.take() {
+            Some((previous, _)) => previous,
+            None => replaced,
+        };
         self.previous = Some((previous, until));
         self.unreachable.clear();
+        self.store.clear_disowned();
     }
 
     /// The node is joining a cluster whose ring, before it arrived, was
@@ -892,6 +923,14 @@ impl Node {
         let until = Time(self.now.0 + self.config.fallback_window);
         self.previous = Some((before, until));
         self.unreachable.clear();
+    }
+
+    /// Notes that `key` changed now, so metadata validated earlier, such as
+    /// a previous home's, is stale.
+    fn changed(&mut self, key: &ObjectKey) {
+        let horizon = self.now.0.saturating_sub(self.config.fallback_window);
+        self.written.retain(|_, written| written.0 >= horizon);
+        self.written.insert(key.clone(), self.now);
     }
 
     /// The node that owned `placement` before the last ring change, while
@@ -917,7 +956,6 @@ impl Node {
             .is_some_and(|(_, until)| *until <= self.now)
         {
             self.previous = None;
-            self.written.clear();
             // Blocks placed elsewhere now go before any this node owns.
             let (ring, id) = (&self.ring, self.id);
             self.store
@@ -937,6 +975,9 @@ impl Node {
                 matches!(request.purpose, Purpose::PeerMeta { .. }),
             );
             self.actions.push(Action::Cancel { origin });
+            if peer.is_some() {
+                self.stats.peer_timeouts += 1;
+            }
             self.unreachable.extend(peer);
             match asks_metadata {
                 true => self.on_peer_metadata(now, origin, None),
@@ -1476,6 +1517,7 @@ impl Node {
             }
             _ => {
                 self.forget(&key);
+                self.changed(&key);
             }
         }
         for waiter in waiters {
@@ -1596,13 +1638,17 @@ impl Node {
             let origin = match in_flight {
                 Some(origin) => origin,
                 None => {
-                    // Fetch this block and every missing block after it,
-                    // up to a chunk, in one range GET.
+                    // Fetch this block and every missing block after it
+                    // with the same placement, up to a chunk, in one range
+                    // GET: one owner holds the run, and held it before.
+                    let placement = layout.placement(key, size, index).hash();
                     let run_end = blocks[next..]
                         .iter()
                         .take_while(|&&index| {
                             let block = BlockKey { version, index };
-                            self.store.get(&block).is_none() && !self.in_flight.contains_key(&block)
+                            self.store.get(&block).is_none()
+                                && !self.in_flight.contains_key(&block)
+                                && layout.placement(key, size, index).hash() == placement
                         })
                         .take(chunk_blocks)
                         .count();
@@ -1680,7 +1726,7 @@ impl Node {
             last_byte,
             stored: Vec::new(),
         };
-        // A run lies within one chunk, so one node owns it, and owned it.
+        // A run shares one placement, so one node owns it, and owned it.
         let placement = layout.placement(key, size, *run.start()).hash();
         let peer = match self.ring.owner(placement) == Some(self.id) {
             true => self.previous_owner(placement),
@@ -1759,6 +1805,9 @@ impl Node {
         let changed = matches!(head.status, 206 | 404 | 412);
         let mut revalidating = Vec::new();
         let (key, etag) = self.name(version).clone();
+        if changed {
+            self.changed(&key);
+        }
         let known =
             matches!(self.objects.get(&key), Some(Object::Known { meta, .. }) if meta.etag == etag);
         if changed

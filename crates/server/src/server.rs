@@ -24,9 +24,7 @@ use s3_accelerator_core::node::Node;
 use s3_accelerator_core::placement::NodeId;
 use s3_accelerator_core::s3::{Method, ObjectKey, Request, ResponseHead};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -145,8 +143,12 @@ pub async fn run_with(
                 Arc::new(disk),
                 config.addresses(),
             );
-            let gossip = resolve(&config)?;
-            let socket = UdpSocket::bind(gossip[&id]).await?;
+            let address = &config.addresses()[&id];
+            let own = tokio::net::lookup_host(address.as_str())
+                .await?
+                .next()
+                .ok_or_else(|| io::Error::other(format!("{address} does not resolve")))?;
+            let socket = UdpSocket::bind(own).await?;
             let started = Instant::now();
             let membership = Membership::new(
                 Time(0),
@@ -155,7 +157,7 @@ pub async fn run_with(
                 config.cluster.membership.config(),
                 random_seed(),
             );
-            let seeds: Vec<NodeId> = gossip.keys().copied().collect();
+            let seeds: Vec<NodeId> = config.addresses().into_keys().collect();
             let fallback_window = Duration::from_millis(config.cache.fallback_window_ms);
             let (engine_for_membership, peers) = (engine.clone(), peers.clone());
             let stopper = stopping.clone();
@@ -166,7 +168,6 @@ pub async fn run_with(
                     engine_for_membership,
                     peers,
                     socket,
-                    gossip,
                     seeds,
                 )
                 .await;
@@ -200,20 +201,6 @@ pub async fn run_with(
         Some(node) => node.await.map_err(io::Error::other)?,
         None => Ok(()),
     }
-}
-
-/// Each node's cluster address, where it also gossips over UDP.
-fn resolve(config: &Config) -> io::Result<BTreeMap<NodeId, SocketAddr>> {
-    config
-        .addresses()
-        .into_iter()
-        .map(|(id, address)| {
-            let resolved = address.to_socket_addrs()?.next().ok_or_else(|| {
-                io::Error::other(format!("node {} has no address: {address}", id.0))
-            })?;
-            Ok((id, resolved))
-        })
-        .collect()
 }
 
 /// A seed for membership's random choices, which need no secrecy.

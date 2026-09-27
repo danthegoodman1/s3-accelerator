@@ -36,14 +36,19 @@ const META_SIZE: &str = "x-accel-meta-size";
 const META_AGE: &str = "x-accel-meta-age";
 const META_HEADER: &str = "x-accel-meta-header";
 const RING: &str = "x-accel-ring";
+const PASSED_ON: &str = "x-accel-passed-on";
 const RING_MEMBERS: &str = "x-accel-ring-members";
 
 /// What a gateway asks of a node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeRequest {
     Read(Read),
-    /// A write to the key passed through the gateway and succeeded.
-    Written(ObjectKey),
+    /// A write to the key passed through a gateway and succeeded. A node
+    /// passes on a write it heard of, and `passed_on` stops it there.
+    Written {
+        key: ObjectKey,
+        passed_on: bool,
+    },
     /// The node's ring.
     Ring,
 }
@@ -77,8 +82,11 @@ pub fn encode_request(
             add(KIND, "ring".into());
             return ("GET", "/".into(), headers);
         }
-        NodeRequest::Written(key) => {
+        NodeRequest::Written { key, passed_on } => {
             add(KIND, "written".into());
+            if *passed_on {
+                add(PASSED_ON, "1".into());
+            }
             key
         }
         NodeRequest::Read(Read::Object {
@@ -127,7 +135,7 @@ pub fn encode_request(
         }
     };
     let method = match request {
-        NodeRequest::Written(_) => "POST",
+        NodeRequest::Written { .. } => "POST",
         NodeRequest::Read(_) | NodeRequest::Ring => "GET",
     };
     (method, path(key), headers)
@@ -158,7 +166,10 @@ pub fn decode_request(path: &str, headers: &[(String, String)]) -> Result<NodeRe
         })
     };
     match field(KIND)? {
-        "written" => Ok(NodeRequest::Written(key)),
+        "written" => Ok(NodeRequest::Written {
+            key,
+            passed_on: header(headers, PASSED_ON).is_some(),
+        }),
         "range" => Ok(NodeRequest::Read(Read::Range(range(key)?))),
         "stored" => Ok(NodeRequest::Read(Read::Stored(range(key)?))),
         "known" => Ok(NodeRequest::Read(Read::Known(key))),
@@ -402,7 +413,14 @@ mod tests {
             last: 49,
         })));
         round_trip(NodeRequest::Read(Read::Known(key())));
-        round_trip(NodeRequest::Written(key()));
+        round_trip(NodeRequest::Written {
+            key: key(),
+            passed_on: false,
+        });
+        round_trip(NodeRequest::Written {
+            key: key(),
+            passed_on: true,
+        });
         round_trip(NodeRequest::Ring);
     }
 

@@ -115,8 +115,9 @@ pub struct NodeEngine {
 struct Work {
     /// S3 requests, and whether each body streams.
     fetches: Vec<(OriginRequestId, Request, bool)>,
-    /// Reads of previous owners.
+    /// Reads of previous owners, and writes to pass on.
     peer_fetches: Vec<(OriginRequestId, NodeId, Read)>,
+    passed_writes: Vec<(NodeId, ObjectKey)>,
     writes: Vec<(Location, Bytes)>,
     /// Slots to verify: location, length and checksum.
     verifies: Vec<(Location, u64, u64)>,
@@ -203,12 +204,13 @@ impl NodeEngine {
         this.node.on_joined(now, before);
     }
 
-    /// A write to `key` passed through a gateway and succeeded.
-    pub fn written(engine: &SharedNode, key: &ObjectKey) {
+    /// A write to `key` passed through a gateway and succeeded; another
+    /// node passed it on if `passed_on`.
+    pub fn written(engine: &SharedNode, key: &ObjectKey, passed_on: bool) {
         let work = {
             let mut this = engine.borrow_mut();
             let now = this.now();
-            this.node.on_write(now, key);
+            this.node.on_write_from(now, key, passed_on);
             this.pump()
         };
         start(engine, work);
@@ -323,6 +325,7 @@ impl NodeEngine {
             node::Action::PeerFetch { origin, peer, read } => {
                 self.work.peer_fetches.push((origin, peer, read));
             }
+            node::Action::PassWrite { node, key } => self.work.passed_writes.push((node, key)),
             node::Action::Cancel { origin } => {
                 if let Some(task) = self.tasks.remove(&origin) {
                     task.abort();
@@ -441,6 +444,19 @@ fn start(engine: &SharedNode, work: Work) {
             .borrow_mut()
             .tasks
             .insert(origin, task.abort_handle());
+    }
+    for (node, key) in work.passed_writes {
+        let peers = engine.borrow().peers.clone();
+        tokio::task::spawn_local(async move {
+            let request = NodeRequest::Written {
+                key,
+                passed_on: true,
+            };
+            match peers.exchange(node, &request).await {
+                Ok(exchanged) => peers.idle(exchanged.body),
+                Err(error) => eprintln!("passing a write to node {}: {error}", node.0),
+            }
+        });
     }
     for (location, bytes) in work.writes {
         write(engine, location, bytes);
@@ -749,8 +765,8 @@ async fn connection(stream: TcpStream, engine: &SharedNode, secret: &str) -> io:
                 eprintln!("a gateway's request: {error}");
                 return refuse(&mut connection, 400).await;
             }
-            Ok(NodeRequest::Written(key)) => {
-                NodeEngine::written(engine, &key);
+            Ok(NodeRequest::Written { key, passed_on }) => {
+                NodeEngine::written(engine, &key, passed_on);
                 Reply {
                     answer: NodeAnswer::Written,
                     body: Vec::new(),

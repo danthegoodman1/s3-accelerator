@@ -1,8 +1,11 @@
 //! The cache survives resizing: a node that joins or leaves costs few S3
 //! requests, because new owners read from previous owners first.
 
-use s3_accelerator_core::s3::{ObjectKey, Request};
+use s3_accelerator_core::layout::Layout;
+use s3_accelerator_core::placement::{Member, NodeId, Ring};
+use s3_accelerator_core::s3::{ByteRange, ObjectKey, Request};
 use s3_accelerator_sim::{IMMUTABLE_BUCKET, Options, Simulator, Summary, TTL_BUCKET};
+use std::num::NonZeroU32;
 
 fn run(sim: &mut Simulator, ticks: u64) {
     for _ in 0..ticks {
@@ -103,6 +106,15 @@ fn grow(seed: u64, fallback_window: u64) -> Reread {
     })
 }
 
+/// A node that knows one seed at first, as a config naming one running
+/// node: its ring grows as it hears of the others, and it must still read
+/// from the owners before it arrived.
+fn grow_from_one_seed(seed: u64, fallback_window: u64) -> Reread {
+    resize(seed, fallback_window, |sim| {
+        sim.add_node_knowing(Some(vec![1])).unwrap();
+    })
+}
+
 fn shrink(seed: u64, fallback_window: u64) -> Reread {
     resize(seed, fallback_window, |sim| sim.remove_node(3).unwrap())
 }
@@ -134,6 +146,14 @@ fn check(name: &str, seed: u64, with: Reread, without: Reread) {
 fn a_new_node_reads_from_previous_owners() {
     for seed in 0..8 {
         check("grow", seed, grow(seed, 5_000), grow(seed, 0));
+    }
+}
+
+#[test]
+fn a_node_that_knows_one_seed_reads_from_previous_owners() {
+    for seed in 0..4 {
+        let (with, without) = (grow_from_one_seed(seed, 5_000), grow_from_one_seed(seed, 0));
+        check("grow from one seed", seed, with, without);
     }
 }
 
@@ -200,4 +220,160 @@ fn blocks_from_a_previous_owner_skip_the_doorkeeper() {
     assert_eq!(second.peer_bytes, 0);
     assert_eq!(sim.summary().peer_requests, before.peer_requests);
     assert_eq!(second.origin_requests, 0);
+}
+
+/// A gateway still on the old ring tells the old home of a write to an
+/// object whose metadata the new home already copied. The old home passes
+/// the write on, and the next read through the new home returns the
+/// written version.
+#[test]
+fn a_write_through_the_old_home_reaches_the_new_one() {
+    let keys = keys(0, IMMUTABLE_BUCKET);
+    let mut options = cluster(0, 5_000);
+    options.gateways = 2;
+    let mut sim = Simulator::new(0, options);
+    run(&mut sim, 300);
+    for (key, size) in &keys {
+        sim.put(key, *size);
+        sim.read(Request::get(key.clone())).unwrap();
+    }
+    let node = sim.add_node().unwrap();
+    settle_ring(&mut sim, &keys[0].0);
+    let (key, _) = keys
+        .iter()
+        .find(|(key, _)| sim.home(key) == node)
+        .expect("an object whose home moved");
+    // The new home copies the metadata from the old one. Gateway 0 keeps
+    // one object's metadata, so reading another makes it ask the home.
+    sim.read(Request::get(key.clone())).unwrap();
+    let other = keys.iter().find(|(other, _)| other != key).unwrap();
+    sim.read(Request::get(other.0.clone())).unwrap();
+    assert_ne!(sim.gateway_ring(1), sim.gateway_ring(0));
+    sim.write_through_via(1, key, 999).unwrap();
+    let (head, body) = sim.read(Request::get(key.clone())).unwrap();
+    let current = sim.origin().current(key).unwrap();
+    assert_eq!(head.etag.as_ref(), Some(&current.etag));
+    assert_eq!(body.len(), 999);
+}
+
+/// A previous owner that never answers is asked once: after its timeout,
+/// the new owner goes straight to S3 until the ring changes again.
+#[test]
+fn a_previous_owner_that_never_answers_is_skipped() {
+    let keys = keys(0, IMMUTABLE_BUCKET);
+    let mut options = cluster(0, 50_000);
+    // Node 0 stays in every ring while the objects are reread.
+    options.down_grace = 100_000;
+    let mut sim = Simulator::new(0, options);
+    run(&mut sim, 300);
+    for (key, size) in &keys {
+        sim.put(key, *size);
+        sim.read(Request::get(key.clone())).unwrap();
+        sim.read(Request::get(key.clone())).unwrap();
+    }
+    sim.add_node().unwrap();
+    settle_ring(&mut sim, &keys[0].0);
+    sim.fail(0).unwrap();
+    let before = sim.summary();
+    reread(&mut sim, &keys);
+    let after = sim.summary();
+    assert!(after.peer_requests > before.peer_requests + 1);
+    assert_eq!(after.peer_timeouts - before.peer_timeouts, 1);
+}
+
+/// Metadata a previous home validated long ago is as old at the new home:
+/// it has outlived its TTL, so the new home checks S3 and finds the
+/// object changed, rather than serving the old version for another TTL.
+#[test]
+fn metadata_from_a_previous_home_keeps_its_age() {
+    let keys = keys(0, TTL_BUCKET);
+    let mut options = cluster(0, 50_000);
+    options.ttl = 1_000;
+    let mut sim = Simulator::new(0, options);
+    run(&mut sim, 300);
+    for (key, size) in &keys {
+        sim.put(key, *size);
+        sim.read(Request::get(key.clone())).unwrap();
+    }
+    // S3 changes behind the cache's back.
+    for (key, size) in &keys {
+        sim.put(key, size + 1);
+    }
+    run(&mut sim, 1_000);
+    let node = sim.add_node().unwrap();
+    settle_ring(&mut sim, &keys[0].0);
+    let before = sim.summary().peer_metadata;
+    let moved: Vec<&(ObjectKey, u64)> = keys
+        .iter()
+        .filter(|(key, _)| sim.home(key) == node)
+        .collect();
+    assert!(!moved.is_empty());
+    for (key, size) in moved {
+        let (_, body) = sim.read(Request::get(key.clone())).unwrap();
+        assert_eq!(body.len() as u64, size + 1);
+    }
+    assert!(sim.summary().peer_metadata > before);
+}
+
+/// A read across two placements that both moved to the new node, from two
+/// different nodes, asks each previous owner for its own blocks.
+#[test]
+fn a_read_across_two_placements_asks_each_previous_owner() {
+    let options = cluster(0, 50_000);
+    let layout = Layout::new(options.block_size, options.chunk_blocks);
+    let block = options.block_size;
+    let ring = |nodes: u64| {
+        let members = (0..nodes)
+            .map(|id| Member {
+                id: NodeId(id),
+                weight: NonZeroU32::MIN,
+            })
+            .collect();
+        Ring::new(1, members)
+    };
+    let (before, after) = (ring(4), ring(5));
+    let size: u64 = 700;
+    let blocks = size.div_ceil(block);
+    let owner = |ring: &Ring, key: &ObjectKey, index: u64| {
+        ring.owner(layout.placement(key, size, index).hash())
+    };
+    // Adjacent blocks of two placements the new node will own, which two
+    // different nodes owned before.
+    let (key, first) = (0..1_000)
+        .map(|index| ObjectKey {
+            bucket: IMMUTABLE_BUCKET.into(),
+            key: format!("wide-{index}"),
+        })
+        .find_map(|key| {
+            let first = (0..blocks - 1).find(|&index| {
+                layout.placement(&key, size, index).hash()
+                    != layout.placement(&key, size, index + 1).hash()
+                    && owner(&after, &key, index) == Some(NodeId(4))
+                    && owner(&after, &key, index + 1) == Some(NodeId(4))
+                    && owner(&before, &key, index) != owner(&before, &key, index + 1)
+            })?;
+            Some((key, first))
+        })
+        .expect("an object with two such placements");
+    let mut sim = Simulator::new(0, options);
+    run(&mut sim, 300);
+    // The first read stores the home's blocks, and the second the others'.
+    sim.put(&key, size);
+    sim.read(Request::get(key.clone())).unwrap();
+    sim.read(Request::get(key.clone())).unwrap();
+    assert_eq!(sim.add_node().unwrap(), 4);
+    settle_ring(&mut sim, &key);
+    let requests = sim.summary().origin_requests;
+    let range = ByteRange::Inclusive {
+        first: first * block,
+        last: (first + 2) * block - 1,
+    };
+    let (head, _) = sim
+        .read(Request {
+            range: Some(range),
+            ..Request::get(key)
+        })
+        .unwrap();
+    assert_eq!(head.status, 206);
+    assert_eq!(sim.summary().origin_requests, requests);
 }
