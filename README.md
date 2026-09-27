@@ -7,18 +7,20 @@ The core serves reads from each object's home node, which keeps the object's met
 ## Layout
 
 - `crates/core`: gateway and storage-node logic as deterministic state machines that do no I/O.
-- `crates/server`: the `s3-accelerator` binary, which runs the core over sockets and disks: HTTP/1.1, SigV4 validation and grants for clients, the cluster protocol between gateways and nodes, the node's slab file, slot table and metadata file, and signed requests to S3.
+- `crates/server`: the `s3-accelerator` binary, which runs the core over sockets and disks: HTTP/1.1, SigV4 validation and grants for clients, the cluster protocol between gateways and nodes, the node's slab file, slot table and metadata file, and signed requests to S3. Bodies stream: nodes send stored blocks with `sendfile`, and gateways relay them with `splice`.
 - `crates/sim`: a deterministic simulator that runs gateways, storage nodes, clients and a model of S3 on one thread.
 - `tests`: the S3 conformance suite, which runs against s3proxy and through the accelerator.
 
 ## Testing
 
 ```console
-cargo test --workspace                        # unit tests and 200 simulator seeds
+cargo test --workspace                        # unit, server and simulator tests
 scripts/s3proxy start                         # in-memory s3proxy in Docker, on 127.0.0.1:8080
 cargo test --workspace -- --include-ignored   # adds the conformance suite
 scripts/s3proxy stop
 ```
+
+The server's tests need Linux and `strace`: `crates/server/tests/zero_copy.rs` traces a node and a gateway to show that hits leave through `sendfile` and `splice`, and that the node syncs each block before its record and each cleared record before the slot is rewritten. The data directory must be on a disk-backed filesystem, and the tests keep theirs under `target/`.
 
 The conformance suite reads `CONFORMANCE_ENDPOINT`, `CONFORMANCE_ACCESS_KEY_ID` and `CONFORMANCE_SECRET_ACCESS_KEY`, which default to the local s3proxy. To run it through the accelerator, which `config/local.toml` points at that s3proxy with a gateway and a node in one process:
 

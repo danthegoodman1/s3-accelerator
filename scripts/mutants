@@ -26,6 +26,11 @@ NODE = "crates/core/src/node.rs"
 STORE = "crates/core/src/store.rs"
 GATEWAY = "crates/core/src/gateway.rs"
 SERVER = "crates/server/src/server.rs"
+DISK = "crates/server/src/disk.rs"
+HTTP = "crates/server/src/http.rs"
+NODE_ENGINE = "crates/server/src/node_engine.rs"
+ORIGIN = "crates/server/src/origin.rs"
+ZERO_COPY = "crates/server/src/zero_copy.rs"
 STEP_TIMEOUT = 600
 
 MUTANTS = [
@@ -105,16 +110,58 @@ MUTANTS = [
           "if let Some(source) = None::<&str> {")],
     ),
     (
-        "bodies are read whatever their size",
-        [(SERVER, "if len > context.max_body {", "if false {")],
+        "a key list of any size is read",
+        [(SERVER, "if deletes_objects && request.len > MAX_DELETE_BODY {", "if false {")],
     ),
     (
         "DeleteObjects leaves cached metadata",
-        [(SERVER, "return listed_keys(&String::from_utf8_lossy(body));", "return Vec::new();")],
+        [(SERVER, "let keys = listed_keys(&String::from_utf8_lossy(&body));", "let keys: Vec<String> = Vec::new();")],
     ),
     (
-        "dot-segment keys reach S3",
-        [(SERVER, 'if key.split(\'/\').any(|segment| segment == "." || segment == "..") {', "if false {")],
+        "the S3 client drops . segments",
+        [(ORIGIN, "let segments: Vec<String> = key.key.split('/').map(sigv4::encode).collect();",
+          "let segments: Vec<String> = key.key.split('/').filter(|segment| *segment != \".\").map(sigv4::encode).collect();")],
+    ),
+    (
+        "S3 receives a body that fails its hash",
+        [(SERVER, "&& hex::encode(hasher.finalize()) != *digest", "&& hex::encode(hasher.finalize()) != *digest && false")],
+    ),
+    (
+        "a slot is overwritten while its pages are in flight",
+        [(DISK, "if self.pages.in_use(&self.slabs, slot, offset..offset + len)? {",
+          "if false && self.pages.in_use(&self.slabs, slot, offset..offset + len)? {")],
+    ),
+    (
+        "an arriving body's blocks are never written",
+        [(NODE_ENGINE, "let done = slot.bytes.len() as u64 == slot.end - slot.start;", "let done = false;")],
+    ),
+    (
+        "a hit is copied rather than sent with sendfile",
+        [(ZERO_COPY, "match rustix::fs::sendfile(socket, file, Some(&mut offset), count) {",
+          "match { let mut buf = vec![0u8; count.min(1 << 20)]; std::os::unix::fs::FileExt::read_at(file, &mut buf, offset)"
+          ".map_err(|error| Errno::from_io_error(&error).unwrap_or(Errno::IO))"
+          ".and_then(|read| rustix::io::write(socket, &buf[..read]))"
+          ".inspect(|written| offset += *written as u64) } {")],
+    ),
+    (
+        "a relay copies through the gateway",
+        [(ZERO_COPY, "let fill = || Ok(splice(from, None, &pipe.write, None, want, flags)?);",
+          "let fill = || { let mut buf = vec![0u8; want]; let read = rustix::io::read(from, &mut buf[..])?; "
+          "Ok(rustix::io::write(&pipe.write, &buf[..read])?) };")],
+    ),
+    (
+        "a record is written before its block's sync",
+        [(DISK, "self.slabs.write_all_at(bytes, offset)?;\n        self.slabs.sync_data()?;",
+          "self.slabs.write_all_at(bytes, offset)?;")],
+    ),
+    (
+        "a block write begins before a clear's sync",
+        [(DISK, "if *clears {\n                self.table.sync_data()?;\n                *clears = false;\n            }",
+          "if *clears {\n                *clears = false;\n            }")],
+    ),
+    (
+        "a gateway reads past a node's response head",
+        [(HTTP, ".read_exact(&mut chunk[..consumed - start])", ".read_exact(&mut chunk[..peeked])")],
     ),
     (
         "parts assembled out of order",

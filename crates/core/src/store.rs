@@ -22,6 +22,14 @@ pub struct StoreConfig {
     pub max_slot: u64,
 }
 
+impl StoreConfig {
+    /// The size of the slots that hold blocks of `len` bytes: the smallest
+    /// size class that fits them.
+    pub fn slot_size(&self, len: u64) -> u64 {
+        len.max(self.min_slot).next_power_of_two()
+    }
+}
+
 /// Where a slot's bytes live: an extent, and an offset within it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Location {
@@ -540,8 +548,7 @@ impl Store {
 }
 
 fn class_index(config: &StoreConfig, len: u64) -> usize {
-    let size = len.max(config.min_slot).next_power_of_two();
-    (size / config.min_slot).trailing_zeros() as usize
+    (config.slot_size(len) / config.min_slot).trailing_zeros() as usize
 }
 
 #[cfg(test)]

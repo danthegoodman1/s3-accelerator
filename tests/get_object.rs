@@ -219,3 +219,37 @@ async fn object_headers_come_back_with_every_read() {
     assert_eq!(output.content_type(), Some("application/x-parquet"));
     assert_eq!(output.metadata().unwrap()["writer"], "conformance");
 }
+
+/// An object many blocks long, read whole and in ranges that cross block
+/// boundaries.
+#[tokio::test]
+#[ignore = "needs an S3 endpoint: scripts/s3proxy start"]
+async fn large_objects_read_whole_and_in_ranges() {
+    let client = client();
+    let bucket = bucket(&client, "large-objects").await;
+    let body = pattern(20 << 20, 9);
+    let etag = put(&client, &bucket, "k", &body).await;
+    for _ in 0..2 {
+        let output = client
+            .get_object()
+            .bucket(&bucket)
+            .key("k")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(output.e_tag(), Some(etag.as_str()));
+        assert!(output.body.collect().await.unwrap().to_vec() == body);
+    }
+    for (first, last) in [(1_048_000, 1_049_000), (3_000_000, 11_000_000)] {
+        let output = client
+            .get_object()
+            .bucket(&bucket)
+            .key("k")
+            .range(format!("bytes={first}-{last}"))
+            .send()
+            .await
+            .unwrap();
+        let bytes = output.body.collect().await.unwrap().to_vec();
+        assert!(bytes == body[first..=last], "bytes {first}-{last}");
+    }
+}

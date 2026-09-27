@@ -2,6 +2,7 @@
 //! responses, and a client writes requests and reads responses. Also the
 //! header formats S3 and the cluster share.
 
+use bytes::Bytes;
 use s3_accelerator_core::s3::{ByteRange, ContentRange, ETag};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -9,6 +10,10 @@ use tokio::net::TcpStream;
 
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_HEADERS: usize = 100;
+/// The most bytes one read of a body takes.
+const READ_CHUNK: usize = 256 * 1024;
+/// How long a peer may leave a write waiting.
+const WRITE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestHead {
@@ -52,11 +57,21 @@ pub struct Response {
     pub headers: Vec<(String, String)>,
     /// For a HEAD, the length a GET's body would have; otherwise the body's.
     pub content_length: u64,
-    pub body: bytes::Bytes,
+    pub body: Bytes,
+}
+
+/// How a response's body is framed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Framing {
+    /// `Content-Length`: the body has this many bytes.
+    Length(u64),
+    /// Chunked transfer encoding, for a body of unknown length.
+    Chunked,
 }
 
 pub struct Connection {
     stream: TcpStream,
+    /// Bytes read from the stream and not yet consumed.
     buffer: Vec<u8>,
 }
 
@@ -66,6 +81,17 @@ impl Connection {
             stream,
             buffer: Vec::new(),
         }
+    }
+
+    /// The socket, for moving body bytes inside the kernel. Bytes already
+    /// read ahead stay in `buffered`.
+    pub fn stream(&self) -> &TcpStream {
+        &self.stream
+    }
+
+    /// How many bytes were read from the socket and not yet consumed.
+    pub fn buffered(&self) -> usize {
+        self.buffer.len()
     }
 
     /// The next request's head, or `None` once the client closes the
@@ -89,6 +115,22 @@ impl Connection {
             }
             self.buffer.extend_from_slice(&chunk[..read]);
         }
+    }
+
+    /// Up to `max` bytes of a body, as they arrive: bytes read ahead first,
+    /// then the next read. Fails at the end of the stream.
+    pub async fn read_some(&mut self, max: usize) -> io::Result<Bytes> {
+        if !self.buffer.is_empty() {
+            let take = self.buffer.len().min(max);
+            return Ok(self.buffer.drain(..take).collect::<Vec<u8>>().into());
+        }
+        let mut chunk = vec![0; max.min(READ_CHUNK)];
+        let read = self.stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        chunk.truncate(read);
+        Ok(chunk.into())
     }
 
     /// Reads a body of `len` bytes as they arrive, so memory grows with
@@ -128,37 +170,47 @@ impl Connection {
         self.stream.flush().await
     }
 
-    /// The next response's status and headers.
+    /// The next response's status and headers. Reads no byte past the
+    /// head, so the body stays in the socket for `splice`.
     pub async fn read_response_head(&mut self) -> io::Result<(u16, Vec<(String, String)>)> {
+        debug_assert!(self.buffer.is_empty(), "a response head read ahead");
+        // Bytes of the head consumed so far.
+        let mut head = Vec::new();
         loop {
-            let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-            let mut response = httparse::Response::new(&mut headers);
-            match response.parse(&self.buffer) {
-                Ok(httparse::Status::Complete(consumed)) => {
-                    let status = response.code.ok_or_else(|| invalid("no status"))?;
-                    let headers = response
-                        .headers
-                        .iter()
-                        .map(|header| {
-                            let value = String::from_utf8_lossy(header.value).into_owned();
-                            (header.name.to_string(), value)
-                        })
-                        .collect();
-                    self.buffer.drain(..consumed);
-                    return Ok((status, headers));
-                }
-                Ok(httparse::Status::Partial) => {}
-                Err(error) => return Err(invalid(&error.to_string())),
-            }
-            if self.buffer.len() > MAX_HEAD {
-                return Err(invalid("response head too large"));
-            }
             let mut chunk = [0; 8 * 1024];
-            let read = self.stream.read(&mut chunk).await?;
-            if read == 0 {
+            let peeked = self.stream.peek(&mut chunk).await?;
+            if peeked == 0 {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
-            self.buffer.extend_from_slice(&chunk[..read]);
+            let start = head.len();
+            head.extend_from_slice(&chunk[..peeked]);
+            let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+            let mut response = httparse::Response::new(&mut headers);
+            let consumed = match response.parse(&head) {
+                Ok(httparse::Status::Complete(consumed)) => consumed,
+                Ok(httparse::Status::Partial) => {
+                    if head.len() > MAX_HEAD {
+                        return Err(invalid("response head too large"));
+                    }
+                    // Every byte peeked belongs to the head.
+                    self.stream.read_exact(&mut chunk[..peeked]).await?;
+                    continue;
+                }
+                Err(error) => return Err(invalid(&error.to_string())),
+            };
+            let status = response.code.ok_or_else(|| invalid("no status"))?;
+            let headers = response
+                .headers
+                .iter()
+                .map(|header| {
+                    let value = String::from_utf8_lossy(header.value).into_owned();
+                    (header.name.to_string(), value)
+                })
+                .collect();
+            self.stream
+                .read_exact(&mut chunk[..consumed - start])
+                .await?;
+            return Ok((status, headers));
         }
     }
 
@@ -173,22 +225,55 @@ impl Connection {
         response: &Response,
         keep_alive: bool,
     ) -> io::Result<()> {
-        let mut head = format!(
-            "HTTP/1.1 {} {}\r\n",
-            response.status,
-            reason(response.status)
-        );
-        for (name, value) in &response.headers {
+        let framing = Framing::Length(response.content_length);
+        self.write_response_head(response.status, &response.headers, framing, keep_alive)
+            .await?;
+        self.write_all(&response.body).await
+    }
+
+    /// Writes a response's status line and headers; the body follows.
+    pub async fn write_response_head(
+        &mut self,
+        status: u16,
+        headers: &[(String, String)],
+        framing: Framing,
+        keep_alive: bool,
+    ) -> io::Result<()> {
+        let mut head = format!("HTTP/1.1 {status} {}\r\n", reason(status));
+        for (name, value) in headers {
             head.push_str(&format!("{name}: {value}\r\n"));
         }
-        head.push_str(&format!("Content-Length: {}\r\n", response.content_length));
+        match framing {
+            Framing::Length(len) => head.push_str(&format!("Content-Length: {len}\r\n")),
+            Framing::Chunked => head.push_str("Transfer-Encoding: chunked\r\n"),
+        }
         if !keep_alive {
             head.push_str("Connection: close\r\n");
         }
         head.push_str("\r\n");
-        self.stream.write_all(head.as_bytes()).await?;
-        self.stream.write_all(&response.body).await?;
-        self.stream.flush().await
+        self.write_all(head.as_bytes()).await
+    }
+
+    pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        tokio::time::timeout(WRITE_IDLE, self.stream.write_all(bytes))
+            .await
+            .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
+    }
+
+    /// Writes one chunk of a chunked body.
+    pub async fn write_chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
+            .await?;
+        self.write_all(bytes).await?;
+        self.write_all(b"\r\n").await
+    }
+
+    /// Ends a chunked body.
+    pub async fn finish_chunks(&mut self) -> io::Result<()> {
+        self.write_all(b"0\r\n\r\n").await
     }
 }
 

@@ -1,33 +1,88 @@
 //! A storage node: runs the core's node on this thread, serves gateways'
 //! reads over the cluster protocol, and carries out the node's actions:
-//! fetches from S3, and block reads and writes on its disk. Block writes and
-//! verifications run on blocking worker threads.
+//! fetches from S3, and block reads and writes on its disk.
+//!
+//! Stored blocks leave with `sendfile` on worker threads, which also write
+//! and verify blocks. A fill's body is held until the node releases it;
+//! every other S3 body passes through as it arrives, to the replies and
+//! slots that read it, and is never held whole.
 
 use crate::disk::Disk;
-use crate::http::{Connection, Response, header};
-use crate::origin::Origin;
+use crate::http::{Connection, Framing, Response, header};
+use crate::origin::{self, Origin, OriginBody};
 use crate::protocol::{self, NodeAnswer, NodeRequest};
 use bytes::Bytes;
+use hyper::body::Incoming;
 use s3_accelerator_core::Time;
 use s3_accelerator_core::node::{self, GatewayRequestId, Node, OriginRequestId, Read, Segment};
-use s3_accelerator_core::s3::{Method, ObjectKey, Request};
+use s3_accelerator_core::s3::{ByteRange, Method, ObjectKey, Request};
 use s3_accelerator_core::store::Location;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
+use std::os::fd::AsFd;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 pub type SharedNode = Rc<RefCell<NodeEngine>>;
 
 /// A node's answer to a gateway, with its body.
 pub struct Reply {
     pub answer: NodeAnswer,
-    pub body: Bytes,
+    pub body: Vec<Part>,
+    /// The body's length.
+    pub len: u64,
+    /// The response the node holds blocks and bodies for until it is sent.
+    sending: Option<GatewayRequestId>,
 }
+
+/// A piece of a reply's body.
+pub enum Part {
+    /// `len` bytes of the slab file from `offset`, sent with `sendfile`.
+    File { offset: u64, len: u64 },
+    /// Bytes of a body the node holds.
+    Held(Bytes),
+    /// `len` bytes of an S3 body, as they arrive.
+    Arriving {
+        chunks: mpsc::Receiver<Bytes>,
+        len: u64,
+    },
+}
+
+/// An S3 response body the node reads.
+enum Body {
+    /// A fill, held whole until the node releases it.
+    Held(Bytes),
+    /// A body whose head just arrived, gathering its readers.
+    Arriving(Vec<Reader>),
+    /// A body passing through to the readers it had as its head arrived.
+    Passing,
+}
+
+/// Where bytes of an arriving body go.
+enum Reader {
+    Reply {
+        offset: u64,
+        len: u64,
+        chunks: mpsc::Sender<Bytes>,
+    },
+    Write {
+        location: Location,
+        offset: u64,
+        len: u64,
+    },
+}
+
+/// Chunks of an arriving body queued for each reply. A reply that falls
+/// this far behind holds up the body for every reader.
+const QUEUED_CHUNKS: usize = 4;
+/// How long a write waits for a slot's old pages to be released, and how
+/// often it looks.
+const PAGES_WAIT: Duration = Duration::from_secs(30);
+const PAGES_RECHECK: Duration = Duration::from_millis(10);
 
 pub struct NodeEngine {
     started: Instant,
@@ -35,12 +90,12 @@ pub struct NodeEngine {
     disk: Arc<Disk>,
     node: Node,
     /// S3 response bodies the node still reads.
-    bodies: BTreeMap<OriginRequestId, Bytes>,
+    bodies: BTreeMap<OriginRequestId, Body>,
     next_id: u64,
     /// Gateways' reads waiting for the node's answer.
     replies: BTreeMap<GatewayRequestId, oneshot::Sender<Reply>>,
     work: Work,
-    /// S3 requests in flight, which a cancellation aborts.
+    /// S3 requests awaiting their heads, which a cancellation aborts.
     tasks: BTreeMap<OriginRequestId, tokio::task::AbortHandle>,
     /// Entries appended to the metadata file since it was last synced.
     unsynced_metadata: bool,
@@ -49,7 +104,8 @@ pub struct NodeEngine {
 /// What the node's actions left to start off this thread.
 #[derive(Default)]
 struct Work {
-    fetches: Vec<(OriginRequestId, Request)>,
+    /// S3 requests, and whether each body streams.
+    fetches: Vec<(OriginRequestId, Request, bool)>,
     writes: Vec<(Location, Bytes)>,
     /// Slots to verify: location, length and checksum.
     verifies: Vec<(Location, u64, u64)>,
@@ -89,6 +145,17 @@ impl NodeEngine {
         };
         start(engine, work);
         receiver
+    }
+
+    /// A reply's body is sent, or will never be: its blocks and bodies are
+    /// free.
+    fn sent(engine: &SharedNode, request: GatewayRequestId) {
+        let work = {
+            let mut this = engine.borrow_mut();
+            this.node.on_sent(request);
+            this.pump()
+        };
+        start(engine, work);
     }
 
     /// A write to `key` passed through a gateway and succeeded.
@@ -147,37 +214,47 @@ impl NodeEngine {
     fn act(&mut self, action: node::Action) {
         match action {
             node::Action::Fetch {
-                origin, request, ..
-            } => self.work.fetches.push((origin, request)),
+                origin,
+                request,
+                streams,
+            } => self.work.fetches.push((origin, request, streams)),
             node::Action::Respond {
                 request,
                 head,
                 body,
                 meta,
             } => {
-                let body = self.assemble(&body);
-                self.reply(request, NodeAnswer::Respond { head, meta }, body);
-                self.node.on_sent(request);
+                let len = body.iter().map(segment_len).sum();
+                let body = self.parts(&body);
+                let answer = NodeAnswer::Respond { head, meta };
+                if !self.reply(request, answer, body, len, true) {
+                    self.node.on_sent(request);
+                }
             }
             node::Action::Metadata { request, meta } => {
-                self.reply(request, NodeAnswer::Metadata(meta), Bytes::new());
+                self.reply(request, NodeAnswer::Metadata(meta), Vec::new(), 0, false);
             }
             node::Action::Stale { request } => {
-                self.reply(request, NodeAnswer::Stale, Bytes::new());
+                self.reply(request, NodeAnswer::Stale, Vec::new(), 0, false);
             }
             node::Action::Write {
                 location,
                 origin,
                 offset,
                 len,
-            } => {
-                let body = &self.bodies[&origin];
-                let range = offset as usize..(offset + len) as usize;
-                match body.get(range.clone()) {
-                    Some(_) => self.work.writes.push((location, body.slice(range))),
+            } => match self.bodies.get_mut(&origin) {
+                Some(Body::Held(bytes)) => match slice(bytes, offset, len) {
+                    Some(bytes) => self.work.writes.push((location, bytes)),
                     None => self.node.on_write_failed(location),
-                }
-            }
+                },
+                Some(Body::Arriving(readers)) => readers.push(Reader::Write {
+                    location,
+                    offset,
+                    len,
+                }),
+                // Only a body's first readers read it as it passes.
+                Some(Body::Passing) | None => self.node.on_write_failed(location),
+            },
             node::Action::Record { location, record } => {
                 if let Err(error) = self.disk.record(location, record) {
                     eprintln!("recording {location:?}: {error}");
@@ -206,51 +283,70 @@ impl NodeEngine {
         }
     }
 
-    fn reply(&mut self, request: GatewayRequestId, answer: NodeAnswer, body: Bytes) {
-        if let Some(reply) = self.replies.remove(&request) {
-            // The gateway may have hung up.
-            let _ = reply.send(Reply { answer, body });
-        }
+    /// Sends the gateway its answer, and whether it was still waiting. A
+    /// `tracked` answer's blocks and bodies stay held until it is sent.
+    fn reply(
+        &mut self,
+        request: GatewayRequestId,
+        answer: NodeAnswer,
+        body: Vec<Part>,
+        len: u64,
+        tracked: bool,
+    ) -> bool {
+        let Some(sender) = self.replies.remove(&request) else {
+            return false;
+        };
+        let reply = Reply {
+            answer,
+            body,
+            len,
+            sending: tracked.then_some(request),
+        };
+        sender.send(reply).is_ok()
     }
 
-    fn assemble(&self, body: &[Segment]) -> Bytes {
-        if let [
-            Segment::Origin {
-                origin,
-                offset,
-                len,
-            },
-        ] = body
-        {
-            return self.bodies[origin].slice(*offset as usize..(offset + len) as usize);
-        }
-        let mut bytes = Vec::new();
-        for segment in body {
-            match *segment {
+    /// The pieces of a response body. An arriving body gains a reader for
+    /// each piece of it.
+    fn parts(&mut self, segments: &[Segment]) -> Vec<Part> {
+        let mut parts = Vec::new();
+        for segment in segments {
+            let part = match *segment {
                 Segment::Slot {
                     location,
                     offset,
                     len,
-                } => match self.disk.read(location, offset, len) {
-                    Ok(slot) => bytes.extend_from_slice(&slot),
-                    // The body ends early, and the gateway reads the rest
-                    // from elsewhere.
-                    Err(error) => {
-                        eprintln!("reading {location:?}: {error}");
-                        break;
-                    }
+                } => Part::File {
+                    offset: self.disk.offset(location) + offset,
+                    len,
                 },
                 Segment::Origin {
                     origin,
                     offset,
                     len,
-                } => {
-                    let start = offset as usize;
-                    bytes.extend_from_slice(&self.bodies[&origin][start..start + len as usize]);
-                }
-            }
+                } => match self.bodies.get_mut(&origin) {
+                    Some(Body::Held(bytes)) => {
+                        Part::Held(slice(bytes, offset, len).unwrap_or_default())
+                    }
+                    Some(Body::Arriving(readers)) => {
+                        let (sender, receiver) = mpsc::channel(QUEUED_CHUNKS);
+                        readers.push(Reader::Reply {
+                            offset,
+                            len,
+                            chunks: sender,
+                        });
+                        Part::Arriving {
+                            chunks: receiver,
+                            len,
+                        }
+                    }
+                    // The reply ends short, and the gateway reads the rest
+                    // from elsewhere.
+                    Some(Body::Passing) | None => Part::Held(Bytes::new()),
+                },
+            };
+            parts.push(part);
         }
-        Bytes::from(bytes)
+        parts
     }
 
     fn save(&mut self, key: &ObjectKey, meta: Option<&node::Meta>) {
@@ -265,51 +361,30 @@ impl NodeEngine {
     }
 }
 
+fn segment_len(segment: &Segment) -> u64 {
+    match *segment {
+        Segment::Slot { len, .. } | Segment::Origin { len, .. } => len,
+    }
+}
+
+fn slice(bytes: &Bytes, offset: u64, len: u64) -> Option<Bytes> {
+    let range = usize::try_from(offset).ok()?..usize::try_from(offset + len).ok()?;
+    bytes.get(range.clone())?;
+    Some(bytes.slice(range))
+}
+
 /// Starts S3 requests on this thread, and block writes and verifications
 /// on worker threads, each feeding its result back to the node.
 fn start(engine: &SharedNode, work: Work) {
-    for (origin, request) in work.fetches {
-        let handle = engine.clone();
-        let task = tokio::task::spawn_local(async move {
-            let engine = handle;
-            let client = engine.borrow().origin.clone();
-            let (head, body) = client.read(&request).await;
-            let work = {
-                let mut this = engine.borrow_mut();
-                this.tasks.remove(&origin);
-                this.bodies.insert(origin, body);
-                let now = this.now();
-                this.node.on_origin_response(now, origin, head);
-                this.pump()
-            };
-            start(&engine, work);
-        });
+    for (origin, request, streams) in work.fetches {
+        let task = tokio::task::spawn_local(fetch(engine.clone(), origin, request, streams));
         engine
             .borrow_mut()
             .tasks
             .insert(origin, task.abort_handle());
     }
     for (location, bytes) in work.writes {
-        let engine = engine.clone();
-        let disk = engine.borrow().disk.clone();
-        tokio::task::spawn_local(async move {
-            let written = tokio::task::spawn_blocking(move || disk.write(location, &bytes)).await;
-            let work = {
-                let mut this = engine.borrow_mut();
-                match written
-                    .map_err(io::Error::other)
-                    .and_then(|written| written)
-                {
-                    Ok(()) => this.node.on_written(location),
-                    Err(error) => {
-                        eprintln!("writing {location:?}: {error}");
-                        this.node.on_write_failed(location);
-                    }
-                }
-                this.pump()
-            };
-            start(&engine, work);
-        });
+        write(engine, location, bytes);
     }
     for (location, len, checksum) in work.verifies {
         let engine = engine.clone();
@@ -328,6 +403,186 @@ fn start(engine: &SharedNode, work: Work) {
             start(&engine, work);
         });
     }
+}
+
+/// Sends a request to S3 and gives the node its answer. A body that
+/// streams is then passed to the readers the node gave it.
+async fn fetch(engine: SharedNode, origin: OriginRequestId, request: Request, streams: bool) {
+    let client = engine.borrow().origin.clone();
+    let hold = (!streams).then(|| fill_limit(&request));
+    let (head, body) = client.read(&request, hold).await;
+    let (work, passing) = {
+        let mut this = engine.borrow_mut();
+        this.tasks.remove(&origin);
+        let arriving = match body {
+            OriginBody::Held(bytes) => {
+                this.bodies.insert(origin, Body::Held(bytes));
+                None
+            }
+            OriginBody::Arriving(body) => {
+                this.bodies.insert(origin, Body::Arriving(Vec::new()));
+                Some(body)
+            }
+        };
+        let now = this.now();
+        this.node.on_origin_response(now, origin, head);
+        let work = this.pump();
+        let readers = match this.bodies.get_mut(&origin) {
+            Some(body) => match std::mem::replace(body, Body::Passing) {
+                Body::Arriving(readers) => readers,
+                held => {
+                    *body = held;
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        (work, arriving.map(|body| (body, readers)))
+    };
+    start(&engine, work);
+    if let Some((body, readers)) = passing {
+        pass_through(&engine, body, readers).await;
+    }
+}
+
+/// The most a fill's held body may be: the bytes it asked for, or an
+/// error body.
+fn fill_limit(request: &Request) -> u64 {
+    let asked = match request.range {
+        Some(ByteRange::Inclusive { first, last }) => last.saturating_sub(first) + 1,
+        _ => 0,
+    };
+    asked.max(1 << 20)
+}
+
+/// A slot's bytes, gathered as an arriving body passes.
+struct Gathering {
+    location: Location,
+    start: u64,
+    end: u64,
+    bytes: Vec<u8>,
+}
+
+/// Passes an arriving S3 body to its readers in lockstep: each chunk goes
+/// to every reply that reads it before the next chunk is read, so the
+/// slowest gateway paces S3. Each slot is written once its bytes are in.
+/// Readers of bytes that never arrive get a short reply, or a failed write.
+async fn pass_through(engine: &SharedNode, mut body: Incoming, readers: Vec<Reader>) {
+    let mut replies = Vec::new();
+    let mut gathering = Vec::new();
+    for reader in readers {
+        match reader {
+            Reader::Reply {
+                offset,
+                len,
+                chunks,
+            } => replies.push((offset, offset + len, Some(chunks))),
+            Reader::Write {
+                location,
+                offset,
+                len,
+            } => gathering.push(Gathering {
+                location,
+                start: offset,
+                end: offset + len,
+                bytes: Vec::new(),
+            }),
+        }
+    }
+    let end = replies
+        .iter()
+        .map(|(_, end, _)| *end)
+        .chain(gathering.iter().map(|slot| slot.end))
+        .max()
+        .unwrap_or(0);
+    let mut position = 0;
+    while position < end {
+        let chunk = match origin::next_frame(&mut body).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) | Err(_) => break,
+        };
+        let chunk_end = position + chunk.len() as u64;
+        for (start, end, chunks) in &mut replies {
+            let (from, to) = (position.max(*start), chunk_end.min(*end));
+            if from < to
+                && let Some(sender) = chunks
+            {
+                let piece = chunk.slice((from - position) as usize..(to - position) as usize);
+                if sender.send(piece).await.is_err() {
+                    // The gateway hung up.
+                    *chunks = None;
+                }
+            }
+        }
+        let mut complete = Vec::new();
+        gathering.retain_mut(|slot| {
+            let (from, to) = (position.max(slot.start), chunk_end.min(slot.end));
+            if from < to {
+                if slot.bytes.is_empty() {
+                    slot.bytes.reserve_exact((slot.end - slot.start) as usize);
+                }
+                slot.bytes.extend_from_slice(
+                    &chunk[(from - position) as usize..(to - position) as usize],
+                );
+            }
+            let done = slot.bytes.len() as u64 == slot.end - slot.start;
+            if done {
+                complete.push((slot.location, std::mem::take(&mut slot.bytes)));
+            }
+            !done
+        });
+        for (location, bytes) in complete {
+            write(engine, location, bytes.into());
+        }
+        position = chunk_end;
+    }
+    if !gathering.is_empty() {
+        let work = {
+            let mut this = engine.borrow_mut();
+            for slot in gathering {
+                this.node.on_write_failed(slot.location);
+            }
+            this.pump()
+        };
+        start(engine, work);
+    }
+}
+
+/// Writes a block into its slot on a worker thread, once no socket or pipe
+/// still holds the slot's old pages, and tells the node how it went.
+fn write(engine: &SharedNode, location: Location, bytes: Bytes) {
+    let engine = engine.clone();
+    tokio::task::spawn_local(async move {
+        let disk = engine.borrow().disk.clone();
+        let deadline = tokio::time::Instant::now() + PAGES_WAIT;
+        let written = loop {
+            let (disk, bytes) = (disk.clone(), bytes.clone());
+            let written = tokio::task::spawn_blocking(move || disk.write(location, &bytes))
+                .await
+                .map_err(io::Error::other)
+                .and_then(|written| written);
+            match written {
+                Ok(false) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(PAGES_RECHECK).await;
+                }
+                Ok(false) => break Err(io::Error::other("the slot's old pages stayed in use")),
+                Ok(true) => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        };
+        let work = {
+            let mut this = engine.borrow_mut();
+            match written {
+                Ok(()) => this.node.on_written(location),
+                Err(error) => {
+                    eprintln!("writing {location:?}: {error}");
+                    this.node.on_write_failed(location);
+                }
+            }
+            this.pump()
+        };
+        start(&engine, work);
+    });
 }
 
 /// Serves gateways on `listener` until `stop` completes, then waits for work
@@ -378,52 +633,110 @@ async fn connection(stream: TcpStream, engine: &SharedNode, secret: &str) -> io:
         let len = head.content_length().map_err(io::Error::other)?;
         connection.read_body(len).await?;
         if header(&head.headers, protocol::SECRET) != Some(secret) {
-            let response = Response {
-                status: 403,
-                headers: Vec::new(),
-                content_length: 0,
-                body: Bytes::new(),
-            };
-            return connection.write_response(&response, false).await;
+            return refuse(&mut connection, 403).await;
         }
-        let (answer, body) = match protocol::decode_request(&head.path, &head.headers) {
+        let reply = match protocol::decode_request(&head.path, &head.headers) {
             Err(error) => {
-                let response = Response {
-                    status: 400,
-                    headers: Vec::new(),
-                    content_length: 0,
-                    body: Bytes::new(),
-                };
                 eprintln!("a gateway's request: {error}");
-                return connection.write_response(&response, false).await;
+                return refuse(&mut connection, 400).await;
             }
             Ok(NodeRequest::Written(key)) => {
                 NodeEngine::written(engine, &key);
-                (NodeAnswer::Written, Bytes::new())
+                Reply {
+                    answer: NodeAnswer::Written,
+                    body: Vec::new(),
+                    len: 0,
+                    sending: None,
+                }
             }
             Ok(NodeRequest::Read(read)) => {
                 let head_only =
                     matches!(&read, Read::Object { request, .. } if request.method == Method::Head);
-                let Ok(reply) = NodeEngine::read(engine, read).await else {
+                let Ok(mut reply) = NodeEngine::read(engine, read).await else {
                     return Err(io::Error::other("the node dropped a read"));
                 };
-                let body = if head_only { Bytes::new() } else { reply.body };
-                (reply.answer, body)
+                if head_only {
+                    (reply.body, reply.len) = (Vec::new(), 0);
+                }
+                reply
             }
         };
-        let (status, headers) = protocol::encode_answer(&answer);
-        let response = Response {
-            status,
-            headers,
-            content_length: body.len() as u64,
-            body,
-        };
-        connection
-            .write_response(&response, head.keep_alive)
-            .await?;
-        if !head.keep_alive {
+        let (status, headers) = protocol::encode_answer(&reply.answer);
+        let framing = Framing::Length(reply.len);
+        let sent = async {
+            connection
+                .write_response_head(status, &headers, framing, head.keep_alive)
+                .await?;
+            send_body(&mut connection, engine, reply.body).await
+        }
+        .await;
+        if let Some(request) = reply.sending {
+            NodeEngine::sent(engine, request);
+        }
+        // A body that ended short ends the connection, which tells the
+        // gateway.
+        if sent? < reply.len || !head.keep_alive {
             return Ok(());
         }
     }
     Ok(())
+}
+
+async fn refuse(connection: &mut Connection, status: u16) -> io::Result<()> {
+    let response = Response {
+        status,
+        headers: Vec::new(),
+        content_length: 0,
+        body: Bytes::new(),
+    };
+    connection.write_response(&response, false).await
+}
+
+/// Sends a reply's body and returns how many bytes went. Runs of stored
+/// blocks go with `sendfile` on a worker thread; held and arriving bytes
+/// are written from memory.
+async fn send_body(
+    connection: &mut Connection,
+    engine: &SharedNode,
+    parts: Vec<Part>,
+) -> io::Result<u64> {
+    let mut sent = 0;
+    let mut parts = parts.into_iter().peekable();
+    while let Some(part) = parts.next() {
+        match part {
+            Part::File { offset, len } => {
+                let mut run = vec![(offset, len)];
+                while let Some(&Part::File { offset, len }) = parts.peek() {
+                    run.push((offset, len));
+                    parts.next();
+                }
+                let socket = connection.stream().as_fd().try_clone_to_owned()?;
+                let disk = engine.borrow().disk.clone();
+                let total: u64 = run.iter().map(|(_, len)| len).sum();
+                tokio::task::spawn_blocking(move || {
+                    run.into_iter()
+                        .try_for_each(|(offset, len)| disk.send(&socket, offset, len))
+                })
+                .await
+                .map_err(io::Error::other)??;
+                sent += total;
+            }
+            Part::Held(bytes) => {
+                connection.write_all(&bytes).await?;
+                sent += bytes.len() as u64;
+            }
+            Part::Arriving { mut chunks, len } => {
+                let mut arrived = 0;
+                while let Some(chunk) = chunks.recv().await {
+                    connection.write_all(&chunk).await?;
+                    arrived += chunk.len() as u64;
+                }
+                sent += arrived;
+                if arrived < len {
+                    return Ok(sent);
+                }
+            }
+        }
+    }
+    Ok(sent)
 }

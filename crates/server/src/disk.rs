@@ -8,7 +8,14 @@
 //! describes bytes that were not durable. Records carry the run that wrote
 //! or verified them, and a clean shutdown marks the table with the earliest
 //! run whose records are sound, which the next start trusts.
+//!
+//! Blocks leave the slab file with `sendfile`, whose sockets hold references
+//! to the page cache's pages until the bytes are consumed. A write into a
+//! slot waits until none of the slot's old pages are still in use, so a
+//! response in flight keeps the bytes it was sent.
 
+use crate::zero_copy::{self, PageCache};
+use rustix::fs::{Advice, fadvise};
 use s3_accelerator_core::node::{Meta, Recovered, SlotRecord};
 use s3_accelerator_core::placement::PlacementHash;
 use s3_accelerator_core::s3::{ETag, ObjectKey};
@@ -16,6 +23,7 @@ use s3_accelerator_core::store::{Location, StoreConfig, VersionId};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Mutex;
@@ -31,6 +39,8 @@ const NO_RUN: u64 = u64::MAX;
 
 pub struct Disk {
     slabs: File,
+    /// Which of the slab file's pages are cached.
+    pages: PageCache,
     table: File,
     metadata: Mutex<File>,
     config: StoreConfig,
@@ -82,7 +92,21 @@ impl Disk {
             }
         };
         table.set_len(table_len)?;
-        slabs.set_len(config.extent_size * u64::from(config.extents))?;
+        let slabs_len = config.extent_size * u64::from(config.extents);
+        slabs.set_len(slabs_len)?;
+        refuse_memory_filesystems(&slabs)?;
+        let page = rustix::param::page_size() as u64;
+        if !config.min_slot.is_multiple_of(page) {
+            return Err(io::Error::other(format!(
+                "the smallest slot ({} bytes) must be a multiple of the page size ({page} bytes)",
+                config.min_slot
+            )));
+        }
+        // Reads fetch just the pages asked for, one page per folio, so
+        // no cached folio spans two slots and each slot's pages can be
+        // dropped on their own.
+        fadvise(&slabs, 0, None, Advice::Random)?;
+        let pages = PageCache::new(&slabs, slabs_len)?;
         let run = last_run + 1;
         write_header(
             &table,
@@ -105,6 +129,7 @@ impl Disk {
         let metadata_entries = read_metadata(&mut metadata)?;
         let disk = Disk {
             slabs,
+            pages,
             table,
             metadata: Mutex::new(metadata),
             config,
@@ -121,8 +146,15 @@ impl Disk {
     }
 
     /// Writes a block's bytes into its slot and syncs them, after any
-    /// cleared records.
-    pub fn write(&self, location: Location, bytes: &[u8]) -> io::Result<()> {
+    /// cleared records. Returns false, writing nothing, while a socket or
+    /// pipe still holds any of the old pages the bytes would overwrite.
+    pub fn write(&self, location: Location, bytes: &[u8]) -> io::Result<bool> {
+        let offset = self.offset(location);
+        let len = bytes.len() as u64;
+        let slot = offset..offset + self.config.slot_size(len);
+        if self.pages.in_use(&self.slabs, slot, offset..offset + len)? {
+            return Ok(false);
+        }
         {
             let mut clears = self.clears.lock().expect("clears lock");
             if *clears {
@@ -130,14 +162,20 @@ impl Disk {
                 *clears = false;
             }
         }
-        self.slabs.write_all_at(bytes, self.offset(location))?;
+        self.slabs.write_all_at(bytes, offset)?;
         self.slabs.sync_data()?;
         let checksum = xxh3_64(bytes);
         self.checksums
             .lock()
             .expect("checksums lock")
             .insert(location, checksum);
-        Ok(())
+        Ok(true)
+    }
+
+    /// Sends `len` bytes of the slab file from `offset` to `socket` with
+    /// `sendfile`. Runs on a worker thread.
+    pub fn send(&self, socket: &OwnedFd, offset: u64, len: u64) -> io::Result<()> {
+        zero_copy::send_file(socket, &self.slabs, offset, len)
     }
 
     /// Records the block in `location`'s slot, with the checksum of the
@@ -221,14 +259,23 @@ impl Disk {
         u64::from(location.extent) * self.config.extent_size + location.offset
     }
 
-    /// The slab file itself, for `sendfile`.
-    pub fn slabs(&self) -> &File {
-        &self.slabs
-    }
-
     fn record_offset(&self, location: Location) -> u64 {
         HEADER_SIZE + self.offset(location) / self.config.min_slot * RECORD_SIZE
     }
+}
+
+/// Refuses a slab file in memory: the page cache is its only copy, so its
+/// pages never leave, and every write would wait for them.
+fn refuse_memory_filesystems(slabs: &File) -> io::Result<()> {
+    const TMPFS_MAGIC: i64 = 0x0102_1994;
+    const RAMFS_MAGIC: i64 = 0x8584_58f6;
+    let kind = rustix::fs::fstatfs(slabs)?.f_type as i64;
+    if kind == TMPFS_MAGIC || kind == RAMFS_MAGIC {
+        return Err(io::Error::other(
+            "the data directory is in memory (tmpfs or ramfs); put it on a disk",
+        ));
+    }
+    Ok(())
 }
 
 /// The location of the slot whose record is at `index`.
@@ -459,16 +506,20 @@ mod tests {
 
     fn config() -> StoreConfig {
         StoreConfig {
-            extent_size: 4096,
+            extent_size: 16384,
             extents: 4,
-            min_slot: 256,
-            max_slot: 1024,
+            min_slot: 4096,
+            max_slot: 8192,
         }
     }
 
+    /// A directory beside the test binary, on a disk-backed filesystem.
     fn dir(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("s3-accelerator-disk-{name}-{}", std::process::id()));
+        let binary = std::env::current_exe().unwrap();
+        let dir = binary
+            .parent()
+            .unwrap()
+            .join(format!("s3-accelerator-disk-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -527,9 +578,9 @@ mod tests {
         {
             let (disk, recovery) = Disk::open(&dir, config()).unwrap();
             assert!(recovery.records.is_empty());
-            disk.write(at(1, 512), &[1; 1000]).unwrap();
-            disk.record(at(1, 512), record()).unwrap();
-            disk.write(at(2, 0), &[2; 1000]).unwrap();
+            assert!(disk.write(at(1, 4096), &[1; 1000]).unwrap());
+            disk.record(at(1, 4096), record()).unwrap();
+            assert!(disk.write(at(2, 0), &[2; 1000]).unwrap());
             disk.record(at(2, 0), record()).unwrap();
             disk.clear(at(2, 0)).unwrap();
             disk.append(&key(), None).unwrap();
@@ -538,12 +589,12 @@ mod tests {
         let [recovered] = recovery.records.as_slice() else {
             panic!("{} records", recovery.records.len());
         };
-        assert_eq!(recovered.location, at(1, 512));
+        assert_eq!(recovered.location, at(1, 4096));
         assert_eq!(recovered.checksum, xxh3_64(&[1; 1000]));
         assert!(!recovered.trusted);
         assert_eq!(recovery.metadata, vec![(key(), None)]);
-        assert!(disk.verify(at(1, 512), 1000, recovered.checksum).unwrap());
-        disk.record(at(1, 512), record()).unwrap();
+        assert!(disk.verify(at(1, 4096), 1000, recovered.checksum).unwrap());
+        disk.record(at(1, 4096), record()).unwrap();
         disk.shut_down().unwrap();
         drop(disk);
         for _ in 0..2 {
@@ -552,7 +603,7 @@ mod tests {
             disk.shut_down().unwrap();
         }
         let other = StoreConfig {
-            min_slot: 512,
+            max_slot: 4096,
             ..config()
         };
         let (_, recovery) = Disk::open(&dir, other).unwrap();

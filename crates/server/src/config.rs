@@ -16,9 +16,6 @@ pub struct Config {
     pub origin: OriginConfig,
     #[serde(default)]
     pub clients: Vec<Client>,
-    /// The largest body the server holds in memory, uploaded or fetched.
-    #[serde(default = "default_max_body")]
-    pub max_body: u64,
     #[serde(default)]
     pub cache: CacheConfig,
     pub cluster: ClusterConfig,
@@ -118,10 +115,6 @@ impl Config {
             .map(|node| (NodeId(node.id), node.address.clone()))
             .collect()
     }
-}
-
-fn default_max_body() -> u64 {
-    1 << 30
 }
 
 #[derive(Debug, Deserialize)]

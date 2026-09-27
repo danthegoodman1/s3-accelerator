@@ -4,13 +4,17 @@
 
 use crate::config::{Client, Config};
 use crate::disk::Disk;
-use crate::gateway_engine::{Answer, GatewayEngine, SharedGateway};
-use crate::http::{Connection, RequestHead, Response};
-use crate::http::{etag_condition, header, parse_range};
+use crate::gateway_engine::{Event, GatewayEngine, SharedGateway};
+use crate::http::{Connection, Framing, RequestHead, Response};
+use crate::http::{etag_condition, format_content_range, header, parse_range};
 use crate::node_engine::{self, NodeEngine};
-use crate::origin::Origin;
+use crate::origin::{self, Origin, RequestBody};
 use crate::sigv4::{self, AuthError, Credentials, Signable};
+use crate::zero_copy::{self, Short};
 use bytes::Bytes;
+use http_body_util::channel::{Channel, Sender as BodySender};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
 use percent_encoding::percent_decode_str;
 use s3_accelerator_core::node::Node;
 use s3_accelerator_core::placement::NodeId;
@@ -29,9 +33,13 @@ struct Context {
     gateway: SharedGateway,
     origin: Rc<Origin>,
     clients: Vec<Client>,
-    /// The largest body held in memory, uploaded or fetched.
-    max_body: u64,
 }
+
+/// The largest `DeleteObjects` body the gateway reads: S3 takes at most
+/// 1,000 keys of at most 1,024 bytes each.
+const MAX_DELETE_BODY: u64 = 8 << 20;
+/// The SHA-256 of an empty body.
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 pub async fn serve(config: Config) -> io::Result<()> {
     let mut listeners = Listeners::default();
@@ -79,7 +87,6 @@ pub async fn run(
         &config.origin.endpoint,
         &config.origin.region,
         credentials,
-        config.max_body,
     ));
     let secret: Rc<str> = config.cluster.secret.as_str().into();
     let (stopping, stopped) = watch::channel(false);
@@ -120,7 +127,6 @@ pub async fn run(
             gateway,
             origin,
             clients: config.clients,
-            max_body: config.max_body,
         });
         serve_clients(listener, context, stopped_signal(stopped)).await?;
     }
@@ -177,33 +183,19 @@ async fn connection(stream: TcpStream, context: &Context) -> io::Result<()> {
                 return connection.write_response(&response, false).await;
             }
         };
-        // The signature covers the head, so a request is authenticated before
-        // its body is read. A rejected request's body is never read, so the
-        // connection closes.
-        let client = match authenticate(&head, context) {
-            Ok(client) => client,
-            Err(response) => return connection.write_response(&response, false).await,
-        };
-        if len > context.max_body {
-            let response = error(
-                400,
-                "EntityTooLarge",
-                "the body is larger than this server holds",
-            );
-            return connection.write_response(&response, false).await;
+        // The signature covers the head, so a request is authenticated and
+        // authorized before its body is read. A request answered before its
+        // body is read closes the connection.
+        let refusal = authenticate(&head, context).and_then(|client| authorize(&head, client));
+        if let Err(response) = refusal {
+            let keep_alive = head.keep_alive && len == 0;
+            connection.write_response(&response, keep_alive).await?;
+            if keep_alive {
+                continue;
+            }
+            return Ok(());
         }
-        let expects_continue = header(&head.headers, "expect")
-            .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"));
-        if len > 0 && expects_continue {
-            connection.write_continue().await?;
-        }
-        let body = connection.read_body(len).await?;
-        let response = handle(&head, client, Bytes::from(body), context).await;
-        let ended_early =
-            head.method != "HEAD" && (response.body.len() as u64) < response.content_length;
-        let keep_alive = head.keep_alive && !ended_early;
-        connection.write_response(&response, keep_alive).await?;
-        if !keep_alive {
+        if !handle(&mut connection, &head, len, context).await? || !head.keep_alive {
             return Ok(());
         }
     }
@@ -238,39 +230,56 @@ fn authenticate<'c>(head: &RequestHead, context: &'c Context) -> Result<&'c Clie
     sigv4::verify(&signable, sigv4::unix_now(), lookup).map_err(auth_error)
 }
 
-async fn handle(head: &RequestHead, client: &Client, body: Bytes, context: &Context) -> Response {
-    let payload_hash = header(&head.headers, "x-amz-content-sha256").expect("authenticated");
-    let is_digest = payload_hash.len() == 64 && payload_hash.bytes().all(|b| b.is_ascii_hexdigit());
-    if is_digest && hex::encode(Sha256::digest(&body)) != payload_hash.to_ascii_lowercase() {
-        return error(
-            400,
-            "XAmzContentSHA256Mismatch",
-            "the body does not match its hash",
-        );
-    }
+/// Whether the client's grants cover the object, and a copy's source.
+fn authorize(head: &RequestHead, client: &Client) -> Result<(), Response> {
     let (bucket, key) = split_path(&head.path);
-    // reqwest's URL parser collapses `.` and `..` segments, so the request
-    // S3 received would name a different key than the one signed.
-    if key
-        .split('/')
-        .any(|segment| segment == "." || segment == "..")
-    {
-        return error(501, "NotImplemented", "keys with . or .. path segments");
-    }
     if !client.may_access(&bucket, &key) {
-        return error(403, "AccessDenied", "Access Denied");
+        return Err(error(403, "AccessDenied", "Access Denied"));
     }
     // A copy reads its source, so the grants must cover the source too.
     if let Some(source) = header(&head.headers, "x-amz-copy-source") {
         let (source_bucket, source_key) = copy_source(source);
         if !client.may_access(&source_bucket, &source_key) {
-            return error(403, "AccessDenied", "Access Denied");
+            return Err(error(403, "AccessDenied", "Access Denied"));
         }
     }
-    if let Some(request) = cacheable(head, &bucket, &key) {
-        return read(request, context).await;
+    Ok(())
+}
+
+/// Answers an authorized request with a `len`-byte body, and returns
+/// whether the connection can take another request.
+async fn handle(
+    connection: &mut Connection,
+    head: &RequestHead,
+    len: u64,
+    context: &Context,
+) -> io::Result<bool> {
+    let payload_hash = header(&head.headers, "x-amz-content-sha256").expect("authenticated");
+    let is_digest = payload_hash.len() == 64 && payload_hash.bytes().all(|b| b.is_ascii_hexdigit());
+    let digest = is_digest.then(|| payload_hash.to_ascii_lowercase());
+    let (bucket, key) = split_path(&head.path);
+    if len == 0
+        && let Some(request) = cacheable(head, &bucket, &key)
+    {
+        if digest
+            .as_deref()
+            .is_some_and(|digest| digest != EMPTY_SHA256)
+        {
+            let response = hash_mismatch();
+            connection.write_response(&response, true).await?;
+            return Ok(true);
+        }
+        return read(connection, request, context).await;
     }
-    forward(head, payload_hash, body, &bucket, &key, context).await
+    let request = Forward {
+        head,
+        payload_hash,
+        digest,
+        len,
+        bucket: &bucket,
+        key: &key,
+    };
+    forward(connection, request, context).await
 }
 
 /// The core's request, if the core serves this one.
@@ -310,113 +319,372 @@ fn cacheable(head: &RequestHead, bucket: &str, key: &str) -> Option<Request> {
     })
 }
 
-async fn read(request: Request, context: &Context) -> Response {
+/// Serves a read through the gateway: its answer, or a head and then the
+/// nodes' bodies, each moved from the node's connection to the client's
+/// with `splice`.
+async fn read(
+    connection: &mut Connection,
+    request: Request,
+    context: &Context,
+) -> io::Result<bool> {
     let method = request.method;
-    let Ok(Answer { head, body }) = GatewayEngine::read(&context.gateway, request).await else {
-        return error(500, "InternalError", "the request was dropped");
-    };
+    let mut events = GatewayEngine::read(&context.gateway, request);
+    // Body bytes the started response still owes.
+    let mut remaining = None;
+    while let Some(event) = events.recv().await {
+        match event {
+            Event::Respond(head) => {
+                connection
+                    .write_response(&answer(&head, method), true)
+                    .await?;
+                return Ok(true);
+            }
+            Event::Start(head) => {
+                let framing = Framing::Length(head.content_length);
+                connection
+                    .write_response_head(head.status, &client_headers(&head), framing, true)
+                    .await?;
+                remaining = Some(head.content_length);
+            }
+            Event::Forward { from, body, len } => {
+                let want = len.min(body.unread());
+                let (copied, relayed) =
+                    zero_copy::relay(body.stream(), connection.stream(), want).await;
+                if let Err(Short::Destination(error)) = relayed {
+                    // The client is gone, and needs none of the rest.
+                    GatewayEngine::forwarded(&context.gateway, from, len, None);
+                    return Err(error);
+                }
+                let read_in_full = relayed.is_ok() && copied == body.unread();
+                GatewayEngine::forwarded(
+                    &context.gateway,
+                    from,
+                    copied,
+                    read_in_full.then_some(body),
+                );
+                let owed = remaining.unwrap_or(0).saturating_sub(copied);
+                remaining = Some(owed);
+                if owed == 0 {
+                    return Ok(true);
+                }
+            }
+            // The body ends short, and the connection with it.
+            Event::Abort => return Ok(false),
+        }
+    }
+    // The gateway dropped the read.
+    if remaining.is_none() {
+        let response = error(500, "InternalError", "the request was dropped");
+        connection.write_response(&response, false).await?;
+    }
+    Ok(false)
+}
+
+/// The headers of a client's response.
+fn client_headers(head: &ResponseHead) -> Vec<(String, String)> {
     let mut headers = vec![("Accept-Ranges".to_string(), "bytes".to_string())];
     headers.extend(head.headers.iter().cloned());
     if let Some(etag) = &head.etag {
         headers.push(("ETag".to_string(), etag.0.clone()));
     }
     if let Some(range) = head.content_range {
-        let value = format!("bytes {}-{}/{}", range.first, range.last, range.size);
-        headers.push(("Content-Range".to_string(), value));
-    }
-    if method == Method::Head {
-        return Response {
-            status: head.status,
-            headers,
-            content_length: head.content_length,
-            body: Bytes::new(),
-        };
-    }
-    if body.is_empty() && head.status >= 400 {
-        return error(head.status, error_code(&head), reason_message(head.status));
+        headers.push(("Content-Range".to_string(), format_content_range(range)));
     }
     if head.status >= 400 {
         headers.push(("Content-Type".to_string(), "application/xml".to_string()));
     }
-    // A body shorter than the head promises ended early; the connection
-    // closes after it.
+    headers
+}
+
+/// A response with no body from the nodes: a HEAD's, or an answer the core
+/// gave itself, with an S3 error body for a failure.
+fn answer(head: &ResponseHead, method: Method) -> Response {
+    if method == Method::Get && head.status >= 400 {
+        return error(head.status, error_code(head), reason_message(head.status));
+    }
+    let content_length = match method {
+        Method::Head => head.content_length,
+        Method::Get => 0,
+    };
     Response {
         status: head.status,
-        headers,
-        content_length: head.content_length.max(body.len() as u64),
-        body,
+        headers: client_headers(head),
+        content_length,
+        body: Bytes::new(),
     }
 }
 
+/// A request the gateway passes to S3.
+struct Forward<'a> {
+    head: &'a RequestHead,
+    payload_hash: &'a str,
+    /// The body's SHA-256, when the client signed it.
+    digest: Option<String>,
+    len: u64,
+    bucket: &'a str,
+    key: &'a str,
+}
+
+/// Passes a request to S3 and its response back. The body streams to S3
+/// as it arrives, except a `DeleteObjects` list, which the gateway reads
+/// to learn the keys it deletes.
 async fn forward(
-    head: &RequestHead,
-    payload_hash: &str,
-    body: Bytes,
-    bucket: &str,
-    key: &str,
+    connection: &mut Connection,
+    request: Forward<'_>,
     context: &Context,
-) -> Response {
-    let forwarded = context
-        .origin
-        .forward(
-            &head.method,
-            &head.path,
-            &head.query,
-            &head.headers,
-            payload_hash,
-            body.clone(),
-        )
-        .await;
-    let forwarded = match forwarded {
-        Ok(forwarded) => forwarded,
-        Err(failure) => return error(502, "BadGateway", &failure),
+) -> io::Result<bool> {
+    let head = request.head;
+    let deletes_objects = head.method == "POST"
+        && !request.bucket.is_empty()
+        && request.key.is_empty()
+        && head
+            .query
+            .split('&')
+            .any(|pair| pair == "delete" || pair.starts_with("delete="));
+    if deletes_objects && request.len > MAX_DELETE_BODY {
+        let response = error(
+            400,
+            "EntityTooLarge",
+            "the key list is larger than S3 takes",
+        );
+        connection.write_response(&response, false).await?;
+        return Ok(false);
+    }
+    let expects_continue = header(&head.headers, "expect")
+        .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"));
+    if request.len > 0 && expects_continue {
+        connection.write_continue().await?;
+    }
+    let (sent, listed) = match deletes_objects {
+        true => {
+            let body = Bytes::from(connection.read_body(request.len).await?);
+            if request
+                .digest
+                .as_ref()
+                .is_some_and(|digest| hex::encode(Sha256::digest(&body)) != *digest)
+            {
+                connection.write_response(&hash_mismatch(), true).await?;
+                return Ok(true);
+            }
+            let keys = listed_keys(&String::from_utf8_lossy(&body));
+            let body = Full::new(body).map_err(|never| match never {}).boxed();
+            let sent = send_to_s3(&request, body, context).await;
+            (
+                Sent {
+                    response: sent,
+                    body_read: true,
+                    matched: true,
+                },
+                Some(keys),
+            )
+        }
+        false => (upload(connection, &request, context).await, None),
     };
-    if forwarded.status < 300 && !bucket.is_empty() {
-        for key in written_keys(head, key, &body) {
+    if !sent.matched {
+        connection
+            .write_response(&hash_mismatch(), sent.body_read)
+            .await?;
+        return Ok(sent.body_read);
+    }
+    let response = match sent.response {
+        Ok(response) => response,
+        Err(failure) => {
+            let response = error(502, "BadGateway", &failure.to_string());
+            connection.write_response(&response, false).await?;
+            return Ok(false);
+        }
+    };
+    if response.status().as_u16() < 300 && !request.bucket.is_empty() {
+        let keys = listed.unwrap_or_else(|| written_keys(head, request.key));
+        for key in keys {
             let key = ObjectKey {
-                bucket: bucket.to_string(),
+                bucket: request.bucket.to_string(),
                 key,
             };
             GatewayEngine::written(&context.gateway, &key);
         }
     }
-    let content_length = match head.method.as_str() {
-        "HEAD" => header(&forwarded.headers, "content-length")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0),
-        _ => forwarded.body.len() as u64,
+    let passed = pass_response(connection, head, response).await?;
+    Ok(passed && sent.body_read)
+}
+
+/// How a forwarded request went.
+struct Sent {
+    response: io::Result<hyper::Response<Incoming>>,
+    /// Whether the client's body was read to its end.
+    body_read: bool,
+    /// Whether the body matched its signed hash.
+    matched: bool,
+}
+
+async fn send_to_s3(
+    request: &Forward<'_>,
+    body: RequestBody,
+    context: &Context,
+) -> io::Result<hyper::Response<Incoming>> {
+    let head = request.head;
+    let sent = context.origin.forward(
+        &head.method,
+        &head.path,
+        &head.query,
+        &head.headers,
+        request.payload_hash,
+        body,
+        request.len,
+    );
+    tokio::time::timeout(origin::READ_TIMEOUT, sent)
+        .await
+        .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
+}
+
+/// Streams the client's body to S3 while S3's answer is awaited. S3 may
+/// answer before the body ends, such as to refuse it.
+async fn upload(connection: &mut Connection, request: &Forward<'_>, context: &Context) -> Sent {
+    let (sender, body) = Channel::<Bytes, io::Error>::new(2);
+    let head = request.head;
+    let sent = context.origin.forward(
+        &head.method,
+        &head.path,
+        &head.query,
+        &head.headers,
+        request.payload_hash,
+        body.boxed(),
+        request.len,
+    );
+    let mut sent = std::pin::pin!(sent);
+    let mut passing = std::pin::pin!(pass_body(connection, request, sender));
+    let mut passed = None;
+    let response = loop {
+        tokio::select! {
+            result = &mut passing, if passed.is_none() => passed = Some(result),
+            response = &mut sent => break response,
+        }
+        if passed.is_some() {
+            // The body is sent; S3 has a while to answer.
+            break tokio::time::timeout(origin::READ_TIMEOUT, &mut sent)
+                .await
+                .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()));
+        }
     };
+    Sent {
+        response,
+        body_read: matches!(passed, Some(Ok(_))),
+        matched: !matches!(passed, Some(Ok(false))),
+    }
+}
+
+/// Passes the client's body to S3 as it arrives, and returns whether it
+/// matched its signed hash. The last bytes wait until the whole body is
+/// checked, so S3 never receives a body that fails its hash.
+async fn pass_body(
+    connection: &mut Connection,
+    request: &Forward<'_>,
+    mut sender: BodySender<Bytes, io::Error>,
+) -> io::Result<bool> {
+    let mut hasher = Sha256::new();
+    let mut remaining = request.len;
+    let mut held: Option<Bytes> = None;
+    while remaining > 0 {
+        let max = usize::try_from(remaining).unwrap_or(usize::MAX);
+        let chunk = match connection.read_some(max).await {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                sender.abort(io::Error::other("the client's body ended early"));
+                return Err(error);
+            }
+        };
+        remaining -= chunk.len() as u64;
+        if request.digest.is_some() {
+            hasher.update(&chunk);
+        }
+        if let Some(previous) = held.replace(chunk)
+            && sender.send_data(previous).await.is_err()
+        {
+            return Err(io::Error::other("S3 stopped taking the body"));
+        }
+    }
+    if let Some(digest) = &request.digest
+        && hex::encode(hasher.finalize()) != *digest
+    {
+        sender.abort(io::Error::other("the body does not match its hash"));
+        return Ok(false);
+    }
+    if let Some(last) = held
+        && sender.send_data(last).await.is_err()
+    {
+        return Err(io::Error::other("S3 stopped taking the body"));
+    }
+    Ok(true)
+}
+
+/// Sends S3's response on to the client as it arrives, and returns whether
+/// it arrived in full.
+async fn pass_response(
+    connection: &mut Connection,
+    head: &RequestHead,
+    response: hyper::Response<Incoming>,
+) -> io::Result<bool> {
+    let status = response.status().as_u16();
+    let headers = origin::header_pairs(response.headers());
+    let length = header(&headers, "content-length").and_then(|value| value.parse::<u64>().ok());
     let hop = [
         "connection",
         "content-length",
         "keep-alive",
         "transfer-encoding",
     ];
-    let headers = forwarded
-        .headers
+    let headers: Vec<(String, String)> = headers
         .into_iter()
         .filter(|(name, _)| !hop.contains(&name.as_str()))
         .collect();
-    Response {
-        status: forwarded.status,
-        headers,
-        content_length,
-        body: forwarded.body,
+    let bodiless = head.method == "HEAD" || status == 204 || status == 304;
+    let framing = match (bodiless, length) {
+        (true, length) => Framing::Length(length.unwrap_or(0)),
+        (false, Some(length)) => Framing::Length(length),
+        (false, None) => Framing::Chunked,
+    };
+    connection
+        .write_response_head(status, &headers, framing, head.keep_alive)
+        .await?;
+    if bodiless {
+        return Ok(true);
+    }
+    let mut body = response.into_body();
+    let mut sent = 0;
+    loop {
+        match origin::next_frame(&mut body).await {
+            Ok(Some(chunk)) => {
+                match framing {
+                    Framing::Length(_) => connection.write_all(&chunk).await?,
+                    Framing::Chunked => connection.write_chunk(&chunk).await?,
+                }
+                sent += chunk.len() as u64;
+            }
+            Ok(None) => break,
+            // The client's body ends short, and the connection with it.
+            Err(_) => return Ok(false),
+        }
+    }
+    match framing {
+        Framing::Chunked => {
+            connection.finish_chunks().await?;
+            Ok(true)
+        }
+        Framing::Length(length) => Ok(sent == length),
     }
 }
 
-/// The keys a successful request wrote: the path's key for a `PUT`,
-/// `POST` or `DELETE` of an object, or every key a `DeleteObjects` lists.
-fn written_keys(head: &RequestHead, key: &str, body: &[u8]) -> Vec<String> {
-    let deletes_objects = head.method == "POST"
-        && key.is_empty()
-        && head
-            .query
-            .split('&')
-            .any(|pair| pair == "delete" || pair.starts_with("delete="));
-    if deletes_objects {
-        return listed_keys(&String::from_utf8_lossy(body));
-    }
+fn hash_mismatch() -> Response {
+    error(
+        400,
+        "XAmzContentSHA256Mismatch",
+        "the body does not match its hash",
+    )
+}
+
+/// The key a successful request wrote: the path's key for a `PUT`, `POST`
+/// or `DELETE` of an object.
+fn written_keys(head: &RequestHead, key: &str) -> Vec<String> {
     match (head.method.as_str(), key.is_empty()) {
         ("PUT" | "POST" | "DELETE", false) => vec![key.to_string()],
         _ => Vec::new(),

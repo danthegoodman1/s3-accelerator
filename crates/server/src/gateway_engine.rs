@@ -1,10 +1,10 @@
 //! A gateway: runs the core's gateway on this thread, sends its reads to the
-//! storage nodes over the cluster protocol, and assembles the answers for
-//! S3 clients.
+//! storage nodes over the cluster protocol, and tells each client's
+//! connection how to answer. A node's body stays in its connection until
+//! the client's connection relays it with `splice`, or the gateway drops it.
 
 use crate::http::Connection;
 use crate::protocol::{self, NodeAnswer, NodeRequest};
-use bytes::Bytes;
 use s3_accelerator_core::Time;
 use s3_accelerator_core::gateway::{self, ClientRequestId, Gateway, NodeRequestId};
 use s3_accelerator_core::node::Read;
@@ -16,11 +16,42 @@ use std::io;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 
-pub struct Answer {
-    pub head: ResponseHead,
-    pub body: Bytes,
+/// What a client's connection does next for its read.
+pub enum Event {
+    /// Answer with `head` and no body.
+    Respond(ResponseHead),
+    /// Start the response with `head`; forwards supply its body.
+    Start(ResponseHead),
+    /// Copy the first `len` bytes of the node's body into the response,
+    /// then call `GatewayEngine::forwarded`.
+    Forward {
+        from: NodeRequestId,
+        body: NodeBody,
+        len: u64,
+    },
+    /// End the started response early.
+    Abort,
+}
+
+/// A node's answer whose body is still in its connection.
+pub struct NodeBody {
+    node: NodeId,
+    connection: Connection,
+    /// Body bytes still unread.
+    len: u64,
+}
+
+impl NodeBody {
+    pub fn stream(&self) -> &TcpStream {
+        self.connection.stream()
+    }
+
+    /// Body bytes still unread.
+    pub fn unread(&self) -> u64 {
+        self.len
+    }
 }
 
 pub type SharedGateway = Rc<RefCell<GatewayEngine>>;
@@ -33,11 +64,9 @@ pub struct GatewayEngine {
     addresses: BTreeMap<NodeId, String>,
     secret: Rc<str>,
     next_id: u64,
-    clients: BTreeMap<ClientRequestId, oneshot::Sender<Answer>>,
-    /// Bodies of nodes' answers, until forwarded or discarded.
-    relayed: BTreeMap<NodeRequestId, Bytes>,
-    /// Client responses the gateway started, and their bodies so far.
-    responses: BTreeMap<ClientRequestId, (ResponseHead, Vec<Bytes>)>,
+    clients: BTreeMap<ClientRequestId, mpsc::UnboundedSender<Event>>,
+    /// Nodes' answered bodies, until forwarded or discarded.
+    relayed: BTreeMap<NodeRequestId, NodeBody>,
     /// Reads to send to nodes.
     sends: Vec<(NodeId, NodeRequestId, Read)>,
     /// Idle connections to each node.
@@ -60,16 +89,15 @@ impl GatewayEngine {
             next_id: 0,
             clients: BTreeMap::new(),
             relayed: BTreeMap::new(),
-            responses: BTreeMap::new(),
             sends: Vec::new(),
             idle: BTreeMap::new(),
         }))
     }
 
-    /// Serves a `GetObject` or `HeadObject`; the answer arrives on the
+    /// Serves a `GetObject` or `HeadObject`; what to answer arrives on the
     /// receiver.
-    pub fn read(engine: &SharedGateway, request: Request) -> oneshot::Receiver<Answer> {
-        let (sender, receiver) = oneshot::channel();
+    pub fn read(engine: &SharedGateway, request: Request) -> mpsc::UnboundedReceiver<Event> {
+        let (sender, receiver) = mpsc::unbounded_channel();
         let sends = {
             let mut this = engine.borrow_mut();
             this.next_id += 1;
@@ -81,6 +109,27 @@ impl GatewayEngine {
         };
         send(engine, sends);
         receiver
+    }
+
+    /// The client's connection copied `copied` bytes of the node's body.
+    /// A body read to its end leaves its connection for the next read.
+    pub fn forwarded(
+        engine: &SharedGateway,
+        from: NodeRequestId,
+        copied: u64,
+        read_in_full: Option<NodeBody>,
+    ) {
+        let sends = {
+            let mut this = engine.borrow_mut();
+            if let Some(mut body) = read_in_full {
+                body.len = 0;
+                this.idle(body);
+            }
+            let now = this.now();
+            this.gateway.on_forwarded(now, from, copied);
+            this.pump()
+        };
+        send(engine, sends);
     }
 
     /// A write to `key` through this gateway succeeded: the gateway forgets
@@ -96,8 +145,9 @@ impl GatewayEngine {
             let engine = engine.clone();
             let request = NodeRequest::Written(key.clone());
             tokio::task::spawn_local(async move {
-                if let Err(error) = exchange(&engine, home, &request).await {
-                    eprintln!("telling node {} of a write: {error}", home.0);
+                match exchange(&engine, home, &request).await {
+                    Ok((_, body)) => engine.borrow_mut().idle(body),
+                    Err(error) => eprintln!("telling node {} of a write: {error}", home.0),
                 }
             });
         }
@@ -107,6 +157,7 @@ impl GatewayEngine {
     pub fn tick(engine: &SharedGateway) {
         let sends = {
             let mut this = engine.borrow_mut();
+            this.clients.retain(|_, client| !client.is_closed());
             let now = this.now();
             this.gateway.on_tick(now);
             this.pump()
@@ -132,47 +183,53 @@ impl GatewayEngine {
         match action {
             gateway::Action::Send { node, id, read } => self.sends.push((node, id, read)),
             gateway::Action::Start { request, head } => {
-                self.responses.insert(request, (head, Vec::new()));
+                self.tell(request, Event::Start(head));
             }
             gateway::Action::Forward { request, from, len } => {
                 let now = self.now();
-                // Every node's body is here before the gateway forwards it;
-                // a missing one is a bug, and the client gets an error, not
-                // a body from elsewhere.
-                let Some(bytes) = self.relayed.remove(&from) else {
-                    self.responses.remove(&request);
-                    self.answer(request, ResponseHead::status(500), Bytes::new());
-                    return self.gateway.on_forwarded(now, from, len);
+                // Every answered body is here until forwarded; a missing
+                // one counts as ending at once, so the rest comes from
+                // elsewhere.
+                let Some(body) = self.relayed.remove(&from) else {
+                    return self.gateway.on_forwarded(now, from, 0);
                 };
-                let bytes = bytes.slice(..bytes.len().min(len as usize));
-                let copied = bytes.len() as u64;
-                if let Some((head, parts)) = self.responses.get_mut(&request) {
-                    parts.push(bytes);
-                    let sent: usize = parts.iter().map(Bytes::len).sum();
-                    if sent as u64 == head.content_length {
-                        let (head, parts) = self.responses.remove(&request).expect("started");
-                        self.answer(request, head, concat(parts));
-                    }
+                // A client that hung up needs no more of its body.
+                if !self.tell(request, Event::Forward { from, body, len }) {
+                    self.gateway.on_forwarded(now, from, len);
                 }
-                self.gateway.on_forwarded(now, from, copied);
             }
-            // The client gets the body so far, and the connection closes.
             gateway::Action::Abort { request } => {
-                if let Some((head, parts)) = self.responses.remove(&request) {
-                    self.answer(request, head, concat(parts));
-                }
+                self.tell(request, Event::Abort);
+                self.clients.remove(&request);
             }
-            gateway::Action::Respond { request, head } => self.answer(request, head, Bytes::new()),
+            gateway::Action::Respond { request, head } => {
+                self.tell(request, Event::Respond(head));
+                self.clients.remove(&request);
+            }
             gateway::Action::Discard { id } => {
-                self.relayed.remove(&id);
+                if let Some(body) = self.relayed.remove(&id) {
+                    self.idle(body);
+                }
             }
         }
     }
 
-    fn answer(&mut self, request: ClientRequestId, head: ResponseHead, body: Bytes) {
-        if let Some(client) = self.clients.remove(&request) {
-            // The client may have disconnected.
-            let _ = client.send(Answer { head, body });
+    /// Passes `event` to the client's connection, and whether it was still
+    /// open.
+    fn tell(&mut self, request: ClientRequestId, event: Event) -> bool {
+        self.clients
+            .get(&request)
+            .is_some_and(|client| client.send(event).is_ok())
+    }
+
+    /// Keeps a connection for the next read if its last answer was read in
+    /// full, and otherwise closes it.
+    fn idle(&mut self, body: NodeBody) {
+        if body.len == 0 {
+            self.idle
+                .entry(body.node)
+                .or_default()
+                .push(body.connection);
         }
     }
 
@@ -198,15 +255,18 @@ fn send(engine: &SharedGateway, sends: Vec<(NodeId, NodeRequestId, Read)>) {
                         this.relayed.insert(id, body);
                         this.gateway.on_node_response(now, id, head, meta);
                     }
-                    Ok((NodeAnswer::Metadata(meta), _)) => {
-                        this.gateway.on_node_metadata(now, id, meta)
+                    Ok((NodeAnswer::Metadata(meta), body)) => {
+                        this.idle(body);
+                        this.gateway.on_node_metadata(now, id, meta);
                     }
-                    Ok((NodeAnswer::Stale, _)) => this.gateway.on_node_stale(now, id),
+                    Ok((NodeAnswer::Stale, body)) => {
+                        this.idle(body);
+                        this.gateway.on_node_stale(now, id);
+                    }
                     Ok((NodeAnswer::Written, _)) | Err(_) => {
                         if let Err(error) = &exchanged {
                             eprintln!("reading from node {}: {error}", node.0);
                         }
-                        this.relayed.insert(id, Bytes::new());
                         this.gateway
                             .on_node_response(now, id, ResponseHead::status(503), None);
                     }
@@ -218,13 +278,14 @@ fn send(engine: &SharedGateway, sends: Vec<(NodeId, NodeRequestId, Read)>) {
     }
 }
 
-/// Sends one request to `node` and reads the answer and its body. An idle
-/// connection the node has since closed gets one retry on a new one.
+/// Sends one request to `node` and reads the answer's head, leaving its
+/// body in the connection. An idle connection the node has since closed
+/// gets one retry on a new one.
 async fn exchange(
     engine: &SharedGateway,
     node: NodeId,
     request: &NodeRequest,
-) -> io::Result<(NodeAnswer, Bytes)> {
+) -> io::Result<(NodeAnswer, NodeBody)> {
     let (idle, address, secret) = {
         let mut this = engine.borrow_mut();
         let idle = this.idle.get_mut(&node).and_then(Vec::pop);
@@ -232,19 +293,18 @@ async fn exchange(
         (idle, address, this.secret.clone())
     };
     let address = address.ok_or_else(|| io::Error::other("no address"))?;
-    let (answer, body, connection) = match idle {
+    let (answer, len, connection) = match idle {
         Some(connection) => match exchange_on(connection, request, &secret).await {
             Ok(exchanged) => exchanged,
             Err(_) => exchange_on(connect(&address).await?, request, &secret).await?,
         },
         None => exchange_on(connect(&address).await?, request, &secret).await?,
     };
-    engine
-        .borrow_mut()
-        .idle
-        .entry(node)
-        .or_default()
-        .push(connection);
+    let body = NodeBody {
+        node,
+        connection,
+        len,
+    };
     Ok((answer, body))
 }
 
@@ -260,7 +320,7 @@ async fn exchange_on(
     mut connection: Connection,
     request: &NodeRequest,
     secret: &str,
-) -> io::Result<(NodeAnswer, Bytes, Connection)> {
+) -> io::Result<(NodeAnswer, u64, Connection)> {
     let (method, target, headers) = protocol::encode_request(request, secret);
     connection
         .write_request(method, &target, &headers, &[])
@@ -270,16 +330,7 @@ async fn exchange_on(
     let len = crate::http::header(&headers, "content-length")
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(0);
-    let body = connection.read_body(len).await?;
-    Ok((answer, Bytes::from(body), connection))
+    Ok((answer, len, connection))
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// One body from its pieces, copying only when there are several.
-fn concat(mut parts: Vec<Bytes>) -> Bytes {
-    match parts.len() {
-        1 => parts.pop().expect("one part"),
-        _ => Bytes::from(parts.concat()),
-    }
-}

@@ -9,9 +9,12 @@ use s3_accelerator::server::{self, Listeners};
 use s3_accelerator::sigv4::{self, Credentials, Signer, UNSIGNED_PAYLOAD};
 use std::cell::{Cell, RefCell};
 use std::io;
+use std::net::TcpListener as StdListener;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -19,14 +22,21 @@ pub const ETAG: &str = "\"0123456789abcdef\"";
 pub const SIZE: usize = 300_000;
 
 pub fn object() -> Vec<u8> {
-    (0..SIZE as u32)
-        .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8)
+    object_of(SIZE, "")
+}
+
+/// An object of `size` bytes whose content depends on `path`.
+pub fn object_of(size: usize, path: &str) -> Vec<u8> {
+    let seed = path.bytes().fold(0u32, |seed, byte| {
+        seed.wrapping_mul(31).wrapping_add(byte.into())
+    });
+    (0..size as u32)
+        .map(|index| (index.wrapping_add(seed).wrapping_mul(2_654_435_761) >> 24) as u8)
         .collect()
 }
 
 /// What the fake S3 has seen, and whether a `DeleteObjects` removed its
 /// object.
-#[derive(Default)]
 pub struct Origin {
     pub requests: Cell<u64>,
     pub deleted: Cell<bool>,
@@ -34,22 +44,58 @@ pub struct Origin {
     pub paths: RefCell<Vec<String>>,
     /// How long it waits before each answer.
     pub delay: Cell<std::time::Duration>,
+    /// The size of its objects, and whether each path has its own content
+    /// (`object_of`) rather than all sharing `object()`'s.
+    pub size: Cell<usize>,
+    pub distinct: Cell<bool>,
+    /// Bodies of the writes it received in full.
+    pub uploads: RefCell<Vec<Vec<u8>>>,
 }
 
-/// Serves one object at any path, honoring `Range` and `If-Match`, until a
-/// `DeleteObjects` removes it. Answers every other request with 200.
+impl Default for Origin {
+    fn default() -> Origin {
+        Origin {
+            requests: Cell::default(),
+            deleted: Cell::default(),
+            paths: RefCell::default(),
+            delay: Cell::default(),
+            size: Cell::new(SIZE),
+            distinct: Cell::default(),
+            uploads: RefCell::default(),
+        }
+    }
+}
+
+impl Origin {
+    /// The object it serves at `path`.
+    pub fn object(&self, path: &str) -> Vec<u8> {
+        match self.distinct.get() {
+            true => object_of(self.size.get(), path),
+            false => object_of(self.size.get(), ""),
+        }
+    }
+}
+
+/// Serves an object at any path, honoring `Range` and `If-Match`, until a
+/// `DeleteObjects` removes it. Answers every other request with 200 once
+/// its body arrives.
 async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
-    let object = object();
     loop {
         let (stream, _) = listener.accept().await.unwrap();
-        let (object, origin) = (object.clone(), origin.clone());
+        let origin = origin.clone();
         tokio::task::spawn_local(async move {
             let mut connection = Connection::new(stream);
             while let Ok(Some(head)) = connection.read_head().await {
+                let len = head.content_length().unwrap();
+                let Ok(upload) = connection.read_body(len).await else {
+                    return;
+                };
                 origin.requests.set(origin.requests.get() + 1);
                 origin.paths.borrow_mut().push(head.path.clone());
-                let len = head.content_length().unwrap();
-                connection.read_body(len).await.unwrap();
+                if head.method == "PUT" {
+                    origin.uploads.borrow_mut().push(upload);
+                }
+                let object = origin.object(&head.path);
                 let mut headers = Vec::new();
                 let (status, body) = match head.method.as_str() {
                     "POST" if head.query.contains("delete") => {
@@ -92,19 +138,20 @@ fn read(
     if header("if-match").is_some_and(|etag| etag != ETAG) {
         return (412, Vec::new());
     }
+    let size = object.len();
     let range = header("range").and_then(|value| {
         let (first, last) = value.strip_prefix("bytes=")?.split_once('-')?;
         let first: usize = first.parse().ok()?;
         let last = last
             .parse()
-            .map_or(SIZE - 1, |last: usize| last.min(SIZE - 1));
+            .map_or(size - 1, |last: usize| last.min(size - 1));
         Some((first, last))
     });
     match range {
         Some((first, last)) => {
             headers.push((
                 "Content-Range".into(),
-                format!("bytes {first}-{last}/{SIZE}"),
+                format!("bytes {first}-{last}/{size}"),
             ));
             (206, object[first..=last].to_vec())
         }
@@ -153,6 +200,18 @@ impl Server {
     /// Starts a server in front of the S3 at `origin_port`, keeping its
     /// disk in `dir`. `extra` is appended to its config.
     pub async fn start(origin_port: u16, dir: &Path, grants: &str, extra: &str) -> Server {
+        let cache = "block_size = 65536\nextent_size = 1048576\nextents = 8";
+        Server::start_with(origin_port, dir, grants, extra, cache).await
+    }
+
+    /// Starts a server whose `[cache]` table's own settings are `cache`.
+    pub async fn start_with(
+        origin_port: u16,
+        dir: &Path,
+        grants: &str,
+        extra: &str,
+        cache: &str,
+    ) -> Server {
         let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let node = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let node_address = node.local_addr().unwrap();
@@ -169,9 +228,7 @@ impl Server {
             secret_access_key = "reader-secret"
             grants = [{grants}]
             [cache]
-            block_size = 65536
-            extent_size = 1048576
-            extents = 8
+            {cache}
             [cache.default_policy]
             ttl_ms = 60000
             [cluster]
@@ -215,13 +272,25 @@ impl Server {
     }
 }
 
-/// The headers of a request `reader` signed.
+/// The headers of a request `reader` signed, with an unsigned payload.
 pub fn signed(
     port: u16,
     method: &str,
     path: &str,
     query: &str,
     extra: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    signed_payload(port, method, path, query, extra, UNSIGNED_PAYLOAD)
+}
+
+/// The headers of a request `reader` signed, with `payload_hash`.
+pub fn signed_payload(
+    port: u16,
+    method: &str,
+    path: &str,
+    query: &str,
+    extra: &[(&str, &str)],
+    payload_hash: &str,
 ) -> Vec<(String, String)> {
     let signer = Signer {
         credentials: Credentials {
@@ -239,7 +308,7 @@ pub fn signed(
         path,
         query,
         &mut headers,
-        UNSIGNED_PAYLOAD,
+        payload_hash,
         sigv4::unix_now(),
     );
     headers
@@ -254,6 +323,20 @@ pub async fn send(
     extra: &[(&str, &str)],
     body: Vec<u8>,
 ) -> (u16, Vec<u8>) {
+    send_payload(port, method, path, query, extra, body, UNSIGNED_PAYLOAD).await
+}
+
+/// Sends a request signed with `payload_hash`, and returns the status and
+/// body.
+pub async fn send_payload(
+    port: u16,
+    method: &str,
+    path: &str,
+    query: &str,
+    extra: &[(&str, &str)],
+    body: Vec<u8>,
+    payload_hash: &str,
+) -> (u16, Vec<u8>) {
     let url = match query {
         "" => format!("http://127.0.0.1:{port}{path}"),
         query => format!("http://127.0.0.1:{port}{path}?{query}"),
@@ -262,10 +345,165 @@ pub async fn send(
     let mut request = reqwest::Client::new()
         .request(method.clone(), url)
         .body(body);
-    for (name, value) in signed(port, method.as_str(), path, query, extra) {
+    for (name, value) in signed_payload(port, method.as_str(), path, query, extra, payload_hash) {
         request = request.header(name, value);
     }
     let response = request.send().await.unwrap();
     let status = response.status().as_u16();
     (status, response.bytes().await.unwrap().to_vec())
+}
+
+/// A server process, killed if the test ends first.
+pub struct Process(Child);
+
+impl Process {
+    pub fn start(config: &Path) -> Process {
+        let child = Command::new(env!("CARGO_BIN_EXE_s3-accelerator"))
+            .arg(config)
+            .spawn()
+            .unwrap();
+        Process(child)
+    }
+
+    /// Starts the server under `strace`, which writes the system calls
+    /// `calls` of every thread to `trace`: a timestamp on each, file and
+    /// socket names for descriptors, and data in hex.
+    pub fn traced(config: &Path, trace: &Path, calls: &str) -> Process {
+        let child = Command::new("strace")
+            .args(["-f", "-qq", "-ttt", "-yy", "-xx", "-s", "1048576"])
+            .args(["-e", &format!("trace={calls}"), "-e", "signal=none", "-o"])
+            .arg(trace)
+            .arg(env!("CARGO_BIN_EXE_s3-accelerator"))
+            .arg(config)
+            .spawn()
+            .expect("strace runs; install it to run the zero-copy tests");
+        Process(child)
+    }
+
+    /// Shuts down cleanly, as a deploy does, and waits. A traced server's
+    /// tracer exits once the server has, with its trace written.
+    pub fn stop(mut self) {
+        let pid = self.server_pid();
+        Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(self.0.wait().unwrap().success());
+    }
+
+    /// The server's process: this child, or the child `strace` started.
+    fn server_pid(&self) -> u32 {
+        let pid = self.0.id();
+        let children = format!("/proc/{pid}/task/{pid}/children");
+        std::fs::read_to_string(children)
+            .ok()
+            .and_then(|children| children.split_whitespace().next()?.parse().ok())
+            .filter(|_| {
+                std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .is_ok_and(|name| name.trim() == "strace")
+            })
+            .unwrap_or(pid)
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A free port on the loopback interface.
+pub fn port() -> u16 {
+    StdListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+pub async fn listening(port: u16) {
+    for _ in 0..400 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("nothing listens on port {port}");
+}
+
+/// The `[cache]` settings of `Cluster`s by default.
+pub const CLUSTER_CACHE: &str = "block_size = 65536\nextent_size = 1048576\nextents = 32";
+
+/// Configs for one node and a gateway, in `dir`, whose bucket `bucket` is
+/// immutable and admits blocks on their first read.
+pub struct Cluster {
+    pub gateway_port: u16,
+    pub node_port: u16,
+    pub node: PathBuf,
+    pub gateway: PathBuf,
+}
+
+impl Cluster {
+    /// `cache` holds the `[cache]` table's own settings.
+    pub fn new(dir: &Path, origin_port: u16, cache: &str) -> Cluster {
+        std::fs::create_dir_all(dir).unwrap();
+        let (gateway_port, node_port) = (port(), port());
+        let shared = format!(
+            r#"
+            [origin]
+            endpoint = "http://127.0.0.1:{origin_port}"
+            region = "us-east-1"
+            access_key_id = "origin"
+            secret_access_key = "origin-secret"
+            [[clients]]
+            access_key_id = "reader"
+            secret_access_key = "reader-secret"
+            grants = [{{ bucket = "bucket" }}]
+            [cache]
+            {cache}
+            [cache.buckets.bucket]
+            immutable = true
+            admit_on_first_read = true
+            [cluster]
+            secret = "cluster-secret"
+            nodes = [{{ id = 0, address = "127.0.0.1:{node_port}" }}]
+            "#
+        );
+        let node = dir.join("node.toml");
+        let node_role = format!(
+            "[node]\nid = 0\ndata_dir = \"{}\"\n",
+            dir.join("disk").display()
+        );
+        std::fs::write(&node, format!("{shared}\n{node_role}")).unwrap();
+        let gateway = dir.join("gateway.toml");
+        let gateway_role = format!("[gateway]\nlisten = \"127.0.0.1:{gateway_port}\"\n");
+        std::fs::write(&gateway, format!("{shared}\n{gateway_role}")).unwrap();
+        Cluster {
+            gateway_port,
+            node_port,
+            node,
+            gateway,
+        }
+    }
+
+    pub async fn start_node(&self) -> Process {
+        let process = Process::start(&self.node);
+        listening(self.node_port).await;
+        process
+    }
+
+    pub async fn start_gateway(&self) -> Process {
+        let process = Process::start(&self.gateway);
+        listening(self.gateway_port).await;
+        process
+    }
+
+    pub async fn get(&self, key: &str) -> (u16, Vec<u8>) {
+        let path = format!("/bucket/{key}");
+        send(self.gateway_port, "GET", &path, "", &[], Vec::new()).await
+    }
 }
