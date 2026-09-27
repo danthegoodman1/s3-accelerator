@@ -1,18 +1,22 @@
 //! Runs the core's gateway and storage node on this thread and carries out
-//! their actions: fetches from S3, block writes, and answers to clients.
-//! Blocks live in memory; the on-disk store replaces this in phase S2.
+//! their actions: fetches from S3, block reads and writes on the node's
+//! disk, and answers to clients. Block writes and verifications run on
+//! blocking worker threads.
 
+use crate::disk::Disk;
 use crate::origin::Origin;
 use bytes::Bytes;
 use s3_accelerator_core::Time;
 use s3_accelerator_core::gateway::{self, ClientRequestId, Gateway, NodeRequestId};
 use s3_accelerator_core::node::{self, GatewayRequestId, Node, OriginRequestId, Segment};
-use s3_accelerator_core::placement::{Member, NodeId, Ring};
+use s3_accelerator_core::placement::Ring;
 use s3_accelerator_core::s3::{ObjectKey, Request, ResponseHead};
+use s3_accelerator_core::store::Location;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
+use std::io;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::oneshot;
 
@@ -26,9 +30,9 @@ pub type Shared = Rc<RefCell<Engine>>;
 pub struct Engine {
     started: Instant,
     origin: Rc<Origin>,
+    disk: Arc<Disk>,
     gateway: Gateway,
     node: Node,
-    extents: Vec<Vec<u8>>,
     /// S3 response bodies the node still reads.
     bodies: BTreeMap<OriginRequestId, Bytes>,
     next_id: u64,
@@ -37,43 +41,57 @@ pub struct Engine {
     relayed: BTreeMap<NodeRequestId, Bytes>,
     /// Client responses the gateway started, and their bodies so far.
     responses: BTreeMap<ClientRequestId, (ResponseHead, Vec<Bytes>)>,
-    fetches: Vec<(OriginRequestId, Request)>,
+    work: Work,
     /// S3 requests in flight, which a cancellation aborts.
     tasks: BTreeMap<OriginRequestId, tokio::task::AbortHandle>,
+    /// Entries appended to the metadata file since it was last synced.
+    unsynced_metadata: bool,
+}
+
+/// What the core's actions left to start off this thread.
+#[derive(Default)]
+struct Work {
+    fetches: Vec<(OriginRequestId, Request)>,
+    writes: Vec<(Location, Bytes)>,
+    /// Slots to verify: location, length and checksum.
+    verifies: Vec<(Location, u64, u64)>,
 }
 
 impl Engine {
-    pub fn new(config: node::Config, gateway: gateway::Config, origin: Rc<Origin>) -> Shared {
-        let member = Member {
-            id: NodeId(0),
-            weight: NonZeroU32::MIN,
-        };
-        let ring = Ring::new(1, vec![member]);
-        let extents = (0..config.store.extents)
-            .map(|_| vec![0; config.store.extent_size as usize])
-            .collect();
-        Rc::new(RefCell::new(Engine {
+    pub fn new(
+        node: Node,
+        ring: Ring,
+        gateway: gateway::Config,
+        origin: Rc<Origin>,
+        disk: Arc<Disk>,
+    ) -> Shared {
+        let engine = Rc::new(RefCell::new(Engine {
             started: Instant::now(),
             origin,
-            gateway: Gateway::new(ring.clone(), gateway),
-            node: Node::new(NodeId(0), ring, config),
-            extents,
+            disk,
+            gateway: Gateway::new(ring, gateway),
+            node,
             bodies: BTreeMap::new(),
             next_id: 0,
             clients: BTreeMap::new(),
             node_requests: BTreeMap::new(),
             relayed: BTreeMap::new(),
             responses: BTreeMap::new(),
-            fetches: Vec::new(),
+            work: Work::default(),
             tasks: BTreeMap::new(),
-        }))
+            unsynced_metadata: false,
+        }));
+        // A recovering node's first actions clear records it cannot use.
+        let work = engine.borrow_mut().pump();
+        start(&engine, work);
+        engine
     }
 
     /// Serves a `GetObject` or `HeadObject`; the answer arrives on the
     /// receiver.
     pub fn read(engine: &Shared, request: Request) -> oneshot::Receiver<Answer> {
         let (sender, receiver) = oneshot::channel();
-        let fetches = {
+        let work = {
             let mut this = engine.borrow_mut();
             let id = ClientRequestId(this.next_id());
             this.clients.insert(id, sender);
@@ -81,43 +99,62 @@ impl Engine {
             this.gateway.on_request(now, id, request);
             this.pump()
         };
-        start_fetches(engine, fetches);
+        start(engine, work);
         receiver
     }
 
     /// Lets the core's timeouts run: nodes give up on S3 requests, and
     /// gateways fail over from nodes.
     pub fn tick(engine: &Shared) {
-        let fetches = {
+        let work = {
             let mut this = engine.borrow_mut();
             let now = this.now();
             this.gateway.on_tick(now);
             this.node.on_tick(now);
+            if std::mem::take(&mut this.unsynced_metadata) {
+                let disk = this.disk.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = disk.sync_metadata() {
+                        eprintln!("syncing the metadata file: {error}");
+                    }
+                });
+            }
             this.pump()
         };
-        start_fetches(engine, fetches);
+        start(engine, work);
     }
 
     /// A write to `key` passed through to S3 and succeeded.
     pub fn write_succeeded(engine: &Shared, key: &ObjectKey) {
-        let fetches = {
+        let work = {
             let mut this = engine.borrow_mut();
             let now = this.now();
             this.node.on_write(now, key);
             this.gateway.on_write(now, key);
             this.pump()
         };
-        start_fetches(engine, fetches);
+        start(engine, work);
+    }
+
+    /// True when neither the gateway nor the node has work in progress.
+    pub fn is_idle(engine: &Shared) -> bool {
+        let this = engine.borrow();
+        this.gateway.is_idle() && this.node.is_idle()
+    }
+
+    /// Syncs the disk and marks its slot table clean. Call once idle.
+    pub fn shut_down(engine: &Shared) -> io::Result<()> {
+        engine.borrow().disk.shut_down()
     }
 
     /// Carries out every action until the core has none left, and returns
-    /// the S3 requests to start.
-    fn pump(&mut self) -> Vec<(OriginRequestId, Request)> {
+    /// the work to start off this thread.
+    fn pump(&mut self) -> Work {
         loop {
             let gateway_actions = self.gateway.drain();
             let node_actions = self.node.drain();
             if gateway_actions.is_empty() && node_actions.is_empty() {
-                return std::mem::take(&mut self.fetches);
+                return std::mem::take(&mut self.work);
             }
             for action in gateway_actions {
                 self.gateway_action(action);
@@ -179,7 +216,7 @@ impl Engine {
         match action {
             node::Action::Fetch {
                 origin, request, ..
-            } => self.fetches.push((origin, request)),
+            } => self.work.fetches.push((origin, request)),
             node::Action::Respond {
                 request,
                 head,
@@ -215,20 +252,30 @@ impl Engine {
                 offset,
                 len,
             } => {
-                let source = &self.bodies[&origin][offset as usize..(offset + len) as usize];
-                let start = location.offset as usize;
-                self.extents[location.extent as usize][start..start + len as usize]
-                    .copy_from_slice(source);
-                self.node.on_written(location);
+                let body = &self.bodies[&origin];
+                let range = offset as usize..(offset + len) as usize;
+                match body.get(range.clone()) {
+                    Some(_) => self.work.writes.push((location, body.slice(range))),
+                    None => self.node.on_write_failed(location),
+                }
             }
-            // Blocks and metadata live in memory and leave with the process,
-            // so there is no slot table or metadata file to keep, and
-            // nothing recovered to verify.
-            node::Action::Record { .. }
-            | node::Action::Clear { .. }
-            | node::Action::Remember { .. }
-            | node::Action::Forget { .. } => {}
-            node::Action::Verify { .. } => unreachable!("a node started empty verifies nothing"),
+            node::Action::Record { location, record } => {
+                if let Err(error) = self.disk.record(location, record) {
+                    eprintln!("recording {location:?}: {error}");
+                }
+            }
+            node::Action::Clear { location } => {
+                if let Err(error) = self.disk.clear(location) {
+                    eprintln!("clearing {location:?}: {error}");
+                }
+            }
+            node::Action::Remember { key, meta } => self.save(&key, Some(&meta)),
+            node::Action::Forget { key } => self.save(&key, None),
+            node::Action::Verify {
+                location,
+                len,
+                checksum,
+            } => self.work.verifies.push((location, len, checksum)),
             node::Action::Release { origin } => {
                 self.bodies.remove(&origin);
             }
@@ -258,11 +305,15 @@ impl Engine {
                     location,
                     offset,
                     len,
-                } => {
-                    let start = (location.offset + offset) as usize;
-                    let extent = &self.extents[location.extent as usize];
-                    bytes.extend_from_slice(&extent[start..start + len as usize]);
-                }
+                } => match self.disk.read(location, offset, len) {
+                    Ok(slot) => bytes.extend_from_slice(&slot),
+                    // The body ends early, and the gateway reads the rest
+                    // from elsewhere.
+                    Err(error) => {
+                        eprintln!("reading {location:?}: {error}");
+                        break;
+                    }
+                },
                 Segment::Origin {
                     origin,
                     offset,
@@ -274,6 +325,13 @@ impl Engine {
             }
         }
         Bytes::from(bytes)
+    }
+
+    fn save(&mut self, key: &ObjectKey, meta: Option<&node::Meta>) {
+        match self.disk.append(key, meta) {
+            Ok(()) => self.unsynced_metadata = true,
+            Err(error) => eprintln!("saving metadata of {key:?}: {error}"),
+        }
     }
 
     fn answer(&mut self, request: ClientRequestId, head: ResponseHead, body: Bytes) {
@@ -293,14 +351,16 @@ impl Engine {
     }
 }
 
-fn start_fetches(engine: &Shared, fetches: Vec<(OriginRequestId, Request)>) {
-    for (origin, request) in fetches {
+/// Starts S3 requests on this thread, and block writes and verifications
+/// on worker threads, each feeding its result back to the node.
+fn start(engine: &Shared, work: Work) {
+    for (origin, request) in work.fetches {
         let handle = engine.clone();
         let task = tokio::task::spawn_local(async move {
             let engine = handle;
             let client = engine.borrow().origin.clone();
             let (head, body) = client.read(&request).await;
-            let fetches = {
+            let work = {
                 let mut this = engine.borrow_mut();
                 this.tasks.remove(&origin);
                 this.bodies.insert(origin, body);
@@ -308,12 +368,52 @@ fn start_fetches(engine: &Shared, fetches: Vec<(OriginRequestId, Request)>) {
                 this.node.on_origin_response(now, origin, head);
                 this.pump()
             };
-            start_fetches(&engine, fetches);
+            start(&engine, work);
         });
         engine
             .borrow_mut()
             .tasks
             .insert(origin, task.abort_handle());
+    }
+    for (location, bytes) in work.writes {
+        let engine = engine.clone();
+        let disk = engine.borrow().disk.clone();
+        tokio::task::spawn_local(async move {
+            let written = tokio::task::spawn_blocking(move || disk.write(location, &bytes)).await;
+            let work = {
+                let mut this = engine.borrow_mut();
+                match written {
+                    Ok(Ok(())) => this.node.on_written(location),
+                    Ok(Err(error)) => {
+                        eprintln!("writing {location:?}: {error}");
+                        this.node.on_write_failed(location);
+                    }
+                    Err(error) => {
+                        eprintln!("writing {location:?}: {error}");
+                        this.node.on_write_failed(location);
+                    }
+                }
+                this.pump()
+            };
+            start(&engine, work);
+        });
+    }
+    for (location, len, checksum) in work.verifies {
+        let engine = engine.clone();
+        let disk = engine.borrow().disk.clone();
+        tokio::task::spawn_local(async move {
+            let verified =
+                tokio::task::spawn_blocking(move || disk.verify(location, len, checksum)).await;
+            let work = {
+                let mut this = engine.borrow_mut();
+                // A block that cannot be read counts as corrupt.
+                let intact = matches!(verified, Ok(Ok(true)));
+                let now = this.now();
+                this.node.on_verified(now, location, intact);
+                this.pump()
+            };
+            start(&engine, work);
+        });
     }
 }
 

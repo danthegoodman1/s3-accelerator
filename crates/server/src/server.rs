@@ -3,6 +3,7 @@
 //! through to S3 under the cluster's signature.
 
 use crate::config::{Client, Config};
+use crate::disk::Disk;
 use crate::engine::{Answer, Engine, Shared};
 use crate::http::header;
 use crate::http::{Connection, RequestHead, Response};
@@ -10,11 +11,18 @@ use crate::origin::Origin;
 use crate::sigv4::{self, AuthError, Credentials, Signable};
 use bytes::Bytes;
 use percent_encoding::percent_decode_str;
+use s3_accelerator_core::node::Node;
+use s3_accelerator_core::placement::{Member, NodeId, Ring};
 use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
 use sha2::{Digest, Sha256};
 use std::io;
+use std::num::NonZeroU32;
+use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::signal::unix::{SignalKind, signal};
 
 struct Context {
     engine: Shared,
@@ -27,12 +35,24 @@ struct Context {
 pub async fn serve(config: Config) -> io::Result<()> {
     let listener = TcpListener::bind(&config.listen).await?;
     eprintln!("s3-accelerator listening on {}", listener.local_addr()?);
-    run(listener, config).await
+    let mut terminate = signal(SignalKind::terminate())?;
+    let stop = async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    };
+    run(listener, config, stop).await
 }
 
-/// Serves clients on `listener`, ignoring `config.listen`. Runs on a
-/// `LocalSet`.
-pub async fn run(listener: TcpListener, config: Config) -> io::Result<()> {
+/// Serves clients on `listener`, ignoring `config.listen`, until `stop`
+/// completes; then waits for work in progress and shuts the node's disk
+/// down cleanly. Runs on a `LocalSet`.
+pub async fn run(
+    listener: TcpListener,
+    config: Config,
+    stop: impl Future<Output = ()>,
+) -> io::Result<()> {
     let credentials = Credentials {
         access_key_id: config.origin.access_key_id.clone(),
         secret_access_key: config.origin.secret_access_key.clone(),
@@ -43,11 +63,27 @@ pub async fn run(listener: TcpListener, config: Config) -> io::Result<()> {
         credentials,
         config.max_body,
     ));
+    let node_config = config.cache.node_config();
+    let (disk, recovery) = Disk::open(Path::new(&config.cache.data_dir), node_config.store)?;
+    let member = Member {
+        id: NodeId(0),
+        weight: NonZeroU32::MIN,
+    };
+    let ring = Ring::new(1, vec![member]);
+    let node = Node::recover(
+        NodeId(0),
+        ring.clone(),
+        node_config,
+        recovery.records,
+        recovery.metadata,
+    );
     let context = Rc::new(Context {
         engine: Engine::new(
-            config.cache.node_config(),
+            node,
+            ring,
             config.cache.gateway_config(),
             origin.clone(),
+            Arc::new(disk),
         ),
         origin,
         clients: config.clients,
@@ -55,14 +91,18 @@ pub async fn run(listener: TcpListener, config: Config) -> io::Result<()> {
     });
     let ticking = context.engine.clone();
     tokio::task::spawn_local(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
             interval.tick().await;
             Engine::tick(&ticking);
         }
     });
+    tokio::pin!(stop);
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            () = &mut stop => break,
+        };
         stream.set_nodelay(true)?;
         let context = context.clone();
         tokio::task::spawn_local(async move {
@@ -71,7 +111,16 @@ pub async fn run(listener: TcpListener, config: Config) -> io::Result<()> {
             }
         });
     }
+    drop(listener);
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_WAIT;
+    while !Engine::is_idle(&context.engine) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Engine::shut_down(&context.engine)
 }
+
+/// How long a shutdown waits for work in progress.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
 
 async fn connection(stream: TcpStream, context: &Context) -> io::Result<()> {
     let mut connection = Connection::new(stream);

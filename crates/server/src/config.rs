@@ -66,10 +66,12 @@ impl Client {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
+    /// Where the node keeps its slab file, slot table and metadata file.
+    pub data_dir: String,
     pub block_size: u64,
     pub chunk_blocks: u64,
     pub extent_size: u64,
-    /// Extents of memory this node caches in.
+    /// Extents in the slab file.
     pub extents: u32,
     pub min_slot: u64,
     pub doorkeeper_window: u64,
@@ -92,6 +94,7 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> CacheConfig {
         CacheConfig {
+            data_dir: String::new(),
             block_size: 1 << 20,
             chunk_blocks: 16,
             extent_size: 64 << 20,
@@ -146,6 +149,9 @@ impl PolicyConfig {
 impl CacheConfig {
     /// Settings the core would misbehave under.
     pub fn check(&self) -> Result<(), String> {
+        if self.data_dir.is_empty() {
+            return Err("cache.data_dir names no directory".into());
+        }
         if self.node_timeout_ms < 2 * self.origin_timeout_ms {
             return Err(format!(
                 "node_timeout_ms ({}) must be at least twice origin_timeout_ms ({}): a node may wait out one S3 timeout and fetch again",

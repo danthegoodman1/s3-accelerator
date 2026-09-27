@@ -1,13 +1,19 @@
 //! A fake S3 that counts its requests, and a signed client, for running the
 //! server end to end.
 
+#![allow(dead_code, reason = "each test crate uses its own part of the harness")]
+
 use s3_accelerator::config::Config;
 use s3_accelerator::http::{Connection, Response};
 use s3_accelerator::server;
 use s3_accelerator::sigv4::{self, Credentials, Signer, UNSIGNED_PAYLOAD};
 use std::cell::{Cell, RefCell};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 pub const ETAG: &str = "\"0123456789abcdef\"";
 pub const SIZE: usize = 300_000;
@@ -106,36 +112,91 @@ fn read(
 /// Starts the fake S3 and a server in front of it on this `LocalSet`, and
 /// returns the server's port. `extra` is appended to the server's config.
 pub async fn start(grants: &str, extra: &str) -> (u16, Rc<Origin>) {
-    let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin_port = origin_listener.local_addr().unwrap().port();
-    let origin = Rc::new(Origin::default());
-    tokio::task::spawn_local(fake_origin(origin_listener, origin.clone()));
-    let config: Config = toml::from_str(&format!(
-        r#"
-        listen = "unused"
-        {extra}
-        [origin]
-        endpoint = "http://127.0.0.1:{origin_port}"
-        region = "us-east-1"
-        access_key_id = "origin"
-        secret_access_key = "origin-secret"
-        [[clients]]
-        access_key_id = "reader"
-        secret_access_key = "reader-secret"
-        grants = [{grants}]
-        [cache]
-        block_size = 65536
-        extent_size = 1048576
-        extents = 8
-        [cache.default_policy]
-        ttl_ms = 60000
-        "#
-    ))
-    .unwrap();
+    let (origin_port, origin) = start_origin().await;
+    let server = Server::start(origin_port, &data_dir(), grants, extra).await;
+    (server.port, origin)
+}
+
+/// Starts the fake S3 on this `LocalSet`, and returns its port.
+pub async fn start_origin() -> (u16, Rc<Origin>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::task::spawn_local(server::run(listener, config));
+    let origin = Rc::new(Origin::default());
+    tokio::task::spawn_local(fake_origin(listener, origin.clone()));
     (port, origin)
+}
+
+/// A fresh directory for a server's disk.
+pub fn data_dir() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = format!(
+        "server-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// A server running on this `LocalSet`.
+pub struct Server {
+    pub port: u16,
+    stop: oneshot::Sender<()>,
+    done: tokio::task::JoinHandle<io::Result<()>>,
+}
+
+impl Server {
+    /// Starts a server in front of the S3 at `origin_port`, keeping its
+    /// disk in `dir`. `extra` is appended to its config.
+    pub async fn start(origin_port: u16, dir: &Path, grants: &str, extra: &str) -> Server {
+        let config: Config = toml::from_str(&format!(
+            r#"
+            listen = "unused"
+            {extra}
+            [origin]
+            endpoint = "http://127.0.0.1:{origin_port}"
+            region = "us-east-1"
+            access_key_id = "origin"
+            secret_access_key = "origin-secret"
+            [[clients]]
+            access_key_id = "reader"
+            secret_access_key = "reader-secret"
+            grants = [{grants}]
+            [cache]
+            data_dir = "{}"
+            block_size = 65536
+            extent_size = 1048576
+            extents = 8
+            [cache.default_policy]
+            ttl_ms = 60000
+            "#,
+            dir.display()
+        ))
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stop, stopped) = oneshot::channel::<()>();
+        // A server whose handle is dropped runs until the test ends.
+        let stopped = async move {
+            if stopped.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        let done = tokio::task::spawn_local(server::run(listener, config, stopped));
+        Server { port, stop, done }
+    }
+
+    /// Shuts the server down cleanly and waits until it has.
+    pub async fn stop(self) {
+        self.stop.send(()).unwrap();
+        self.done.await.unwrap().unwrap();
+    }
+
+    /// Stops the server as a crash would, without a clean shutdown.
+    pub fn crash(self) {
+        self.done.abort();
+    }
 }
 
 /// The headers of a request `reader` signed.

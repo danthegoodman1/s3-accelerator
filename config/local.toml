@@ -14,6 +14,7 @@ secret_access_key = "local-credential"
 grants = [{ bucket = "*" }]
 
 [cache]
+data_dir = "target/local-cache"
 block_size = 65536
 chunk_blocks = 16
 extent_size = 1048576
