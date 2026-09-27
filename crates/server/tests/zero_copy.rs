@@ -456,3 +456,85 @@ fn recorded(path: &std::path::Path) -> usize {
         .filter(|record| decode_record(record.as_slice()).is_some())
         .count()
 }
+
+/// Slot records, clears and metadata entries reach their files from the
+/// journal's thread, off the event loop, which owns the node's core, so a
+/// drive slow to sync stalls the journal and never the loop. Evictions
+/// still clear a slot's record, and sync the table, before the slot's new
+/// bytes reach the slab file.
+#[tokio::test(flavor = "current_thread")]
+async fn records_and_metadata_are_written_off_the_event_loop() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, _origin) = start_origin().await;
+            let dir = data_dir();
+            // Room for 64 blocks of 64 KiB; each object holds 5.
+            let cache = "block_size = 65536\nextent_size = 1048576\nextents = 4";
+            let cluster = Cluster::new(&dir, origin_port, cache);
+            let calls = "pwrite64,fdatasync";
+            let node = Process::traced(&cluster.node, &dir.join("node.trace"), calls);
+            common::listening(cluster.node_port).await;
+            let _gateway = cluster.start_gateway().await;
+            for index in 0..30 {
+                assert_eq!(cluster.get(&format!("k{index}")).await.0, 200);
+            }
+            let event_loop = node.server_pid();
+            node.stop();
+
+            let calls = read_trace(&dir.join("node.trace"), 0.0, f64::MAX);
+            let on = |call: &Call, file: &str| {
+                let file = format!("/{file}>");
+                call.fds().iter().any(|fd| fd.ends_with(&file))
+            };
+            const HEADER: u64 = 4096;
+            // Records and clears, past the table's header, and entries.
+            let records: Vec<&Call> = calls
+                .iter()
+                .filter(|call| call.name == "pwrite64" && on(call, "slots"))
+                .filter(|call| call.offset_and_len().0 >= HEADER)
+                .collect();
+            let entries: Vec<&Call> = calls
+                .iter()
+                .filter(|call| call.name == "pwrite64" && on(call, "metadata"))
+                .collect();
+            assert!(!records.is_empty() && !entries.is_empty());
+            let threads: Vec<u32> = records
+                .iter()
+                .chain(&entries)
+                .map(|call| call.thread)
+                .collect();
+            assert!(
+                threads.iter().all(|&thread| thread != event_loop),
+                "{threads:?}"
+            );
+
+            let syncs: Vec<&Call> = calls
+                .iter()
+                .filter(|call| call.name == "fdatasync" && on(call, "slots"))
+                .collect();
+            let mut reused = 0;
+            for write in calls
+                .iter()
+                .filter(|call| call.name == "pwrite64" && on(call, "slabs"))
+            {
+                let record = HEADER + write.offset_and_len().0 / 4096 * 64;
+                let at = |call: &Call| call.offset_and_len().0 == record;
+                let Some(last) = records
+                    .iter()
+                    .filter(|call| at(call) && call.end < write.start)
+                    .max_by(|a, b| a.end.total_cmp(&b.end))
+                else {
+                    continue;
+                };
+                reused += 1;
+                let cleared = last.data().iter().all(|&byte| byte == 0);
+                assert!(cleared, "a slot's bytes before its old record was cleared");
+                let synced = syncs
+                    .iter()
+                    .any(|sync| sync.end > last.end && sync.end < write.start);
+                assert!(synced, "a slot's bytes before its clear was durable");
+            }
+            assert!(reused > 0, "no slot was reused");
+        })
+        .await;
+}

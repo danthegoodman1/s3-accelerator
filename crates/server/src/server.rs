@@ -217,11 +217,13 @@ pub async fn run_with(
             if disk.run() > 1 {
                 recovered.restarted(Time(0));
             }
+            let disk = Arc::new(disk);
+            disk.start_journal();
             let engine = NodeEngine::new(
                 recovered,
                 origin,
                 peers.clone(),
-                Arc::new(disk),
+                disk,
                 config.addresses(),
                 metrics.clone(),
             );

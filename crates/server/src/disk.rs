@@ -9,6 +9,12 @@
 //! or verified them, and a clean shutdown marks the table with the earliest
 //! run whose records are sound, which the next start trusts.
 //!
+//! The node's thread hands its records, clears, erasures and metadata
+//! entries to the journal, a thread of its own that applies them in order,
+//! so a drive slow to sync stalls that thread and never the node's. A block
+//! write, a sync and a clean shutdown each wait for the entries issued
+//! before them.
+//!
 //! Blocks leave the slab file with `sendfile`, whose sockets hold references
 //! to the page cache's pages until the bytes are consumed. A write into a
 //! slot waits until none of the slot's old pages are still in use, so a
@@ -28,7 +34,8 @@ use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::time::{Duration, Instant};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -70,6 +77,7 @@ pub struct Disk {
     /// Records cleared since the table was last synced. A block write
     /// syncs them first.
     clears: Mutex<bool>,
+    journal: Journal,
 }
 
 /// Syncs a file for many writers at once. Syncs run one at a time, each
@@ -140,6 +148,47 @@ impl GroupSync {
             self.done.notify_all();
         }
     }
+}
+
+/// A change to the slot table, the slab file, the metadata file or the
+/// purge log, which the journal applies in the order the node issued it.
+pub enum Entry {
+    Record {
+        location: Location,
+        record: SlotRecord,
+    },
+    Clear {
+        location: Location,
+    },
+    Erase {
+        location: Location,
+        len: u64,
+    },
+    Append {
+        key: ObjectKey,
+        meta: Option<Meta>,
+    },
+    SavePurge {
+        key: ObjectKey,
+        nodes: Vec<NodeId>,
+    },
+}
+
+/// The journal's queue and progress. Entries are numbered from 1 in the
+/// order they are issued.
+#[derive(Default)]
+struct Journal {
+    sender: Mutex<Option<mpsc::Sender<(u64, Entry)>>>,
+    issued: AtomicU64,
+    progress: Mutex<Progress>,
+    applied: Condvar,
+}
+
+#[derive(Default)]
+struct Progress {
+    /// The last entry applied, and the entries that failed so far.
+    through: u64,
+    failures: u64,
 }
 
 /// A block write that reached the disk.
@@ -252,6 +301,7 @@ impl Disk {
             started_from: trusted_from,
             checksums: Mutex::new(BTreeMap::new()),
             clears: Mutex::new(false),
+            journal: Journal::default(),
         };
         let recovery = Recovery {
             records,
@@ -344,6 +394,84 @@ impl Disk {
         let bytes = encode_record(&record, checksum, self.run);
         self.table
             .write_all_at(&bytes, self.record_offset(location))
+    }
+
+    /// Starts the journal's thread. Until it starts, entries apply as they
+    /// are issued.
+    pub fn start_journal(self: &Arc<Self>) {
+        let (sender, entries) = mpsc::channel::<(u64, Entry)>();
+        *self.journal.sender.lock().expect("journal lock") = Some(sender);
+        let disk: Weak<Disk> = Arc::downgrade(self);
+        std::thread::Builder::new()
+            .name("journal".into())
+            .spawn(move || {
+                for (number, entry) in entries {
+                    let Some(disk) = disk.upgrade() else {
+                        return;
+                    };
+                    disk.apply(number, entry);
+                }
+            })
+            .expect("a journal thread");
+    }
+
+    /// Issues `entry` to the journal, and returns its number.
+    pub fn journal(&self, entry: Entry) -> u64 {
+        let sender = self.journal.sender.lock().expect("journal lock");
+        let number = self.journal.issued.fetch_add(1, Ordering::Relaxed) + 1;
+        match sender.as_ref() {
+            Some(sender) => {
+                sender
+                    .send((number, entry))
+                    .expect("the journal runs while the disk does");
+            }
+            None => {
+                drop(sender);
+                self.apply(number, entry);
+            }
+        }
+        number
+    }
+
+    /// The number of the last entry issued.
+    pub fn issued(&self) -> u64 {
+        self.journal.issued.load(Ordering::Relaxed)
+    }
+
+    /// Waits until the journal has applied entry `number` and every entry
+    /// before it, and returns how many entries have failed so far.
+    pub fn applied(&self, number: u64) -> u64 {
+        let progress = self.journal.progress.lock().expect("journal lock");
+        let progress = self
+            .journal
+            .applied
+            .wait_while(progress, |progress| progress.through < number)
+            .expect("journal lock");
+        progress.failures
+    }
+
+    /// How many journal entries have failed so far.
+    pub fn journal_failures(&self) -> u64 {
+        self.journal.progress.lock().expect("journal lock").failures
+    }
+
+    fn apply(&self, number: u64, entry: Entry) {
+        let (what, applied) = match entry {
+            Entry::Record { location, record } => {
+                ("recording a slot", self.record(location, record))
+            }
+            Entry::Clear { location } => ("clearing a slot", self.clear(location)),
+            Entry::Erase { location, len } => ("erasing a slot", self.erase(location, len)),
+            Entry::Append { key, meta } => ("saving metadata", self.append(&key, meta.as_ref())),
+            Entry::SavePurge { key, nodes } => ("saving a purge", self.save_purge(&key, &nodes)),
+        };
+        if let Err(error) = &applied {
+            log!(Warn, "a journal entry failed", entry = what, error = error);
+        }
+        let mut progress = self.journal.progress.lock().expect("journal lock");
+        progress.through = progress.through.max(number);
+        progress.failures += u64::from(applied.is_err());
+        self.journal.applied.notify_all();
     }
 
     /// Erases `location`'s record. The next block write syncs the erasure

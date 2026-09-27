@@ -9,7 +9,7 @@
 //! node reads blocks and metadata from their previous owners over the
 //! cluster protocol, and holds those bodies like fills.
 
-use crate::disk::Disk;
+use crate::disk::{Disk, Entry};
 use crate::http::{Connection, Framing, Response, header};
 use crate::log;
 use crate::metrics::{Link, Metrics, S3Kind};
@@ -138,9 +138,6 @@ pub struct NodeEngine {
     events: Events,
     /// Bytes of uploads the node may still keep for warming.
     warm_budget: u64,
-    /// An append to the purge log or an erasure failed during the purge
-    /// under way, which then fails rather than confirm.
-    purge_failed: bool,
     /// A purge's actions are being carried out.
     purging: bool,
 }
@@ -221,7 +218,6 @@ impl NodeEngine {
             next_rewrite: None,
             events: Events::default(),
             warm_budget: WARM_BUDGET,
-            purge_failed: false,
             purging: false,
         }));
         // A recovering node's first actions clear records it cannot use.
@@ -375,14 +371,17 @@ impl NodeEngine {
             this.node.on_purge(now, key, passed_on);
             let work = this.pump();
             this.purging = false;
-            (work, !std::mem::take(&mut this.purge_failed))
+            (work, this.disk.issued())
         };
         start(engine, work);
-        if !logged {
-            return Err(io::Error::other("the purge could not be logged or erased"));
-        }
         let disk = engine.borrow().disk.clone();
+        let failures = disk.journal_failures();
         tokio::task::spawn_blocking(move || {
+            // A purge whose log entry or erasures failed goes unconfirmed,
+            // and its coordinator tells the node again.
+            if disk.applied(logged) > failures {
+                return Err(io::Error::other("the purge could not be logged or erased"));
+            }
             // The erased slots' bytes, then the records that no longer
             // name them.
             disk.sync_slabs()?;
@@ -516,7 +515,9 @@ impl NodeEngine {
                 .retain(|_, message| messages.contains_key(message));
             if std::mem::take(&mut this.unsynced_metadata) {
                 let disk = this.disk.clone();
+                let saved = disk.issued();
                 tokio::task::spawn_blocking(move || {
+                    disk.applied(saved);
                     if let Err(error) = disk.sync_metadata() {
                         log!(Warn, "syncing the metadata file failed", error = error);
                     }
@@ -536,6 +537,7 @@ impl NodeEngine {
     /// disk and marks its slot table clean. Call once idle.
     pub fn shut_down(engine: &SharedNode) -> io::Result<()> {
         let this = engine.borrow();
+        this.disk.applied(this.disk.issued());
         this.disk.rewrite_metadata(&this.node.saved_metadata())?;
         this.disk.shut_down()
     }
@@ -626,24 +628,10 @@ impl NodeEngine {
                 Some(Body::Passing) | None => self.node.on_write_failed(location),
             },
             node::Action::Record { location, record } => {
-                if let Err(error) = self.disk.record(location, record) {
-                    log!(
-                        Warn,
-                        "recording a slot failed",
-                        location = format!("{location:?}"),
-                        error = error
-                    );
-                }
+                self.disk.journal(Entry::Record { location, record });
             }
             node::Action::Clear { location } => {
-                if let Err(error) = self.disk.clear(location) {
-                    log!(
-                        Warn,
-                        "clearing a slot failed",
-                        location = format!("{location:?}"),
-                        error = error
-                    );
-                }
+                self.disk.journal(Entry::Clear { location });
             }
             node::Action::Remember { key, meta } => self.save(&key, Some(&meta)),
             node::Action::Forget { key } => self.save(&key, None),
@@ -663,32 +651,16 @@ impl NodeEngine {
                 checksum,
             } => self.work.verifies.push((location, len, checksum)),
             node::Action::ReadSpot { version, parts } => self.work.spots.push((version, parts)),
-            // Erasing in order with the node's actions finishes before any
-            // later write can reuse the slot.
-            // A purge syncs its own erasures before it confirms; a slot a
-            // purged block held until now is synced on its own.
-            node::Action::Erase { location, len } => match self.disk.erase(location, len) {
-                Ok(()) => self.work.erased |= !self.purging,
-                Err(error) => {
-                    log!(
-                        Warn,
-                        "erasing a slot failed",
-                        location = format!("{location:?}"),
-                        error = error
-                    );
-                    self.purge_failed |= self.purging;
-                }
-            },
+            // The journal erases in order with the node's actions, before
+            // any later write can reuse the slot. A purge syncs its own
+            // erasures before it confirms; a slot a purged block held until
+            // now is synced on its own.
+            node::Action::Erase { location, len } => {
+                self.disk.journal(Entry::Erase { location, len });
+                self.work.erased |= !self.purging;
+            }
             node::Action::SavePurge { key, nodes } => {
-                if let Err(error) = self.disk.save_purge(&key, &nodes) {
-                    log!(
-                        Warn,
-                        "saving a purge failed",
-                        key = named(&key),
-                        error = error
-                    );
-                    self.purge_failed = true;
-                }
+                self.disk.journal(Entry::SavePurge { key, nodes });
             }
             node::Action::PassPurge { node, key } => self.work.purges.push((node, key)),
             node::Action::Release { origin } => {
@@ -819,15 +791,12 @@ impl NodeEngine {
             self.saved_meanwhile.push((key.clone(), meta.cloned()));
             return;
         }
-        match self.disk.append(key, meta) {
-            Ok(()) => self.unsynced_metadata = true,
-            Err(error) => log!(
-                Warn,
-                "saving metadata failed",
-                key = named(key),
-                error = error
-            ),
-        }
+        let meta = meta.cloned();
+        self.disk.journal(Entry::Append {
+            key: key.clone(),
+            meta,
+        });
+        self.unsynced_metadata = true;
     }
 
     fn now(&self) -> Time {
@@ -893,7 +862,9 @@ fn start(engine: &SharedNode, work: Work) {
     }
     if work.erased {
         let disk = engine.borrow().disk.clone();
+        let erased = disk.issued();
         tokio::task::spawn_blocking(move || {
+            disk.applied(erased);
             if let Err(error) = disk.sync_slabs() {
                 log!(Warn, "syncing erased slots failed", error = error);
             }
@@ -1274,16 +1245,22 @@ async fn pass_through(engine: &SharedNode, mut body: Incoming, readers: Vec<Read
 /// still holds the slot's old pages, and tells the node how it went.
 fn write(engine: &SharedNode, location: Location, bytes: Bytes) {
     let engine = engine.clone();
+    // The journal's entries so far, such as the clear of this slot's last
+    // record, which the write waits for.
+    let issued = engine.borrow().disk.issued();
     tokio::task::spawn_local(async move {
         let disk = engine.borrow().disk.clone();
         let deadline = tokio::time::Instant::now() + PAGES_WAIT;
         let mut recheck = PAGES_RECHECK;
         let written = loop {
             let (disk, bytes) = (disk.clone(), bytes.clone());
-            let written = tokio::task::spawn_blocking(move || disk.write(location, &bytes))
-                .await
-                .map_err(io::Error::other)
-                .and_then(|written| written);
+            let written = tokio::task::spawn_blocking(move || {
+                disk.applied(issued);
+                disk.write(location, &bytes)
+            })
+            .await
+            .map_err(io::Error::other)
+            .and_then(|written| written);
             match written {
                 Ok(None) if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(recheck).await;

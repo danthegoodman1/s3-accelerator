@@ -1021,6 +1021,14 @@ MUTANTS = [
         [(GATEWAY, "let split = !runs.is_empty();\n        let dispatched", "let split = true;\n        let dispatched")],
     ),
     (
+        "slot records are written on the event loop",
+        [(DISK, "*self.journal.sender.lock().expect(\"journal lock\") = Some(sender);", "drop(sender);")],
+    ),
+    (
+        "a block write skips the journal's earlier entries",
+        [(NODE_ENGINE, "disk.applied(issued);\n                disk.write(location, &bytes)", "disk.write(location, &bytes)")],
+    ),
+    (
         "request IDs never reach nodes",
         [(PEERS, "headers.push((protocol::REQUEST_ID.to_string(), id.to_string()));", "let _ = id;")],
     ),
