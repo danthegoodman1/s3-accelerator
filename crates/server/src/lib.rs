@@ -7,6 +7,7 @@ pub mod config;
 pub mod disk;
 pub mod gateway_engine;
 pub mod http;
+pub mod log;
 pub mod membership_engine;
 pub mod metrics;
 pub mod node_engine;

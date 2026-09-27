@@ -14,6 +14,7 @@
 //! slot waits until none of the slot's old pages are still in use, so a
 //! response in flight keeps the bytes it was sent.
 
+use crate::log;
 use crate::zero_copy::{self, PageCache};
 use rustix::fs::{Advice, FallocateFlags, fadvise, fallocate};
 use s3_accelerator_core::node::{Meta, Recovered, SlotRecord};
@@ -437,7 +438,11 @@ impl Disk {
         fallocate(&self.slabs, flags, offset, len)?;
         // The slot's space again, empty, so the file stays preallocated.
         if let Err(error) = fallocate(&self.slabs, FallocateFlags::KEEP_SIZE, offset, len) {
-            eprintln!("reserving an erased slot's space: {error}");
+            log!(
+                Warn,
+                "reserving an erased slot's space failed",
+                error = error
+            );
         }
         Ok(())
     }

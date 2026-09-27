@@ -26,6 +26,16 @@ pub struct Config {
     pub gateway: Option<GatewayConfig>,
     pub node: Option<NodeConfig>,
     pub admin: Option<AdminConfig>,
+    #[serde(default)]
+    pub log: LogConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogConfig {
+    /// The least severe level written: `error`, `warn`, `info` or `debug`.
+    #[serde(default)]
+    pub level: crate::log::Level,
 }
 
 /// Where the process serves its metrics, health and readiness.

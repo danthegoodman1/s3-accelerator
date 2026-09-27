@@ -8,13 +8,14 @@ use crate::disk::Disk;
 use crate::gateway_engine::{Event, GatewayEngine, SharedGateway};
 use crate::http::{Connection, Framing, RequestHead, Response};
 use crate::http::{etag_condition, format_content_range, header, parse_range, split_path};
+use crate::log;
 use crate::membership_engine::{self, GossipKey};
 use crate::metrics::{Link, Metrics, NodeFailure, Operation, Side};
 use crate::node_engine::{self, NodeEngine};
 use crate::origin::{self, Origin};
 use crate::passthrough::{self, ToNode};
 use crate::peers::{Exchanged, Peers};
-use crate::protocol::{self, NodeAnswer, NodeRequest};
+use crate::protocol::{self, NodeAnswer, NodeRequest, RequestId};
 use crate::sigv4::{self, AuthError, Credentials, Signable};
 use crate::sqs::Queue;
 use crate::tls::{self, Connector, Tls};
@@ -27,6 +28,7 @@ use s3_accelerator_core::node::Node;
 use s3_accelerator_core::placement::NodeId;
 use s3_accelerator_core::s3::{Method, ObjectKey, Request, ResponseHead};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::io;
 use std::path::Path;
 use std::rc::Rc;
@@ -39,6 +41,8 @@ use tokio::sync::watch;
 struct Context {
     gateway: SharedGateway,
     metrics: Rc<Metrics>,
+    /// The state that gives each client request a random ID.
+    request_ids: Cell<u64>,
     clients: Vec<Client>,
     /// Domains the gateway takes virtual-hosted-style requests for.
     domains: Vec<String>,
@@ -52,18 +56,23 @@ pub async fn serve(config: Config) -> io::Result<()> {
     let mut listeners = Listeners::default();
     if let Some(admin) = &config.admin {
         let listener = TcpListener::bind(&admin.listen).await?;
-        eprintln!("admin listening on {}", listener.local_addr()?);
+        log!(Info, "admin listening", address = listener.local_addr()?);
         listeners.admin = Some(listener);
     }
     if let Some(gateway) = &config.gateway {
         let listener = TcpListener::bind(&gateway.listen).await?;
-        eprintln!("gateway listening on {}", listener.local_addr()?);
+        log!(Info, "gateway listening", address = listener.local_addr()?);
         listeners.gateway = Some(listener);
     }
     if let Some(node) = &config.node {
         let address = &config.addresses()[&NodeId(node.id)];
         let listener = TcpListener::bind(address).await?;
-        eprintln!("node {} listening on {}", node.id, listener.local_addr()?);
+        log!(
+            Info,
+            "node listening",
+            node = node.id,
+            address = listener.local_addr()?
+        );
         listeners.node = Some(listener);
     }
     let mut terminate = signal(SignalKind::terminate())?;
@@ -177,11 +186,13 @@ pub async fn run_with(
                 tokio::task::spawn_blocking(move || Disk::open(Path::new(&dir), store))
                     .await
                     .map_err(io::Error::other)??;
-            eprintln!(
-                "node {} read {} slot records in {:.3} s",
-                node.id,
-                recovery.records.len(),
-                opening.elapsed().as_secs_f64()
+            let seconds = format!("{:.3}", opening.elapsed().as_secs_f64());
+            log!(
+                Info,
+                "recovered the store",
+                node = node.id,
+                records = recovery.records.len(),
+                seconds = seconds
             );
             let id = NodeId(node.id);
             let me = config
@@ -244,7 +255,7 @@ pub async fn run_with(
                 joining.joined();
                 leave.await;
                 joining.leaving();
-                eprintln!("leaving the cluster");
+                log!(Info, "leaving the cluster");
                 membership_engine::start_leaving(&membership);
                 tokio::time::sleep(fallback_window).await;
                 membership_engine::leave(&membership);
@@ -281,6 +292,7 @@ pub async fn run_with(
         let context = Rc::new(Context {
             gateway,
             metrics,
+            request_ids: Cell::new(random_seed()),
             clients: config.clients,
             domains,
         });
@@ -306,6 +318,19 @@ async fn measure_loop_delay(metrics: Rc<Metrics>) {
         let due = Instant::now() + DELAY_PERIOD;
         tokio::time::sleep_until(due.into()).await;
         metrics.loop_delay(due.elapsed());
+    }
+}
+
+impl Context {
+    /// A random ID for the next client request: splitmix64 over a seeded
+    /// counter, since the IDs need no secrecy.
+    fn next_request_id(&self) -> RequestId {
+        let state = self.request_ids.get().wrapping_add(0x9e37_79b9_7f4a_7c15);
+        self.request_ids.set(state);
+        let mut id = state;
+        id = (id ^ (id >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        id = (id ^ (id >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        RequestId(id ^ (id >> 31))
     }
 }
 
@@ -351,7 +376,7 @@ async fn serve_clients(
                 return;
             };
             if let Err(error) = serve_connection(connection, &context).await {
-                eprintln!("connection closed: {error}");
+                log!(Debug, "a client connection failed", error = error);
             }
         });
     }
@@ -362,6 +387,8 @@ async fn serve_clients(
 async fn serve_connection(mut connection: Connection, context: &Context) -> io::Result<()> {
     while let Some(head) = connection.read_head().await? {
         let arrived = Instant::now();
+        let id = context.next_request_id();
+        connection.set_request_id(id);
         let host = header(&head.headers, "host");
         let operation = Operation::of(&head, virtual_bucket(host, &context.domains).is_some());
         let served = serve_request(&mut connection, &head, context).await;
@@ -369,6 +396,27 @@ async fn serve_connection(mut connection: Connection, context: &Context) -> io::
             let first_byte = answered.head_sent.saturating_duration_since(arrived);
             let (status, sent) = (answered.status, answered.body_sent);
             context.metrics.request(operation, status, first_byte, sent);
+            let first_byte_ms = format!("{:.3}", first_byte.as_secs_f64() * 1e3);
+            let operation = format!("{operation:?}");
+            if status >= 500 {
+                log!(
+                    Warn,
+                    "answered a client with a server error",
+                    request = id,
+                    operation = operation,
+                    status = status
+                );
+            } else {
+                log!(
+                    Debug,
+                    "answered a client",
+                    request = id,
+                    operation = operation,
+                    status = status,
+                    bytes = sent,
+                    first_byte_ms = first_byte_ms
+                );
+            }
         }
         if !served? {
             return Ok(());
@@ -678,7 +726,10 @@ async fn purge(
             key: key.clone(),
             passed_on: false,
         };
-        match peers.exchange(node, &request).await {
+        match peers
+            .exchange_for(node, &request, connection.request_id())
+            .await
+        {
             Ok(Exchanged {
                 answer: NodeAnswer::Written,
                 body,
@@ -699,11 +750,20 @@ async fn purge(
             }
             Ok(_) => {
                 context.metrics.node_failure(NodeFailure::Error);
-                eprintln!("node {} answered a purge out of protocol", node.0)
+                log!(
+                    Warn,
+                    "a node answered a purge out of protocol",
+                    node = node.0
+                )
             }
             Err(failure) => {
                 context.metrics.node_failure(NodeFailure::of(&failure));
-                eprintln!("purging through node {}: {failure}", node.0)
+                log!(
+                    Warn,
+                    "purging through a node failed",
+                    node = node.0,
+                    error = failure
+                )
             }
         }
     }
@@ -766,7 +826,7 @@ async fn read(
     context: &Context,
 ) -> io::Result<bool> {
     let method = request.method;
-    let mut events = GatewayEngine::read(&context.gateway, request);
+    let mut events = GatewayEngine::read(&context.gateway, request, connection.request_id());
     // Body bytes the started response still owes.
     let mut remaining = None;
     while let Some(event) = events.recv().await {
@@ -1019,14 +1079,22 @@ async fn pass(
     let peers = GatewayEngine::peers(&context.gateway);
     let mut opened = None;
     for node in GatewayEngine::pass_candidates(&context.gateway, &target) {
-        match peers.send_head(node, &forward, request.len).await {
+        match peers
+            .send_head(node, &forward, request.len, connection.request_id())
+            .await
+        {
             Ok(connection) => {
                 opened = Some((node, connection));
                 break;
             }
             Err(failure) => {
                 context.metrics.node_failure(NodeFailure::of(&failure));
-                eprintln!("passing a request to node {}: {failure}", node.0)
+                log!(
+                    Warn,
+                    "passing a request to a node failed",
+                    node = node.0,
+                    error = failure
+                )
             }
         }
     }
@@ -1091,7 +1159,12 @@ async fn pass(
             match answered {
                 Err(failure) => {
                     context.metrics.node_failure(NodeFailure::of(&failure));
-                    eprintln!("passing a request through node {}: {failure}", node.0);
+                    log!(
+                        Warn,
+                        "passing a request through a node failed",
+                        node = node.0,
+                        error = failure
+                    );
                 }
                 Ok(_) => context.metrics.node_failure(NodeFailure::Error),
             }

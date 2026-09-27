@@ -3057,7 +3057,7 @@ impl Simulator {
         }
         for action in self.gateways[gateway].drain() {
             match action {
-                gateway::Action::Send { node, id, read } => {
+                gateway::Action::Send { node, id, read, .. } => {
                     let node = self.route(node.0 as usize, &read);
                     if self.trace {
                         eprintln!(

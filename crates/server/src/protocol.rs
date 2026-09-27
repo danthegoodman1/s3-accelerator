@@ -23,6 +23,19 @@ use s3_accelerator_core::s3::{ETag, Method, ObjectKey, Request, ResponseHead};
 use std::collections::BTreeMap;
 
 pub const SECRET: &str = "x-accel-secret";
+/// Names the client request a node request serves, and a gateway's
+/// response to it.
+pub const REQUEST_ID: &str = "x-accel-request-id";
+
+/// A client request's ID, which follows it to nodes and into logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestId(pub u64);
+
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
 const KIND: &str = "x-accel-read";
 const METHOD: &str = "x-accel-method";
 const STALE: &str = "x-accel-stale";

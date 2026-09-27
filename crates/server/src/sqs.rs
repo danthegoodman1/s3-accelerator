@@ -178,19 +178,10 @@ fn parse_time(time: &str) -> Option<SystemTime> {
         number(clock.next()?)?,
     );
     let millis = number(&format!("{fraction:0<3}")[..3])?;
-    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
+    let seconds =
+        sigv4::days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
     let millis = u64::try_from(seconds * 1_000 + millis).ok()?;
     Some(SystemTime::UNIX_EPOCH + Duration::from_millis(millis))
-}
-
-/// Days from 1970-01-01 to a date in the proleptic Gregorian calendar.
-pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
 }
 
 fn change(record: &Value) -> Result<(ObjectKey, Option<ETag>), String> {
@@ -251,13 +242,6 @@ mod tests {
         let millis = 1_790_512_496_789;
         let earliest = SystemTime::UNIX_EPOCH + Duration::from_millis(millis);
         assert_eq!(read.event_time, Some(earliest));
-    }
-
-    #[test]
-    fn days_count_from_the_epoch() {
-        assert_eq!(days_from_civil(1970, 1, 1), 0);
-        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
-        assert_eq!(days_from_civil(1969, 12, 31), -1);
     }
 
     #[test]

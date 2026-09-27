@@ -2,6 +2,7 @@
 //! responses, and a client writes requests and reads responses. Also the
 //! header formats S3 and the cluster share.
 
+use crate::protocol::{REQUEST_ID, RequestId};
 use crate::tls::Session;
 use bytes::Bytes;
 use percent_encoding::percent_decode_str;
@@ -86,6 +87,9 @@ pub struct Connection {
     /// the body bytes sent since.
     answered: Option<(u16, Instant)>,
     body_sent: u64,
+    /// The ID of the client request being answered, which its response
+    /// names.
+    request_id: Option<RequestId>,
 }
 
 /// A response as it went: its status, when its head was written, and the
@@ -105,6 +109,7 @@ impl Connection {
             owes_close_notify: false,
             answered: None,
             body_sent: 0,
+            request_id: None,
         }
     }
 
@@ -118,6 +123,7 @@ impl Connection {
             owes_close_notify: session.kernel,
             answered: None,
             body_sent: 0,
+            request_id: None,
         }
     }
 
@@ -130,6 +136,15 @@ impl Connection {
     /// Whether the kernel holds the connection's TLS session.
     pub fn kernel_tls(&self) -> bool {
         self.kernel_tls
+    }
+
+    /// Names the client request the next responses answer.
+    pub fn set_request_id(&mut self, id: RequestId) {
+        self.request_id = Some(id);
+    }
+
+    pub fn request_id(&self) -> Option<RequestId> {
+        self.request_id
     }
 
     /// The response written since the last call, if one was.
@@ -351,7 +366,8 @@ impl Connection {
         keep_alive: bool,
         body: &[u8],
     ) -> io::Result<()> {
-        let mut head = response_head(status, headers, framing, keep_alive).into_bytes();
+        let head = response_head(status, headers, framing, keep_alive, self.request_id);
+        let mut head = head.into_bytes();
         if body.len() > COALESCED_BODY {
             self.write_all(&head).await?;
             self.answered = Some((status, Instant::now()));
@@ -373,7 +389,7 @@ impl Connection {
         framing: Framing,
         keep_alive: bool,
     ) -> io::Result<()> {
-        let head = response_head(status, headers, framing, keep_alive);
+        let head = response_head(status, headers, framing, keep_alive, self.request_id);
         self.write_all(head.as_bytes()).await?;
         self.answered = Some((status, Instant::now()));
         self.body_sent = 0;
@@ -489,15 +505,24 @@ pub fn split_path(path: &str) -> (String, String) {
 const COALESCED_BODY: usize = 64 << 10;
 
 /// A response's status line and headers, ending with the blank line.
+/// A response's head. A response to the client request `request_id` names
+/// it, and when S3 gave the response no ID of its own, names it as S3's.
 fn response_head(
     status: u16,
     headers: &[(String, String)],
     framing: Framing,
     keep_alive: bool,
+    request_id: Option<RequestId>,
 ) -> String {
     let mut head = format!("HTTP/1.1 {status} {}\r\n", reason(status));
     for (name, value) in headers {
         head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if let Some(id) = request_id {
+        head.push_str(&format!("{REQUEST_ID}: {id}\r\n"));
+        if header(headers, "x-amz-request-id").is_none() {
+            head.push_str(&format!("x-amz-request-id: {id}\r\n"));
+        }
     }
     match framing {
         Framing::Length(len) => head.push_str(&format!("Content-Length: {len}\r\n")),

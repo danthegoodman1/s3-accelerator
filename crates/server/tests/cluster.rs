@@ -4,9 +4,10 @@
 mod common;
 
 use common::{
-    CLUSTER_CACHE, Cluster, LISTING, data_dir, object, object_of, send, start_origin, start_queue,
-    try_get,
+    CLUSTER_CACHE, Cluster, LISTING, Process, data_dir, listening, object, object_of, send,
+    send_for_headers, start_origin, start_queue, try_get,
 };
+use s3_accelerator::http::header;
 use s3_accelerator::peers::Peers;
 use s3_accelerator::protocol::{NodeAnswer, NodeRequest};
 use s3_accelerator_core::layout::Layout;
@@ -16,6 +17,46 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::time::Duration;
 use tokio::task::LocalSet;
+
+/// A read's ID follows it from the gateway to the node that serves it: both
+/// log their answers to it under the ID the client got.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reads_id_follows_it_to_the_node() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, _) = start_origin().await;
+            let dir = data_dir();
+            let cluster = Cluster::new(&dir, origin_port, CLUSTER_CACHE);
+            for config in [&cluster.node, &cluster.gateway] {
+                let mut text = std::fs::read_to_string(config).unwrap();
+                text.push_str("\n[log]\nlevel = \"debug\"\n");
+                std::fs::write(config, text).unwrap();
+            }
+            let (node_log, gateway_log) = (dir.join("node.log"), dir.join("gateway.log"));
+            let node = Process::logged(&cluster.node, &node_log);
+            listening(cluster.node_port).await;
+            let gateway = Process::logged(&cluster.gateway, &gateway_log);
+            listening(cluster.gateway_port).await;
+            let port = cluster.gateway_port;
+            let (status, headers) = send_for_headers(port, "GET", "/bucket/k", Vec::new()).await;
+            assert_eq!(status, 200);
+            let id = header(&headers, "x-accel-request-id").unwrap().to_string();
+            gateway.stop();
+            node.stop();
+            let answered = |log: &std::path::Path, msg: &str| {
+                let text = std::fs::read_to_string(log).unwrap();
+                let line = text
+                    .lines()
+                    .find(|line| line.contains(&format!("request={id}")))
+                    .unwrap_or_else(|| panic!("no line names {id} in {text}"));
+                assert!(line.contains(&format!("msg=\"{msg}\"")), "{line}");
+                assert!(line.contains(" level=debug "), "{line}");
+            };
+            answered(&gateway_log, "answered a client");
+            answered(&node_log, "answered a read");
+        })
+        .await;
+}
 
 /// A node restarted for a deploy keeps serving its blocks, and the
 /// metadata it saved, without asking S3 again.

@@ -238,7 +238,7 @@ Metrics of every process:
 Each process also exports `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds` and `process_start_time_seconds`, read from `/proc/self` at each scrape.
 
 - **Logs:** one line per event on standard error, in logfmt: `ts`, `level` and `msg`, then fields. `[log] level` sets the least severe level written: `error`, `warn`, `info` (the default) or `debug`. Failures log at `warn`; starts, recoveries, ring changes and departures at `info`; at `debug`, gateways and nodes also log each request they answer.
-- **Request IDs:** a gateway gives each client request a random 64-bit ID and sends it to nodes in `x-accel-request-id`. Every response carries it in `x-accel-request-id`, and a response the cache serves also carries it as `x-amz-request-id`, the header S3 clients print; a passed-through response keeps S3's. Log lines about a request carry its ID as `request`. When S3 fails a request, the node logs S3's `x-amz-request-id` and `x-amz-id-2`, beside the client's request ID when it passed the client's request through.
+- **Request IDs:** a gateway gives each client request a random 64-bit ID and sends it to nodes in `x-accel-request-id`. Every response carries it in `x-accel-request-id`, and a response S3 did not give also carries it as `x-amz-request-id`, the header S3 clients print; a passed-through response keeps S3's. Log lines about a request carry its ID as `request`. When S3 fails a request, the node logs S3's `x-amz-request-id` and `x-amz-id-2`, beside the client's request ID when it passed the client's request through.
 
 ## Open questions
 

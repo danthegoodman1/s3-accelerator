@@ -4,16 +4,18 @@ reports whether the core's unit tests, the server's tests, its kernel TLS
 tests, the simulator's tests (scenarios and regression seeds) or a seed
 sweep catch each one.
 
-    scripts/mutants [--seeds N] [--only NAME] [--check]
+    scripts/mutants [--seeds N] [--only NAME]... [--check] [--no-baseline]
 
 The kernel TLS tests need the tls module (`sudo modprobe tls`).
 
 A mutant is a list of replacements; each must match exactly once, ignoring
 whitespace, so formatting changes leave the mutants intact. The copy lives
 in target/mutants/src and shares one target directory: dependencies build
-once, and every workspace crate rebuilds for each mutant. A step that hangs counts as a catch,
-and is killed with every process it started. Exits
-non-zero if any mutant goes uncaught or fails to build.
+once, and every workspace crate rebuilds for each mutant. First the
+unmutated code runs every layer, since a layer that fails without a mutant
+would claim to catch them all. A step that hangs counts as a catch, and is
+killed with every process it started. Exits non-zero if the unmutated code
+fails, or any mutant goes uncaught or fails to build.
 """
 
 import argparse
@@ -44,6 +46,7 @@ TLS = "crates/server/src/tls.rs"
 PEERS = "crates/server/src/peers.rs"
 METRICS = "crates/server/src/metrics.rs"
 ADMIN = "crates/server/src/admin.rs"
+LOG = "crates/server/src/log.rs"
 SIGV4 = "crates/server/src/sigv4.rs"
 STEP_TIMEOUT = 600
 
@@ -978,6 +981,18 @@ MUTANTS = [
         [(METRICS, '("source=\\"cache\\"", stats.hit_bytes),', '("source=\\"cache\\"", stats.miss_bytes),')],
     ),
     (
+        "request IDs never reach nodes",
+        [(PEERS, "headers.push((protocol::REQUEST_ID.to_string(), id.to_string()));", "let _ = id;")],
+    ),
+    (
+        "responses S3 did not give lack an S3 request ID",
+        [(HTTP, 'head.push_str(&format!("x-amz-request-id: {id}\\r\\n"));', "")],
+    ),
+    (
+        "log values with spaces go unquoted",
+        [(LOG, "char == ' ' || char == '='", "char == '='")],
+    ),
+    (
         "a disowned block's eviction is counted as cold",
         [(STORE, "Some(_) => return Some(self.evict(key, true).extent),",
                  "Some(_) => return Some(self.evict(key, false).extent),")],
@@ -990,8 +1005,10 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--seeds", type=int, default=300)
-    parser.add_argument("--only")
+    parser.add_argument("--only", action="append", help="run only this mutant; repeatable")
     parser.add_argument("--check", action="store_true", help="only check that every mutant applies")
+    parser.add_argument("--no-baseline", action="store_true",
+                        help="skip checking that the unmutated code passes every layer")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent.parent
@@ -1002,7 +1019,7 @@ def main():
     if args.check:
         broken = 0
         for name, replacements in MUTANTS:
-            if args.only and args.only != name:
+            if args.only and name not in args.only:
                 continue
             for path, old, new in replacements:
                 count = len(list(re.finditer(pattern(old), (root / path).read_text())))
@@ -1012,16 +1029,18 @@ def main():
         sys.exit(1 if broken else 0)
     if not Path("/proc/net/tls_stat").exists():
         sys.exit("the kernel TLS tests need the tls module: sudo modprobe tls")
+    # A layer that fails without a mutant would claim to catch every one.
+    if not args.no_baseline:
+        print("== baseline", flush=True)
+        fresh_copy(root, copy)
+        outcome = catch(copy, target, args.seeds)
+        if outcome != "MISSED":
+            sys.exit(f"the unmutated code fails: {outcome}")
     for name, replacements in MUTANTS:
-        if args.only and args.only != name:
+        if args.only and name not in args.only:
             continue
         print(f"== {name}", flush=True)
-        if copy.exists():
-            shutil.rmtree(copy)
-        # Fresh modification times make cargo rebuild every workspace crate,
-        # so no crate keeps the previous mutant's build.
-        shutil.copytree(root, copy, ignore=shutil.ignore_patterns("target", ".git"),
-                        copy_function=shutil.copy)
+        fresh_copy(root, copy)
         for path, old, new in replacements:
             file = copy / path
             text = file.read_text()
@@ -1038,6 +1057,15 @@ def main():
         print(f"{name:<{width}}  {outcome}")
     if any(outcome in ("MISSED", "did not build") for _, outcome in results):
         sys.exit(1)
+
+
+def fresh_copy(root, copy):
+    """Copies the tree to `copy`. Fresh modification times make cargo
+    rebuild every workspace crate, so no crate keeps an earlier build."""
+    if copy.exists():
+        shutil.rmtree(copy)
+    shutil.copytree(root, copy, ignore=shutil.ignore_patterns("target", ".git"),
+                    copy_function=shutil.copy)
 
 
 def pattern(old):

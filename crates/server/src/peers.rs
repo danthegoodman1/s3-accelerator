@@ -3,7 +3,7 @@
 //! requests, and answers whose bodies stay in their connections until read.
 
 use crate::http::{Connection, header};
-use crate::protocol::{self, NodeAnswer, NodeRequest, Versions};
+use crate::protocol::{self, NodeAnswer, NodeRequest, RequestId, Versions};
 use crate::tls::Connector;
 use bytes::Bytes;
 use rustix::io::Errno;
@@ -95,16 +95,27 @@ impl Peers {
     /// body in the connection. An idle connection the node has since closed
     /// gets one retry on a new one.
     pub async fn exchange(&self, node: NodeId, request: &NodeRequest) -> io::Result<Exchanged> {
+        self.exchange_for(node, request, None).await
+    }
+
+    /// As `exchange`, for the client request `id`.
+    pub async fn exchange_for(
+        &self,
+        node: NodeId,
+        request: &NodeRequest,
+        id: Option<RequestId>,
+    ) -> io::Result<Exchanged> {
         let address = self.addresses.borrow().get(&node).cloned();
         let address =
             address.ok_or_else(|| io::Error::other(format!("no address for node {}", node.0)))?;
         let address = address.as_str();
+        let secret = &self.secret;
         let (answer, versions, len, connection) = match self.take_idle(node) {
-            Some(connection) => match exchange_on(connection, request, &self.secret).await {
+            Some(connection) => match exchange_on(connection, request, secret, id).await {
                 Ok(exchanged) => exchanged,
-                Err(_) => exchange_on(self.connect(address).await?, request, &self.secret).await?,
+                Err(_) => exchange_on(self.connect(address).await?, request, secret, id).await?,
             },
-            None => exchange_on(self.connect(address).await?, request, &self.secret).await?,
+            None => exchange_on(self.connect(address).await?, request, secret, id).await?,
         };
         let body = NodeBody {
             node,
@@ -118,13 +129,15 @@ impl Peers {
         })
     }
 
-    /// Sends `request`'s head to `node`, and returns the connection, which
-    /// takes the request's `len`-byte body next.
+    /// Sends the head of `request`, for the client request `id`, to `node`,
+    /// and returns the connection, which takes the request's `len`-byte body
+    /// next.
     pub async fn send_head(
         &self,
         node: NodeId,
         request: &NodeRequest,
         len: u64,
+        id: Option<RequestId>,
     ) -> io::Result<Connection> {
         let mut connection = match self.take_idle(node) {
             Some(connection) => connection,
@@ -135,7 +148,7 @@ impl Peers {
                 self.connect(&address).await?
             }
         };
-        let (method, target, headers) = protocol::encode_request(request, &self.secret);
+        let (method, target, headers) = encode(request, &self.secret, id);
         connection
             .write_request_head(method, &target, &headers, len)
             .await?;
@@ -209,12 +222,27 @@ fn open(connection: &Connection) -> bool {
     )
 }
 
+/// A request's method, target and headers, which name the client request
+/// `id` it serves.
+fn encode(
+    request: &NodeRequest,
+    secret: &str,
+    id: Option<RequestId>,
+) -> (&'static str, String, Vec<(String, String)>) {
+    let (method, target, mut headers) = protocol::encode_request(request, secret);
+    if let Some(id) = id {
+        headers.push((protocol::REQUEST_ID.to_string(), id.to_string()));
+    }
+    (method, target, headers)
+}
+
 async fn exchange_on(
     mut connection: Connection,
     request: &NodeRequest,
     secret: &str,
+    id: Option<RequestId>,
 ) -> io::Result<(NodeAnswer, Option<Versions>, u64, Connection)> {
-    let (method, target, headers) = protocol::encode_request(request, secret);
+    let (method, target, headers) = encode(request, secret, id);
     connection
         .write_request(method, &target, &headers, &[])
         .await?;

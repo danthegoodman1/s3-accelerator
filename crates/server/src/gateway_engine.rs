@@ -5,9 +5,10 @@
 //! Every answer names the version of its node's ring, and the gateway
 //! fetches a ring whose version differs from its own.
 
+use crate::log;
 use crate::metrics::{Metrics, NodeFailure};
 use crate::peers::{Exchanged, NodeBody, Peers};
-use crate::protocol::{Hint, NodeAnswer, NodeRequest, Versions};
+use crate::protocol::{Hint, NodeAnswer, NodeRequest, RequestId, Versions};
 use s3_accelerator_core::Time;
 use s3_accelerator_core::gateway::{self, ClientRequestId, Gateway, NodeRequestId};
 use s3_accelerator_core::node::{HotHint, Read};
@@ -50,11 +51,13 @@ pub struct GatewayEngine {
     peers: Rc<Peers>,
     next_id: u64,
     clients: BTreeMap<ClientRequestId, mpsc::UnboundedSender<Event>>,
+    /// Each client read's ID, which its node requests carry.
+    request_ids: BTreeMap<ClientRequestId, RequestId>,
     /// Nodes' answered bodies, until forwarded or discarded.
     relayed: BTreeMap<NodeRequestId, NodeBody>,
-    /// Reads to send to nodes, and nodes to fetch rings from, or `None` to
-    /// try every node known.
-    sends: Vec<(NodeId, NodeRequestId, Read)>,
+    /// Reads to send to nodes, with their client reads' IDs, and nodes to
+    /// fetch rings from, or `None` to try every node known.
+    sends: Vec<(NodeId, NodeRequestId, Read, Option<RequestId>)>,
     ring_fetches: Vec<Option<NodeId>>,
 }
 
@@ -72,21 +75,29 @@ impl GatewayEngine {
             peers,
             next_id: 0,
             clients: BTreeMap::new(),
+            request_ids: BTreeMap::new(),
             relayed: BTreeMap::new(),
             sends: Vec::new(),
             ring_fetches: Vec::new(),
         }))
     }
 
-    /// Serves a `GetObject` or `HeadObject`; what to answer arrives on the
-    /// receiver.
-    pub fn read(engine: &SharedGateway, request: Request) -> mpsc::UnboundedReceiver<Event> {
+    /// Serves a `GetObject` or `HeadObject` whose ID is `request_id`; what
+    /// to answer arrives on the receiver.
+    pub fn read(
+        engine: &SharedGateway,
+        request: Request,
+        request_id: Option<RequestId>,
+    ) -> mpsc::UnboundedReceiver<Event> {
         let (sender, receiver) = mpsc::unbounded_channel();
         let work = {
             let mut this = engine.borrow_mut();
             this.next_id += 1;
             let id = ClientRequestId(this.next_id);
             this.clients.insert(id, sender);
+            if let Some(request_id) = request_id {
+                this.request_ids.insert(id, request_id);
+            }
             let now = this.now();
             this.gateway.on_request(now, id, request);
             this.pump()
@@ -161,7 +172,12 @@ impl GatewayEngine {
                             heard.borrow_mut()[index] = true;
                         }
                         Err(error) => {
-                            eprintln!("telling node {} of a write: {error}", home.0);
+                            log!(
+                                Warn,
+                                "telling a home of a write failed",
+                                node = home.0,
+                                error = error
+                            );
                             return;
                         }
                     }
@@ -170,7 +186,7 @@ impl GatewayEngine {
         }
         let told = async { while telling.join_next().await.is_some() {} };
         if tokio::time::timeout(WRITTEN_WAIT, told).await.is_err() {
-            eprintln!("homes took too long to hear of writes");
+            log!(Warn, "homes took too long to hear of writes");
         }
         let heard = heard.borrow();
         let mut this = engine.borrow_mut();
@@ -221,7 +237,13 @@ impl GatewayEngine {
     pub fn tick(engine: &SharedGateway) {
         let work = {
             let mut this = engine.borrow_mut();
-            this.clients.retain(|_, client| !client.is_closed());
+            let GatewayEngine {
+                clients,
+                request_ids,
+                ..
+            } = &mut *this;
+            clients.retain(|_, client| !client.is_closed());
+            request_ids.retain(|id, _| clients.contains_key(id));
             let now = this.now();
             this.gateway.on_tick(now);
             this.pump()
@@ -248,7 +270,15 @@ impl GatewayEngine {
 
     fn act(&mut self, action: gateway::Action) {
         match action {
-            gateway::Action::Send { node, id, read } => self.sends.push((node, id, read)),
+            gateway::Action::Send {
+                node,
+                id,
+                read,
+                request,
+            } => {
+                let request_id = self.request_ids.get(&request).copied();
+                self.sends.push((node, id, read, request_id));
+            }
             gateway::Action::Start { request, head } => {
                 self.tell(request, Event::Start(head));
             }
@@ -268,10 +298,12 @@ impl GatewayEngine {
             gateway::Action::Abort { request } => {
                 self.tell(request, Event::Abort);
                 self.clients.remove(&request);
+                self.request_ids.remove(&request);
             }
             gateway::Action::Respond { request, head } => {
                 self.tell(request, Event::Respond(head));
                 self.clients.remove(&request);
+                self.request_ids.remove(&request);
             }
             gateway::Action::Discard { id } => {
                 if let Some(body) = self.relayed.remove(&id) {
@@ -309,7 +341,7 @@ fn hints(now: Time, hot: Vec<Hint>) -> Vec<HotHint> {
 
 /// What the gateway's actions left to start.
 struct Work {
-    sends: Vec<(NodeId, NodeRequestId, Read)>,
+    sends: Vec<(NodeId, NodeRequestId, Read, Option<RequestId>)>,
     ring_fetches: Vec<Option<NodeId>>,
 }
 
@@ -317,12 +349,12 @@ struct Work {
 /// gateway, and fetches each ring asked for. A node that cannot be reached,
 /// or answers out of protocol, fails the read over at once, as a 5xx does.
 fn start(engine: &SharedGateway, work: Work) {
-    for (node, id, read) in work.sends {
+    for (node, id, read, request_id) in work.sends {
         let engine = engine.clone();
         tokio::task::spawn_local(async move {
             let peers = engine.borrow().peers.clone();
             let request = NodeRequest::Read(read);
-            let exchanged = peers.exchange(node, &request).await;
+            let exchanged = peers.exchange_for(node, &request, request_id).await;
             let work = {
                 let mut this = engine.borrow_mut();
                 let now = this.now();
@@ -365,7 +397,12 @@ fn start(engine: &SharedGateway, work: Work) {
                     }
                     Err(error) => {
                         this.metrics.node_failure(NodeFailure::of(&error));
-                        eprintln!("reading from node {}: {error}", node.0);
+                        log!(
+                            Warn,
+                            "reading from a node failed",
+                            node = node.0,
+                            error = error
+                        );
                         this.gateway.on_node_unreachable(now, id);
                     }
                 }
@@ -412,18 +449,22 @@ fn start(engine: &SharedGateway, work: Work) {
                     }
                     Ok(Ok(_)) => {
                         engine.borrow().metrics.node_failure(NodeFailure::Error);
-                        eprintln!("node {} answered a ring request out of protocol", node.0)
+                        log!(
+                            Warn,
+                            "a node answered a ring request out of protocol",
+                            node = node.0
+                        )
                     }
                     Ok(Err(error)) => {
                         engine
                             .borrow()
                             .metrics
                             .node_failure(NodeFailure::of(&error));
-                        eprintln!("fetching node {}'s ring: {error}", node.0)
+                        log!(Warn, "fetching a ring failed", node = node.0, error = error)
                     }
                     Err(_) => {
                         engine.borrow().metrics.node_failure(NodeFailure::Timeout);
-                        eprintln!("fetching node {}'s ring: timed out", node.0)
+                        log!(Warn, "fetching a ring timed out", node = node.0)
                     }
                 }
             }

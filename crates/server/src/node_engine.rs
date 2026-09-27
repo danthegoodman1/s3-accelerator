@@ -11,6 +11,7 @@
 
 use crate::disk::Disk;
 use crate::http::{Connection, Framing, Response, header};
+use crate::log;
 use crate::metrics::{Link, Metrics, S3Kind};
 use crate::origin::{self, Origin, OriginBody};
 use crate::passthrough;
@@ -517,7 +518,7 @@ impl NodeEngine {
                 let disk = this.disk.clone();
                 tokio::task::spawn_blocking(move || {
                     if let Err(error) = disk.sync_metadata() {
-                        eprintln!("syncing the metadata file: {error}");
+                        log!(Warn, "syncing the metadata file failed", error = error);
                     }
                 });
             }
@@ -626,12 +627,22 @@ impl NodeEngine {
             },
             node::Action::Record { location, record } => {
                 if let Err(error) = self.disk.record(location, record) {
-                    eprintln!("recording {location:?}: {error}");
+                    log!(
+                        Warn,
+                        "recording a slot failed",
+                        location = format!("{location:?}"),
+                        error = error
+                    );
                 }
             }
             node::Action::Clear { location } => {
                 if let Err(error) = self.disk.clear(location) {
-                    eprintln!("clearing {location:?}: {error}");
+                    log!(
+                        Warn,
+                        "clearing a slot failed",
+                        location = format!("{location:?}"),
+                        error = error
+                    );
                 }
             }
             node::Action::Remember { key, meta } => self.save(&key, Some(&meta)),
@@ -659,13 +670,23 @@ impl NodeEngine {
             node::Action::Erase { location, len } => match self.disk.erase(location, len) {
                 Ok(()) => self.work.erased |= !self.purging,
                 Err(error) => {
-                    eprintln!("erasing {location:?}: {error}");
+                    log!(
+                        Warn,
+                        "erasing a slot failed",
+                        location = format!("{location:?}"),
+                        error = error
+                    );
                     self.purge_failed |= self.purging;
                 }
             },
             node::Action::SavePurge { key, nodes } => {
                 if let Err(error) = self.disk.save_purge(&key, &nodes) {
-                    eprintln!("saving the purge of {key:?}: {error}");
+                    log!(
+                        Warn,
+                        "saving a purge failed",
+                        key = named(&key),
+                        error = error
+                    );
                     self.purge_failed = true;
                 }
             }
@@ -800,7 +821,12 @@ impl NodeEngine {
         }
         match self.disk.append(key, meta) {
             Ok(()) => self.unsynced_metadata = true,
-            Err(error) => eprintln!("saving metadata of {key:?}: {error}"),
+            Err(error) => log!(
+                Warn,
+                "saving metadata failed",
+                key = named(key),
+                error = error
+            ),
         }
     }
 
@@ -843,7 +869,7 @@ async fn rewrite_metadata(engine: SharedNode, entries: Vec<(ObjectKey, node::Met
             .map_err(io::Error::other)
             .and_then(|result| result)
         {
-            eprintln!("rewriting the metadata file: {error}");
+            log!(Warn, "rewriting the metadata file failed", error = error);
         }
         let mut this = engine.borrow_mut();
         match this.next_rewrite.take() {
@@ -867,7 +893,7 @@ fn start(engine: &SharedNode, work: Work) {
         let disk = engine.borrow().disk.clone();
         tokio::task::spawn_blocking(move || {
             if let Err(error) = disk.sync_slabs() {
-                eprintln!("syncing erased slots: {error}");
+                log!(Warn, "syncing erased slots failed", error = error);
             }
         });
     }
@@ -894,7 +920,12 @@ fn start(engine: &SharedNode, work: Work) {
             };
             match peers.exchange(node, &request).await {
                 Ok(exchanged) => peers.idle(exchanged.body),
-                Err(error) => eprintln!("passing a write to node {}: {error}", node.0),
+                Err(error) => log!(
+                    Warn,
+                    "passing a write on failed",
+                    node = node.0,
+                    error = error
+                ),
             }
         });
     }
@@ -916,9 +947,18 @@ fn start(engine: &SharedNode, work: Work) {
                     peers.idle(body);
                     NodeEngine::purge_confirmed(&engine, &key, node);
                 }
-                Ok(Ok(_)) => eprintln!("node {} answered a purge out of protocol", node.0),
-                Ok(Err(error)) => eprintln!("passing a purge to node {}: {error}", node.0),
-                Err(_) => eprintln!("passing a purge to node {}: timed out", node.0),
+                Ok(Ok(_)) => log!(
+                    Warn,
+                    "a node answered a purge out of protocol",
+                    node = node.0
+                ),
+                Ok(Err(error)) => log!(
+                    Warn,
+                    "passing a purge on failed",
+                    node = node.0,
+                    error = error
+                ),
+                Err(_) => log!(Warn, "passing a purge on timed out", node = node.0),
             }
         });
     }
@@ -928,8 +968,13 @@ fn start(engine: &SharedNode, work: Work) {
             let told = tokio::time::timeout(PASS_WAIT, peers.exchange(node, &request)).await;
             match told {
                 Ok(Ok(exchanged)) => peers.idle(exchanged.body),
-                Ok(Err(error)) => eprintln!("telling node {} of a lease: {error}", node.0),
-                Err(_) => eprintln!("telling node {} of a lease: timed out", node.0),
+                Ok(Err(error)) => log!(
+                    Warn,
+                    "telling a node of a lease failed",
+                    node = node.0,
+                    error = error
+                ),
+                Err(_) => log!(Warn, "telling a node of a lease timed out", node = node.0),
             }
         });
     }
@@ -945,7 +990,12 @@ fn start(engine: &SharedNode, work: Work) {
                     true
                 }
                 Ok(Err(error)) => {
-                    eprintln!("passing an event to node {}: {error}", node.0);
+                    log!(
+                        Warn,
+                        "passing an event on failed",
+                        node = node.0,
+                        error = error
+                    );
                     false
                 }
                 Err(_) => false,
@@ -960,7 +1010,7 @@ fn start(engine: &SharedNode, work: Work) {
             let queue = queue.clone();
             tokio::task::spawn_local(async move {
                 if let Err(error) = queue.delete(&receipt).await {
-                    eprintln!("deleting an event message: {error}");
+                    log!(Warn, "deleting an event message failed", error = error);
                 }
             });
         }
@@ -1023,6 +1073,19 @@ async fn fetch(engine: SharedNode, origin: OriginRequestId, request: Request, st
         let mut this = engine.borrow_mut();
         this.tasks.remove(&origin);
         this.metrics.s3_request(S3Kind::Read, reply.answered);
+        let status = reply.answered.map(|(status, _)| status);
+        if status.is_none_or(|status| status >= 500) {
+            let status = status.map_or("none".to_string(), |status| status.to_string());
+            let (s3_request, s3_id2) = reply.ids.clone().unwrap_or_default();
+            log!(
+                Warn,
+                "S3 failed a read",
+                key = named(&request.key),
+                status = status,
+                s3_request_id = s3_request,
+                s3_id2 = s3_id2
+            );
+        }
         let arriving = match reply.body {
             OriginBody::Held(bytes) => {
                 this.bodies.insert(origin, Body::Held(bytes));
@@ -1239,7 +1302,12 @@ fn write(engine: &SharedNode, location: Location, bytes: Bytes) {
                     this.node.on_written(location);
                 }
                 Err(error) => {
-                    eprintln!("writing {location:?}: {error}");
+                    log!(
+                        Warn,
+                        "writing a block failed",
+                        location = format!("{location:?}"),
+                        error = error
+                    );
                     this.node.on_write_failed(location);
                 }
             }
@@ -1247,6 +1315,11 @@ fn write(engine: &SharedNode, location: Location, bytes: Bytes) {
         };
         start(&engine, work);
     });
+}
+
+/// `bucket/key`, for logs.
+fn named(key: &ObjectKey) -> String {
+    format!("{}/{}", key.bucket, key.key)
 }
 
 /// How long each poll of the event queue waits for messages.
@@ -1262,7 +1335,7 @@ pub async fn take_events(engine: SharedNode, queue: Rc<Queue>, visibility: Durat
         let offered = match queue.receive(EVENTS_WAIT, visibility).await {
             Ok(offered) => offered,
             Err(error) => {
-                eprintln!("polling the event queue: {error}");
+                log!(Warn, "polling the event queue failed", error = error);
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -1284,10 +1357,10 @@ pub async fn take_events(engine: SharedNode, queue: Rc<Queue>, visibility: Durat
                 }
                 read => {
                     if let Err(error) = read {
-                        eprintln!("an event message: {error}");
+                        log!(Warn, "an event message is unreadable", error = error);
                     }
                     if let Err(error) = queue.delete(&message.receipt).await {
-                        eprintln!("deleting an event message: {error}");
+                        log!(Warn, "deleting an event message failed", error = error);
                     }
                 }
             }
@@ -1328,7 +1401,7 @@ pub async fn serve(
                 return;
             };
             if let Err(error) = serve_connection(connection, &engine, &secret).await {
-                eprintln!("gateway connection closed: {error}");
+                log!(Debug, "a gateway connection failed", error = error);
             }
         });
     }
@@ -1357,14 +1430,18 @@ async fn serve_connection(
         if !given.is_some_and(|given| constant_time_eq(given.as_bytes(), secret.as_bytes())) {
             return refuse(&mut connection, 403, len).await;
         }
+        let request_id = header(&head.headers, protocol::REQUEST_ID).unwrap_or("none");
         let request = protocol::decode_request(&head.path, &head.query, &head.headers, len);
         let request = match request {
             Err(error) => {
-                eprintln!("a gateway's request: {error}");
+                log!(Warn, "a gateway's request is malformed", error = error);
                 return refuse(&mut connection, 400, len).await;
             }
             Ok(NodeRequest::Forward(forward)) => {
-                if forward_to_s3(&mut connection, engine, &forward, head.keep_alive).await? {
+                let keep_alive = head.keep_alive;
+                let forwarded =
+                    forward_to_s3(&mut connection, engine, &forward, keep_alive, request_id);
+                if forwarded.await? {
                     continue;
                 }
                 return Ok(());
@@ -1450,6 +1527,10 @@ async fn serve_connection(
         };
         let versions = NodeEngine::versions(engine);
         let (status, headers) = protocol::encode_answer(&reply.answer, versions);
+        let answered = match &reply.answer {
+            NodeAnswer::Respond { head, .. } => Some(head.status),
+            _ => None,
+        };
         let framing = Framing::Length(reply.len);
         let sent = async {
             // A small body the node holds goes out with the head.
@@ -1471,6 +1552,27 @@ async fn serve_connection(
         .await;
         if let Some(request) = reply.sending {
             NodeEngine::sent(engine, request);
+        }
+        let bytes = *sent.as_ref().unwrap_or(&0);
+        match answered {
+            Some(status) if status >= 500 => {
+                log!(
+                    Warn,
+                    "answered a read with a server error",
+                    request = request_id,
+                    status = status
+                );
+            }
+            Some(status) => {
+                log!(
+                    Debug,
+                    "answered a read",
+                    request = request_id,
+                    status = status,
+                    bytes = bytes
+                );
+            }
+            None => {}
         }
         // A body that ended short ends the connection, which tells the
         // gateway.
@@ -1497,15 +1599,17 @@ async fn refuse(connection: &mut Connection, status: u16, len: u64) -> io::Resul
     Ok(())
 }
 
-/// Passes a gateway's forwarded request to S3 and S3's answer back, and
-/// returns whether the connection can take another request. A write S3
-/// accepted changes the node's view of its object before the gateway
-/// hears, so the gateway's next read sees the write.
+/// Passes a gateway's `forward`, for the client request `request_id`, to
+/// S3 and S3's answer back, and returns whether the connection can take
+/// another request. A write S3 accepted changes the node's view of its
+/// object before the gateway hears, so the gateway's next read sees the
+/// write.
 async fn forward_to_s3(
     connection: &mut Connection,
     engine: &SharedNode,
     forward: &Forward,
     keep_alive: bool,
+    request_id: &str,
 ) -> io::Result<bool> {
     let origin = engine.borrow().origin.clone();
     let key = passthrough::written_key(&forward.method, &forward.path);
@@ -1531,13 +1635,37 @@ async fn forward_to_s3(
         Ok(response) => response,
         Err(error) => {
             engine.borrow_mut().warm_budget += reserved;
-            eprintln!("forwarding to S3: {error}");
+            log!(
+                Warn,
+                "forwarding to S3 failed",
+                request = request_id,
+                error = error
+            );
             let unread = if sent.body_read { 0 } else { forward.len };
             refuse(connection, 502, unread).await?;
             return Ok(false);
         }
     };
     let status = response.status().as_u16();
+    if status >= 500 {
+        let (s3_request, s3_id2) =
+            origin::request_ids(&origin::header_pairs(response.headers())).unwrap_or_default();
+        log!(
+            Warn,
+            "S3 failed a forwarded request",
+            request = request_id,
+            status = status,
+            s3_request_id = s3_request,
+            s3_id2 = s3_id2
+        );
+    } else {
+        log!(
+            Debug,
+            "forwarded a request",
+            request = request_id,
+            status = status
+        );
+    }
     match key {
         Some(key) if status < 300 => {
             NodeEngine::written(engine, &key, false);

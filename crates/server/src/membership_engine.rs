@@ -6,6 +6,7 @@
 //! that held it. A leaving node drops out of every ring at once, serves its
 //! blocks to their new owners through the fallback window, and then stops.
 
+use crate::log;
 use crate::node_engine::{NodeEngine, SharedNode};
 use crate::peers::{Exchanged, Peers};
 use crate::protocol::{NodeAnswer, NodeRequest};
@@ -218,7 +219,12 @@ fn refresh(engine: &SharedMembership) {
                 Ok(Some(resolved)) => {
                     this.resolved.insert(id, (address, resolved));
                 }
-                _ => eprintln!("node {}'s address {address} does not resolve", id.0),
+                _ => log!(
+                    Warn,
+                    "a node's address does not resolve",
+                    node = id.0,
+                    address = address
+                ),
             }
         });
     }
@@ -257,7 +263,9 @@ fn apply(engine: &SharedMembership) {
                     (this.node.clone(), this.membership.addresses())
                 };
                 let members: Vec<u64> = ring.members().iter().map(|member| member.id.0).collect();
-                eprintln!("ring {:016x}: nodes {members:?}", ring.version());
+                let version = format!("{:016x}", ring.version());
+                let members = format!("{members:?}");
+                log!(Info, "adopted a ring", version = version, nodes = members);
                 NodeEngine::on_ring(&node, ring, addresses);
             }
             membership::Action::Down(down) => {

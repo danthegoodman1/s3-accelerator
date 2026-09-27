@@ -1,7 +1,7 @@
 //! The gateway and storage node binary. `s3-accelerator CONFIG` runs the
 //! gateway, the storage node, or both, as the config says.
 
-use s3_accelerator::{config, server};
+use s3_accelerator::{config, log, server};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -20,6 +20,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    log::set_level(config.log.level);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -28,7 +29,7 @@ fn main() -> ExitCode {
     match local.block_on(&runtime, server::serve(config)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("s3-accelerator: {error}");
+            log!(Error, "the process stopped", error = error);
             ExitCode::FAILURE
         }
     }

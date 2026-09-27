@@ -8,6 +8,7 @@
 
 use crate::config::{ClusterTlsConfig, TlsConfig};
 use crate::http::Connection;
+use crate::log;
 use crate::metrics::{Link, Metrics};
 use ktls::{CompatibleCiphers, CorkStream};
 use rustls::client::Resumption;
@@ -62,8 +63,9 @@ pub async fn kernel(wanted: bool) -> Option<CompatibleCiphers> {
         tls13.aes_gcm_128 || tls13.aes_gcm_256 || tls13.chacha20_poly1305
     });
     if ciphers.is_none() {
-        eprintln!(
-            "the kernel cannot take TLS sessions (is the tls module loaded?); using userspace TLS"
+        log!(
+            Warn,
+            "the kernel cannot take TLS sessions, so TLS runs in userspace; is the tls module loaded?"
         );
     }
     ciphers
@@ -214,12 +216,12 @@ pub async fn accept(
         Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => None,
         Ok(Err(error)) => {
             metrics.tls_failure(link);
-            eprintln!("a TLS handshake failed: {error}");
+            log!(Warn, "a TLS handshake failed", error = error);
             None
         }
         Err(_) => {
             metrics.tls_failure(link);
-            eprintln!("a TLS handshake timed out");
+            log!(Warn, "a TLS handshake timed out");
             None
         }
     }

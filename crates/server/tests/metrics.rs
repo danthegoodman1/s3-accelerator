@@ -3,8 +3,10 @@
 
 mod common;
 
-use common::{Server, admin, data_dir, sample, send, start_origin};
+use common::{S3_REQUEST_ID, SIZE, Server, admin, data_dir, sample, send, send_for_headers};
+use common::{start, start_origin};
 use s3_accelerator::config::Config;
+use s3_accelerator::http::header;
 use s3_accelerator::server::{self, Listeners};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -18,9 +20,13 @@ async fn metrics_agree_with_s3s_log_and_the_clients_bytes() {
             let dir = data_dir();
             let server = Server::start(origin_port, &dir, r#"{ bucket = "bucket" }"#, "").await;
             let port = server.port;
-            // A first fetch, a fill the doorkeeper now admits, and a hit.
+            // A first fetch, a fill the doorkeeper now admits, and, once
+            // the fill's blocks are on disk, a hit.
             let mut received = 0;
-            for _ in 0..3 {
+            for read in 0..3 {
+                if read == 2 {
+                    written_bytes(server.admin_port, SIZE as u64).await;
+                }
                 let (status, body) = send(port, "GET", "/bucket/k", "", &[], Vec::new()).await;
                 assert_eq!(status, 200);
                 received += body.len() as u64;
@@ -66,6 +72,19 @@ async fn metrics_agree_with_s3s_log_and_the_clients_bytes() {
             server.stop().await;
         })
         .await;
+}
+
+/// Waits until the node has written `bytes` of blocks.
+async fn written_bytes(admin_port: u16, bytes: u64) {
+    let started = Instant::now();
+    loop {
+        let (_, scrape) = admin(admin_port, "/metrics").await;
+        if sample(&scrape, "s3accel_node_written_bytes_total", "") as u64 >= bytes {
+            return;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// A seed that takes connections and never answers holds a starting node
@@ -116,21 +135,52 @@ async fn readiness_waits_for_the_node_to_join() {
             let started = Instant::now();
             tokio::task::spawn_local(server::run(config, listeners, std::future::pending()));
             assert_eq!(admin(admin_port, "/healthz").await, (200, "ok\n".into()));
-            let (status, waiting) = admin(admin_port, "/readyz").await;
-            assert_eq!(status, 503);
-            assert!(waiting.contains("joining"), "{waiting}");
+            // The node recovers, then waits on the seed.
+            let mut joining = false;
             loop {
                 let (status, body) = admin(admin_port, "/readyz").await;
                 if status == 200 {
                     assert_eq!(body, "ready\n");
                     break;
                 }
+                assert!(
+                    body.contains("recovering") || body.contains("joining"),
+                    "{body}"
+                );
+                joining |= body.contains("joining");
                 assert!(started.elapsed() < Duration::from_secs(10), "{body}");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            assert!(joining);
             // The seed held the node for the ring wait.
             assert!(started.elapsed() >= Duration::from_millis(900));
             drop(silent);
+        })
+        .await;
+}
+
+/// Every response names its request's ID; one the cache served names it
+/// as S3's request ID too, and one S3 answered keeps S3's.
+#[tokio::test(flavor = "current_thread")]
+async fn responses_name_their_request_ids() {
+    LocalSet::new()
+        .run_until(async {
+            let (port, _) = start(r#"{ bucket = "bucket" }"#, "").await;
+            let (status, cached) = send_for_headers(port, "GET", "/bucket/k", Vec::new()).await;
+            assert_eq!(status, 200);
+            let id = header(&cached, "x-accel-request-id").unwrap();
+            assert_eq!(id.len(), 16);
+            assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert_eq!(header(&cached, "x-amz-request-id"), Some(id));
+            let (_, again) = send_for_headers(port, "GET", "/bucket/k", Vec::new()).await;
+            assert_ne!(header(&again, "x-accel-request-id"), Some(id));
+            let (status, passed) = send_for_headers(port, "PUT", "/bucket/n", b"n".to_vec()).await;
+            assert_eq!(status, 200);
+            assert!(header(&passed, "x-accel-request-id").is_some());
+            assert_eq!(header(&passed, "x-amz-request-id"), Some(S3_REQUEST_ID));
+            let (status, refused) = send_for_headers(port, "GET", "/other/k", Vec::new()).await;
+            assert_eq!(status, 403);
+            assert!(header(&refused, "x-amz-request-id").is_some());
         })
         .await;
 }

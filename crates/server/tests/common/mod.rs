@@ -29,6 +29,8 @@ pub const ETAG: &str = "\"0123456789abcdef\"";
 /// The CRC32 the fake S3 gives every object, when asked.
 pub const CHECKSUM: &str = "AAAAAA==";
 pub const SIZE: usize = 300_000;
+/// The request ID the fake S3 gives every answer.
+pub const S3_REQUEST_ID: &str = "FAKES3REQUEST";
 
 pub fn object() -> Vec<u8> {
     object_of(SIZE, "")
@@ -150,7 +152,7 @@ async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
                 origin.requests.set(origin.requests.get() + 1);
                 origin.paths.borrow_mut().push(head.path.clone());
                 origin.queries.borrow_mut().push(head.query.clone());
-                let mut headers = Vec::new();
+                let mut headers = vec![("x-amz-request-id".to_string(), S3_REQUEST_ID.to_string())];
                 if head.method == "PUT" {
                     let etag = format!("\"written-{}\"", origin.uploads.borrow().len());
                     headers.push(("ETag".to_string(), etag.clone()));
@@ -641,6 +643,33 @@ pub async fn send_payload(
     (status, response.bytes().await.unwrap().to_vec())
 }
 
+/// Sends a signed request with an unsigned payload, and returns the status
+/// and the response's headers.
+pub async fn send_for_headers(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> (u16, Vec<(String, String)>) {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+    let mut request = reqwest::Client::new()
+        .request(method.clone(), url)
+        .body(body);
+    for (name, value) in signed(port, method.as_str(), path, "", &[]) {
+        request = request.header(name, value);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_string()))
+        .collect();
+    let _ = response.bytes().await;
+    (status, headers)
+}
+
 /// Sends a signed GET and returns the status and body, or `None` if the
 /// connection failed or the body ended early, as when its server dies.
 pub async fn try_get(port: u16, path: &str) -> Option<(u16, Vec<u8>)> {
@@ -660,6 +689,16 @@ impl Process {
     pub fn start(config: &Path) -> Process {
         let child = Command::new(env!("CARGO_BIN_EXE_s3-accelerator"))
             .arg(config)
+            .spawn()
+            .unwrap();
+        Process(child)
+    }
+
+    /// Starts the server with its log lines going to `log`.
+    pub fn logged(config: &Path, log: &Path) -> Process {
+        let child = Command::new(env!("CARGO_BIN_EXE_s3-accelerator"))
+            .arg(config)
+            .stderr(std::fs::File::create(log).unwrap())
             .spawn()
             .unwrap();
         Process(child)

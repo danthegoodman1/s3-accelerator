@@ -512,8 +512,9 @@ pub fn parse_amz_date(text: &str) -> Option<i64> {
     Some(days * 86_400 + digits(9..11)? * 3_600 + digits(11..13)? * 60 + digits(13..15)?)
 }
 
-/// Howard Hinnant's date algorithms.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+/// Days from 1970-01-01 to a date in the proleptic Gregorian calendar,
+/// and back: Howard Hinnant's algorithms.
+pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
     let year_of_era = year - era * 400;
@@ -522,7 +523,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let days = days + 719_468;
     let era = days.div_euclid(146_097);
     let day_of_era = days - era * 146_097;

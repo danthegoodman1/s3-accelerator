@@ -64,6 +64,8 @@ pub enum Action {
         node: NodeId,
         id: NodeRequestId,
         read: Read,
+        /// The client's read the request serves.
+        request: ClientRequestId,
     },
     /// Start the client's response with `head`. `Forward` actions supply
     /// its body, which ends after `head.content_length` bytes or at `Abort`.
@@ -855,6 +857,7 @@ impl Gateway {
             node,
             id: node_request,
             read,
+            request: id,
         });
         node_request
     }
