@@ -19,8 +19,10 @@
 //! target/release/s3-accelerator-bench [--scale X] [--clients N] [--origin-latency-ms MS] [--dir DIR]
 //! ```
 //!
-//! With `--scrape-ms MS`, both processes serve their admin listener, and a
-//! thread scrapes each one's `/metrics` every `MS` milliseconds.
+//! Both processes serve their admin listener. Between runs, the benchmark
+//! waits for the node's metrics to show no fills in progress; with
+//! `--scrape-ms MS`, a thread also scrapes each process's `/metrics` every
+//! `MS` milliseconds during runs.
 
 mod client;
 mod cluster;
@@ -335,9 +337,9 @@ impl Bench {
         cluster.stop();
         let notes = format!(
             "{count} objects of 64 MiB, which the cache admits on their first read. The node's \
-             fill budget is 4 GiB: a gateway asks for all of an object's chunks at once, so \
-             each client's miss holds 64 MiB of it, and misses past the budget stream from S3 \
-             without admission. \"Hits\" reads every object again, more than the page cache \
+             fill budget is 4 GiB, and each block holds its share from its fill's start until \
+             it is durable; the drive's writes trail S3's bodies, so misses past the budget \
+             stream from S3 without admission. \"Hits\" reads every object again, more than the page cache \
              keeps of blocks read once; \"Hits from the page cache\" rereads 2 GiB of them, \
              and \"Hits from the drive\" reads them all after the slab file leaves the page \
              cache. A miss's first byte includes S3's {} ms.",

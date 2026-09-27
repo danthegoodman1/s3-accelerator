@@ -38,7 +38,7 @@ pub struct Setup<'a> {
     pub extent: u64,
     pub policy: &'a str,
     pub transport: Transport,
-    /// How often to scrape each process's metrics, if at all.
+    /// How often to scrape each process's metrics during runs, if at all.
     pub scrape: Option<Duration>,
 }
 
@@ -46,6 +46,8 @@ pub struct Cluster {
     node: Child,
     gateway: Child,
     pub gateway_port: u16,
+    /// Where the node serves its metrics.
+    node_admin_port: u16,
     pub slabs: PathBuf,
     /// A client config that trusts the gateway, when it serves TLS.
     pub tls: Option<Arc<ClientConfig>>,
@@ -99,14 +101,14 @@ impl Cluster {
             scrape,
             ..
         } = setup;
-        // Admin listeners, which the scraper reads.
-        let admin = scrape.map(|_| (reserve_port(), reserve_port()));
-        let admin_table = |port: Option<u16>| match port {
-            Some(port) => format!("\n[admin]\nlisten = \"127.0.0.1:{port}\"\n"),
-            None => String::new(),
-        };
-        let node_admin = admin_table(admin.as_ref().map(|((port, _), _)| *port));
-        let gateway_admin = admin_table(admin.as_ref().map(|(_, (port, _))| *port));
+        // Admin listeners: settling reads the node's, and the scraper both.
+        let (
+            (node_admin_port, node_admin_reservation),
+            (gateway_admin_port, gateway_admin_reservation),
+        ) = (reserve_port(), reserve_port());
+        let admin_table = |port: u16| format!("\n[admin]\nlisten = \"127.0.0.1:{port}\"\n");
+        let node_admin = admin_table(node_admin_port);
+        let gateway_admin = admin_table(gateway_admin_port);
         let extents = cache / extent;
         let shared = format!(
             r#"
@@ -172,27 +174,29 @@ data_dir = "{}"
         listening(gateway_port);
         // For profilers to attach to.
         eprintln!("node pid {}, gateway pid {}", node.id(), gateway.id());
-        let mut ports = vec![node_reservation, gateway_reservation];
-        let scraping = admin
-            .zip(*scrape)
-            .map(|(((node, a), (gateway, b)), every)| {
-                ports.extend([a, b]);
-                listening(node);
-                listening(gateway);
-                let files = [
-                    (node, dir.join("node.metrics")),
-                    (gateway, dir.join("gateway.metrics")),
-                ];
-                scrape_every(every, files)
-            });
+        listening(node_admin_port);
+        listening(gateway_admin_port);
+        let scraping = scrape.map(|every| {
+            let files = [
+                (node_admin_port, dir.join("node.metrics")),
+                (gateway_admin_port, dir.join("gateway.metrics")),
+            ];
+            scrape_every(every, files)
+        });
         Cluster {
             node,
             gateway,
             gateway_port,
+            node_admin_port,
             slabs: data.join("slabs"),
             tls,
             scraping,
-            _ports: ports,
+            _ports: vec![
+                node_reservation,
+                gateway_reservation,
+                node_admin_reservation,
+                gateway_admin_reservation,
+            ],
         }
     }
 
@@ -205,17 +209,35 @@ data_dir = "{}"
         }
     }
 
-    /// Waits until the node has written nothing for half a second, so a run
-    /// starts after the last one's blocks reach the drive.
+    /// Waits until the node has no fills in progress and has written
+    /// nothing for half a second, so a run starts after the last one's
+    /// blocks reach the drive.
     pub async fn settle(&self) {
         let mut written = proc_io(self.node.id(), "write_bytes");
         let mut quiet = 0;
-        while quiet < 5 {
+        while quiet < 5 || self.filling() != Some(0) {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let now = proc_io(self.node.id(), "write_bytes");
             quiet = if now == written { quiet + 1 } else { 0 };
             written = now;
         }
+    }
+
+    /// Bytes of blocks the node is filling, which it has yet to make
+    /// durable, as its metrics say.
+    fn filling(&self) -> Option<u64> {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.node_admin_port)).ok()?;
+        let request = "GET /metrics HTTP/1.1\r\nhost: bench\r\nconnection: close\r\n\r\n";
+        stream.write_all(request.as_bytes()).ok()?;
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).ok()?;
+        answer
+            .lines()
+            .find_map(|line| line.strip_prefix("s3accel_node_fill_bytes "))?
+            .trim()
+            .parse()
+            .ok()
     }
 
     /// Drops the slab file's pages from the page cache, so the next hits
