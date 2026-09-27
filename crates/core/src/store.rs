@@ -40,7 +40,10 @@ pub struct Location {
 /// An object version, named by hashes: one of its bucket and key, which
 /// groups an object's versions, and a 128-bit one of its bucket, key and
 /// ETag. Records on disk hold it, so they have one size whatever the key.
+/// Packed to 8-byte alignment, so it takes 24 bytes rather than 32, in
+/// every block key the index holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(C, packed(8))]
 pub struct VersionId {
     pub key: u64,
     pub version: u128,
@@ -149,14 +152,17 @@ pub struct Store {
     extents: Vec<Extent>,
     free_extents: Vec<u32>,
     classes: Vec<Class>,
-    small: VecDeque<(BlockKey, u64)>,
-    main: VecDeque<(BlockKey, u64)>,
+    /// The queues name each block by its slot, which holds its key, and
+    /// by the sequence number of its entry, which tells it from a block
+    /// that held the slot before.
+    small: VecDeque<(Location, u64)>,
+    main: VecDeque<(Location, u64)>,
     small_bytes: u64,
     ghost: VecDeque<u64>,
     ghosts: BTreeMap<u64, u32>,
     /// Blocks the node no longer owns, which eviction takes first, with the
     /// sequence number of the entry each was marked in.
-    disowned: VecDeque<(BlockKey, u64)>,
+    disowned: VecDeque<(Location, u64)>,
     next_seq: u64,
     evicted: Vec<(BlockKey, Location)>,
 }
@@ -355,7 +361,7 @@ impl Store {
         self.hold(location, key);
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.small.push_back((key, seq));
+        self.small.push_back((location, seq));
         self.small_bytes += size;
         self.blocks.insert(
             key,
@@ -394,12 +400,13 @@ impl Store {
         entry.seq = seq;
         self.extents[entry.location.extent as usize].busy -= 1;
         let size = self.classes[class_index(&self.config, entry.len)].size;
+        let location = entry.location;
         if self.ghosts.contains_key(&entry.hash) {
             entry.queue = Queue::Main;
-            self.main.push_back((key, seq));
+            self.main.push_back((location, seq));
         } else {
             entry.queue = Queue::Small;
-            self.small.push_back((key, seq));
+            self.small.push_back((location, seq));
             self.small_bytes += size;
         }
     }
@@ -518,7 +525,7 @@ impl Store {
             .blocks
             .iter()
             .filter(|(_, entry)| entry.queue != Queue::None && !owned(entry.placement))
-            .map(|(&key, entry)| (key, entry.seq))
+            .map(|(_, entry)| (entry.location, entry.seq))
             .collect();
     }
 
@@ -532,13 +539,16 @@ impl Store {
     /// block is pinned.
     fn evict_one(&mut self) -> Option<u32> {
         for _ in 0..self.disowned.len() {
-            let Some((key, seq)) = self.disowned.pop_front() else {
+            let Some((location, seq)) = self.disowned.pop_front() else {
                 break;
+            };
+            let Some(key) = self.block_at(location) else {
+                continue;
             };
             // A mark counts only for the entry it was made on.
             match self.blocks.get(&key) {
                 Some(entry) if entry.seq != seq || entry.queue == Queue::None => {}
-                Some(entry) if entry.pins > 0 => self.disowned.push_back((key, seq)),
+                Some(entry) if entry.pins > 0 => self.disowned.push_back((location, seq)),
                 Some(_) => return Some(self.evict(key).extent),
                 None => {}
             }
@@ -569,7 +579,10 @@ impl Store {
             } else {
                 (Queue::Main, self.main.pop_front())
             };
-            let (key, seq) = popped?;
+            let (location, seq) = popped?;
+            let Some(key) = self.block_at(location) else {
+                continue;
+            };
             let Some(entry) = self.blocks.get_mut(&key) else {
                 continue;
             };
@@ -580,11 +593,11 @@ impl Store {
                 match queue {
                     Queue::Small => {
                         pinned_small += 1;
-                        self.small.push_back((key, seq));
+                        self.small.push_back((location, seq));
                     }
                     _ => {
                         pinned_main += 1;
-                        self.main.push_back((key, seq));
+                        self.main.push_back((location, seq));
                     }
                 }
                 continue;
@@ -595,7 +608,7 @@ impl Store {
                 if entry.freq > 0 {
                     entry.freq = 0;
                     entry.queue = Queue::Main;
-                    self.main.push_back((key, seq));
+                    self.main.push_back((location, seq));
                     continue;
                 }
                 let hash = entry.hash;
@@ -603,7 +616,7 @@ impl Store {
                 self.remember(hash);
             } else if entry.freq > 0 {
                 entry.freq -= 1;
-                self.main.push_back((key, seq));
+                self.main.push_back((location, seq));
                 continue;
             }
             return Some(self.evict(key).extent);

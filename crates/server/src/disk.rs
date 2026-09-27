@@ -545,15 +545,44 @@ fn read_header(table: &File) -> io::Result<Option<Header>> {
 /// Every valid record in the table: its index, the record, the checksum of
 /// its block's bytes, and the run that wrote it.
 fn read_records(table: &File, slots: u64) -> io::Result<Vec<(u64, SlotRecord, u64, u64)>> {
+    // Threads read and decode parts of the table at once: a large disk's
+    // table is a sixty-fourth of its size, and one reader leaves the drive
+    // and the cores idle.
+    let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get());
+    let part = slots.div_ceil(threads.min(8) as u64).max(1);
+    let parts: Vec<io::Result<Vec<_>>> = std::thread::scope(|scope| {
+        let readers: Vec<_> = (0..slots)
+            .step_by(part as usize)
+            .map(|first| scope.spawn(move || read_part(table, first, (first + part).min(slots))))
+            .collect();
+        readers
+            .into_iter()
+            .map(|reader| reader.join().expect("a table reader finishes"))
+            .collect()
+    });
     let mut records = Vec::new();
-    let mut chunk = vec![0; (RECORD_SIZE * 1024) as usize];
-    let mut index = 0;
-    while index < slots {
-        let count = (slots - index).min(1024);
+    for part in parts {
+        records.extend(part?);
+    }
+    Ok(records)
+}
+
+/// The records of slots `first..end`.
+fn read_part(table: &File, first: u64, end: u64) -> io::Result<Vec<(u64, SlotRecord, u64, u64)>> {
+    const BATCH: u64 = 16_384;
+    let mut records = Vec::new();
+    let mut chunk = vec![0; (RECORD_SIZE * BATCH) as usize];
+    let mut index = first;
+    while index < end {
+        let count = (end - index).min(BATCH);
         let bytes = &mut chunk[..(count * RECORD_SIZE) as usize];
         table.read_exact_at(bytes, HEADER_SIZE + index * RECORD_SIZE)?;
         let (records_read, _) = bytes.as_chunks::<{ RECORD_SIZE as usize }>();
         for (offset, record) in records_read.iter().enumerate() {
+            // Most of a table is empty slots, which need no check.
+            if record.iter().all(|&byte| byte == 0) {
+                continue;
+            }
             if let Some((record, checksum, run)) = decode_record(record) {
                 records.push((index + offset as u64, record, checksum, run));
             }

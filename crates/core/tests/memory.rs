@@ -72,6 +72,6 @@ fn the_index_costs_what_the_spec_says() {
     // 4 KiB blocks, 256 to an extent.
     let small = bytes_per_block(1 << 20, 400, 4 << 10);
     println!("bytes per block: {large:.0} for 1 MiB blocks, {small:.0} for 4 KiB blocks");
-    assert!(large < 550.0, "{large:.0} bytes per 1 MiB block");
-    assert!(small < 460.0, "{small:.0} bytes per 4 KiB block");
+    assert!(large < 420.0, "{large:.0} bytes per 1 MiB block");
+    assert!(small < 340.0, "{small:.0} bytes per 4 KiB block");
 }

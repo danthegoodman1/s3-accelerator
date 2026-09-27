@@ -903,6 +903,11 @@ MUTANTS = [
                        "let _ = self.disk.rewrite_metadata(&entries);")],
     ),
     (
+        "a restart skips part of the slot table",
+        [(DISK, "scope.spawn(move || read_part(table, first, (first + part).min(slots)))",
+                "scope.spawn(move || read_part(table, first, (first + part - 1).min(slots)))")],
+    ),
+    (
         "reads waiting on a newly down node wait out the timeout",
         [(GATEWAY, "for id in waiting {\n            self.fail_over(now, id, None, false);\n        }", "")],
     ),

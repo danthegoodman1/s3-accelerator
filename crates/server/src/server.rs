@@ -151,7 +151,14 @@ pub async fn run_with(
             };
             let origin = Arc::new(Origin::new(&origin.endpoint, &origin.region, credentials()));
             let node_config = config.cache.node_config();
+            let opening = Instant::now();
             let (disk, recovery) = Disk::open(Path::new(&node.data_dir), node_config.store)?;
+            eprintln!(
+                "node {} read {} slot records in {:.3} s",
+                node.id,
+                recovery.records.len(),
+                opening.elapsed().as_secs_f64()
+            );
             let id = NodeId(node.id);
             let me = config
                 .peers()
