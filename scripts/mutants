@@ -34,6 +34,7 @@ ORIGIN = "crates/server/src/origin.rs"
 ZERO_COPY = "crates/server/src/zero_copy.rs"
 MEMBERSHIP_ENGINE = "crates/server/src/membership_engine.rs"
 GATEWAY_ENGINE = "crates/server/src/gateway_engine.rs"
+PASSTHROUGH = "crates/server/src/passthrough.rs"
 STEP_TIMEOUT = 600
 
 MUTANTS = [
@@ -242,7 +243,7 @@ MUTANTS = [
     ),
     (
         "DeleteObjects leaves cached metadata",
-        [(SERVER, "let keys = listed_keys(&String::from_utf8_lossy(&body));", "let keys: Vec<String> = Vec::new();")],
+        [(SERVER, "let keys = listed_keys(&String::from_utf8_lossy(&body))", "let keys = Vec::<String>::new()")],
     ),
     (
         "the S3 client drops . segments",
@@ -251,7 +252,7 @@ MUTANTS = [
     ),
     (
         "S3 receives a body that fails its hash",
-        [(SERVER, "&& hex::encode(hasher.finalize()) != *digest", "&& hex::encode(hasher.finalize()) != *digest && false")],
+        [(PASSTHROUGH, "&& hex::encode(hasher.finalize()) != digest", "&& hex::encode(hasher.finalize()) != digest && false")],
     ),
     (
         "a slot is overwritten while its pages are in flight",
@@ -327,7 +328,7 @@ MUTANTS = [
     ),
     (
         "an answer older than a write restores the gateway's entry",
-        [(GATEWAY, "Some(entry) if sent < entry.written => return,", "")],
+        [(GATEWAY, "if self.writes.get(&key).is_some_and(|written| sent < *written) {\n            return;\n        }", "")],
     ),
     (
         "the gateway sends preconditions to the home",
@@ -336,7 +337,7 @@ MUTANTS = [
     ),
     (
         "a read that keeps finding its object changed never goes direct",
-        [(GATEWAY, "let direct = read.retries >= STALE_RETRIES;", "let direct = false;")],
+        [(GATEWAY, "let direct = read.retries >= STALE_RETRIES || detoured;", "let direct = detoured;")],
     ),
     (
         "the home ignores stale reports",
@@ -470,6 +471,35 @@ MUTANTS = [
     (
         "a queued reader shares an arriving body that lacks its bytes",
         [(NODE, "&& start <= first\n            && last <= end", "")],
+    ),
+    (
+        "a write marker leaves with its key's cache entry",
+        [
+            (GATEWAY, "self.writes.insert(key.clone(), now);\n        self.remove(key);",
+             "self.writes.insert(key.clone(), now);\n        self.put(key.clone(), None);"),
+            (GATEWAY, "let (_, oldest) = self.recency.pop_first().expect(\"over capacity\");",
+             "let (_, oldest) = self.recency.pop_first().expect(\"over capacity\");\n            self.writes.remove(&oldest);"),
+        ],
+    ),
+    (
+        "a gateway that wrote around a key's home trusts the home",
+        [(GATEWAY, "self.detours.insert(key.clone(), Time(now.0 + ttl));", "let _ = (key, ttl);")],
+    ),
+    (
+        "a node other than the home keeps a write to itself",
+        [(NODE, "let homes = [\n                self.ring.owner(placement),", "let homes = [\n                None,")],
+    ),
+    (
+        "a gateway keeps its entry after a write it passed to a node",
+        [(SERVER, "GatewayEngine::written_via(&context.gateway, &key, node);", "let _ = (&key, node);")],
+    ),
+    (
+        "a node answers a write before the home forgets the key",
+        [(NODE_ENGINE, "NodeEngine::written(engine, &key, false);", "let _ = key;")],
+    ),
+    (
+        "a chunked answer reaches the client unframed",
+        [(SERVER, "Ok(Some(piece)) => to.write_chunk(&piece).await?,", "Ok(Some(piece)) => to.write_all(&piece).await?,")],
     ),
 ]
 

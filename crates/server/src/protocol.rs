@@ -1,13 +1,15 @@
 //! How gateways and storage nodes talk, and nodes to each other: HTTP/1.1,
 //! one request per read. The request's path names the object, and headers
 //! say what to read; the node's answer is a response with its body, the
-//! object's metadata, word that the object changed, or its ring. Every
+//! object's metadata, word that the object changed, or its ring. A request
+//! the cache doesn't serve travels whole, its target, headers and body as
+//! the client sent them, and S3's answer comes back the same way. Every
 //! request carries the cluster's secret, and every answer the version of
 //! the node's ring.
 //!
-//! `Content-Length` always counts the body bytes that follow. A response's
-//! own length, which a HEAD read answers without a body, travels in
-//! `x-accel-content-length`.
+//! `Content-Length` always counts the body bytes that follow, or a chunked
+//! body follows. A response's own length, which a HEAD read answers
+//! without a body, travels in `x-accel-content-length`.
 
 use crate::http::{
     etag_condition, format_content_range, format_range, header, parse_content_range, parse_range,
@@ -38,6 +40,9 @@ const META_HEADER: &str = "x-accel-meta-header";
 const RING: &str = "x-accel-ring";
 const PASSED_ON: &str = "x-accel-passed-on";
 const RING_MEMBERS: &str = "x-accel-ring-members";
+const PAYLOAD: &str = "x-accel-payload";
+/// Prefixes a forwarded request's or response's own headers.
+const FORWARDED: &str = "x-accel-h-";
 
 /// What a gateway asks of a node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +56,23 @@ pub enum NodeRequest {
     },
     /// The node's ring.
     Ring,
+    /// A client's request the node passes to S3 under the cluster's
+    /// signature. The request's body follows.
+    Forward(Forward),
+}
+
+/// A client's request, as the gateway authenticated and authorized it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Forward {
+    pub method: String,
+    /// The path and query as the client sent them.
+    pub path: String,
+    pub query: String,
+    pub headers: Vec<(String, String)>,
+    /// The payload hash the client signed, which S3 checks the body against.
+    pub payload_hash: String,
+    /// The body's length.
+    pub len: u64,
 }
 
 /// A node's answer to a gateway.
@@ -68,6 +90,14 @@ pub enum NodeAnswer {
         ring: Ring,
         addresses: BTreeMap<NodeId, String>,
     },
+    /// S3's answer to a forwarded request. Its body follows, `length` bytes
+    /// long, or chunked when S3 sent no length; a HEAD's `length` is what a
+    /// GET's would be.
+    Forwarded {
+        status: u16,
+        headers: Vec<(String, String)>,
+        length: Option<u64>,
+    },
 }
 
 /// A request's method, target and headers.
@@ -81,6 +111,19 @@ pub fn encode_request(
         NodeRequest::Ring => {
             add(KIND, "ring".into());
             return ("GET", "/".into(), headers);
+        }
+        NodeRequest::Forward(forward) => {
+            add(KIND, "forward".into());
+            add(METHOD, forward.method.clone());
+            add(PAYLOAD, forward.payload_hash.clone());
+            for (name, value) in &forward.headers {
+                add(&format!("{FORWARDED}{name}"), value.clone());
+            }
+            let target = match forward.query.as_str() {
+                "" => forward.path.clone(),
+                query => format!("{}?{query}", forward.path),
+            };
+            return ("POST", target, headers);
         }
         NodeRequest::Written { key, passed_on } => {
             add(KIND, "written".into());
@@ -136,16 +179,33 @@ pub fn encode_request(
     };
     let method = match request {
         NodeRequest::Written { .. } => "POST",
-        NodeRequest::Read(_) | NodeRequest::Ring => "GET",
+        NodeRequest::Read(_) | NodeRequest::Ring | NodeRequest::Forward(_) => "GET",
     };
     (method, path(key), headers)
 }
 
-/// The request a gateway sent, from its path and headers.
-pub fn decode_request(path: &str, headers: &[(String, String)]) -> Result<NodeRequest, String> {
+/// The request a gateway sent, from its path, query and headers, and for
+/// a forwarded request, the length of the body that follows.
+pub fn decode_request(
+    path: &str,
+    query: &str,
+    headers: &[(String, String)],
+    len: u64,
+) -> Result<NodeRequest, String> {
     let field = |name: &str| header(headers, name).ok_or_else(|| format!("no {name}"));
-    if field(KIND)? == "ring" {
-        return Ok(NodeRequest::Ring);
+    match field(KIND)? {
+        "ring" => return Ok(NodeRequest::Ring),
+        "forward" => {
+            return Ok(NodeRequest::Forward(Forward {
+                method: field(METHOD)?.to_string(),
+                path: path.to_string(),
+                query: query.to_string(),
+                headers: unprefixed(headers),
+                payload_hash: field(PAYLOAD)?.to_string(),
+                len,
+            }));
+        }
+        _ => {}
     }
     let key = key(path)?;
     let number = |name: &str| -> Result<u64, String> {
@@ -229,6 +289,20 @@ pub fn encode_answer(answer: &NodeAnswer, ring: u64) -> (u16, Vec<(String, Strin
             headers.push((ANSWER.to_string(), "written".into()));
             200
         }
+        NodeAnswer::Forwarded {
+            status,
+            headers: forwarded,
+            length,
+        } => {
+            headers.push((ANSWER.to_string(), "forwarded".into()));
+            if let Some(length) = length {
+                headers.push((LENGTH.to_string(), length.to_string()));
+            }
+            for (name, value) in forwarded {
+                headers.push((format!("{FORWARDED}{name}"), value.clone()));
+            }
+            *status
+        }
         NodeAnswer::Ring { ring, addresses } => {
             headers.push((ANSWER.to_string(), "ring".into()));
             let members: Vec<String> = ring
@@ -244,6 +318,19 @@ pub fn encode_answer(answer: &NodeAnswer, ring: u64) -> (u16, Vec<(String, Strin
         }
     };
     (status, headers)
+}
+
+/// The headers a forwarded request or response carries for S3 or the
+/// client, without their prefix.
+fn unprefixed(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.to_ascii_lowercase();
+            let name = name.strip_prefix(FORWARDED)?;
+            Some((name.to_string(), value.clone()))
+        })
+        .collect()
 }
 
 /// The version of the ring of the node that answered.
@@ -277,6 +364,21 @@ pub fn decode_answer(status: u16, headers: &[(String, String)]) -> Result<NodeAn
         "metadata" => Ok(NodeAnswer::Metadata(decode_meta(headers)?)),
         "stale" => Ok(NodeAnswer::Stale),
         "written" => Ok(NodeAnswer::Written),
+        "forwarded" => {
+            let length = match header(headers, LENGTH) {
+                Some(length) => Some(
+                    length
+                        .parse()
+                        .map_err(|_| format!("{LENGTH} is no number"))?,
+                ),
+                None => None,
+            };
+            Ok(NodeAnswer::Forwarded {
+                status,
+                headers: unprefixed(headers),
+                length,
+            })
+        }
         "ring" => {
             let version = ring_version(headers).ok_or_else(|| format!("no {RING}"))?;
             let mut addresses = BTreeMap::new();
@@ -376,7 +478,12 @@ mod tests {
     fn round_trip(request: NodeRequest) {
         let (_, target, headers) = encode_request(&request, "secret");
         assert_eq!(header(&headers, SECRET), Some("secret"));
-        assert_eq!(decode_request(&target, &headers), Ok(request));
+        let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+        let len = match &request {
+            NodeRequest::Forward(forward) => forward.len,
+            _ => 0,
+        };
+        assert_eq!(decode_request(path, query, &headers, len), Ok(request));
     }
 
     #[test]
@@ -422,6 +529,17 @@ mod tests {
             passed_on: true,
         });
         round_trip(NodeRequest::Ring);
+        round_trip(NodeRequest::Forward(Forward {
+            method: "PUT".into(),
+            path: "/bucket/a%20b/../c".into(),
+            query: "x-id=PutObject".into(),
+            headers: vec![
+                ("content-type".into(), "text/plain".into()),
+                ("x-amz-meta-note".into(), "hi".into()),
+            ],
+            payload_hash: "UNSIGNED-PAYLOAD".into(),
+            len: 5,
+        }));
     }
 
     #[test]
@@ -462,6 +580,16 @@ mod tests {
             NodeAnswer::Stale,
             NodeAnswer::Written,
             NodeAnswer::Ring { ring, addresses },
+            NodeAnswer::Forwarded {
+                status: 404,
+                headers: vec![("content-type".into(), "application/xml".into())],
+                length: Some(120),
+            },
+            NodeAnswer::Forwarded {
+                status: 200,
+                headers: Vec::new(),
+                length: None,
+            },
         ] {
             // A node's answer names its ring, which a ring answer carries.
             let version = match &answer {

@@ -102,6 +102,10 @@ pub struct Gateway {
     parts: BTreeMap<NodeRequestId, Part>,
     /// Nodes that timed out, and until when the gateway routes around them.
     suspects: BTreeMap<NodeId, Time>,
+    /// Keys written through a node other than their home, and until when
+    /// the gateway reads them directly from S3: the home may keep metadata
+    /// from before the write until the bucket's TTL runs out.
+    detours: BTreeMap<ObjectKey, Time>,
     /// When the gateway last asked a node for its ring, until it arrives.
     fetching_ring: Option<Time>,
     actions: Vec<Action>,
@@ -219,6 +223,7 @@ impl Gateway {
             next_node_request: 0,
             reads: BTreeMap::new(),
             parts: BTreeMap::new(),
+            detours: BTreeMap::new(),
             suspects: BTreeMap::new(),
             fetching_ring: None,
             actions: Vec::new(),
@@ -228,6 +233,16 @@ impl Gateway {
     /// The ring the gateway routes by.
     pub fn ring(&self) -> &Ring {
         &self.ring
+    }
+
+    /// The nodes to pass a request for `target` through to S3, best first:
+    /// the object's home, then its other rendezvous candidates, with nodes
+    /// the gateway routes around last. A bucket's request names the bucket
+    /// and an empty key.
+    pub fn pass_candidates(&self, target: &ObjectKey) -> Vec<NodeId> {
+        let mut candidates = self.ring.candidates(Placement::Home(target).hash());
+        candidates.sort_by_key(|node| self.suspects.contains_key(node));
+        candidates
     }
 
     /// A node answered with its ring's version. A version other than the
@@ -284,10 +299,20 @@ impl Gateway {
     }
 
     /// A write this gateway passed to S3 succeeded at `now`: it forgets
-    /// the key's metadata, and ignores answers to reads sent before.
-    pub fn on_write(&mut self, now: Time, key: &ObjectKey) {
+    /// the key's metadata, and ignores answers to reads sent before. `via`
+    /// is the node that took the write or heard of it from the gateway.
+    /// Unless that is the key's home, the gateway reads the key directly
+    /// from S3 until the bucket's TTL has passed, by when the home's
+    /// metadata from before the write has expired.
+    pub fn on_write(&mut self, now: Time, key: &ObjectKey, via: Option<NodeId>) {
         self.now = self.now.max(now);
         self.cache.written(key, now);
+        let home = self.ring.owner(Placement::Home(key).hash());
+        if let Freshness::Ttl(ttl) = self.policy(&key.bucket).freshness
+            && (via.is_none() || via != home)
+        {
+            self.detours.insert(key.clone(), Time(now.0 + ttl));
+        }
     }
 
     /// Time passed: a node request unanswered past the timeout goes to the
@@ -295,6 +320,16 @@ impl Gateway {
     pub fn on_tick(&mut self, now: Time) {
         self.now = self.now.max(now);
         self.suspects.retain(|_, until| *until > now);
+        self.detours.retain(|_, until| *until > now);
+        let oldest = self
+            .reads
+            .values()
+            .filter_map(|read| match read.stage {
+                Stage::Home { sent } => Some(sent),
+                _ => None,
+            })
+            .min();
+        self.cache.forget_writes_before(oldest);
         let timeout = self.config.node_timeout;
         let expired: Vec<NodeRequestId> = self
             .parts
@@ -446,7 +481,8 @@ impl Gateway {
         let read = &self.reads[&id];
         let key = read.request.key.clone();
         let (arrived, policy) = (read.arrived, self.policy(&key.bucket));
-        let direct = read.retries >= STALE_RETRIES;
+        let detoured = self.detours.get(&key).is_some_and(|until| now < *until);
+        let direct = read.retries >= STALE_RETRIES || detoured;
         let ttl = self.config.metadata_ttl;
         if !direct && let Some(cached) = self.cache.fresh(&key, arrived, policy, ttl) {
             let meta = cached.meta.clone();
@@ -847,20 +883,19 @@ impl CachedMeta {
 }
 
 /// Object metadata by key, dropping the least recently used past capacity.
-/// A key written through this gateway keeps its entry, empty, with the time
-/// of the write.
 struct MetadataCache {
     capacity: usize,
     entries: BTreeMap<ObjectKey, Entry>,
     recency: BTreeMap<u64, ObjectKey>,
     next_use: u64,
+    /// When each key was last written through this gateway, while reads
+    /// sent before then may still be answered: their answers predate the
+    /// write, and are ignored. Capacity never evicts these.
+    writes: BTreeMap<ObjectKey, Time>,
 }
 
 struct Entry {
     meta: Option<CachedMeta>,
-    /// Answers to reads sent before this were answered before the last
-    /// write, and are ignored.
-    written: Time,
     /// An ETag a node found out of date, which the next read through the
     /// home reports.
     stale: Option<ETag>,
@@ -874,6 +909,7 @@ impl MetadataCache {
             entries: BTreeMap::new(),
             recency: BTreeMap::new(),
             next_use: 0,
+            writes: BTreeMap::new(),
         }
     }
 
@@ -903,20 +939,32 @@ impl MetadataCache {
     /// Stores metadata from the answer to a read sent at `sent`, unless a
     /// write or newer metadata superseded it.
     fn insert(&mut self, key: ObjectKey, meta: CachedMeta, sent: Time) {
-        let written = match self.entries.get(&key) {
-            Some(entry) if sent < entry.written => return,
-            Some(Entry {
-                meta: Some(current),
-                ..
-            }) if current.validated > meta.validated => return,
-            Some(entry) => entry.written,
-            None => Time::default(),
-        };
-        self.put(key, Some(meta), written);
+        if self.writes.get(&key).is_some_and(|written| sent < *written) {
+            return;
+        }
+        if let Some(Entry {
+            meta: Some(current),
+            ..
+        }) = self.entries.get(&key)
+            && current.validated > meta.validated
+        {
+            return;
+        }
+        self.put(key, Some(meta));
     }
 
     fn written(&mut self, key: &ObjectKey, now: Time) {
-        self.put(key.clone(), None, now);
+        self.writes.insert(key.clone(), now);
+        self.remove(key);
+    }
+
+    /// Forgets writes that no read still in flight was sent before, given
+    /// the oldest read's send time.
+    fn forget_writes_before(&mut self, oldest: Option<Time>) {
+        match oldest {
+            Some(oldest) => self.writes.retain(|_, written| *written > oldest),
+            None => self.writes.clear(),
+        }
     }
 
     fn remove(&mut self, key: &ObjectKey) {
@@ -928,11 +976,7 @@ impl MetadataCache {
     /// Forgets the key's metadata, whose version `etag` a node found out
     /// of date.
     fn stale(&mut self, key: &ObjectKey, etag: ETag) {
-        let written = self
-            .entries
-            .get(key)
-            .map_or(Time::default(), |entry| entry.written);
-        self.put(key.clone(), None, written);
+        self.put(key.clone(), None);
         if let Some(entry) = self.entries.get_mut(key) {
             entry.stale = Some(etag);
         }
@@ -942,7 +986,7 @@ impl MetadataCache {
         self.entries.get_mut(key)?.stale.take()
     }
 
-    fn put(&mut self, key: ObjectKey, meta: Option<CachedMeta>, written: Time) {
+    fn put(&mut self, key: ObjectKey, meta: Option<CachedMeta>) {
         let mut stale = None;
         if let Some(entry) = self.entries.remove(&key) {
             self.recency.remove(&entry.used);
@@ -951,15 +995,7 @@ impl MetadataCache {
         let used = self.next_use;
         self.next_use += 1;
         self.recency.insert(used, key.clone());
-        self.entries.insert(
-            key,
-            Entry {
-                meta,
-                written,
-                stale,
-                used,
-            },
-        );
+        self.entries.insert(key, Entry { meta, stale, used });
         while self.entries.len() > self.capacity {
             let (_, oldest) = self.recency.pop_first().expect("over capacity");
             self.entries.remove(&oldest);
@@ -985,6 +1021,11 @@ mod tests {
     use std::num::NonZeroU32;
 
     fn gateway() -> Gateway {
+        gateway_holding(16)
+    }
+
+    /// A gateway that keeps the metadata of `capacity` objects.
+    fn gateway_holding(capacity: usize) -> Gateway {
         let members = (0..3)
             .map(|id| Member {
                 id: NodeId(id),
@@ -999,7 +1040,7 @@ mod tests {
             layout: Layout::new(64, 1),
             default_policy: policy,
             buckets: BTreeMap::new(),
-            metadata_capacity: 16,
+            metadata_capacity: capacity,
             metadata_ttl: 1_000,
             node_timeout: 1_000,
             suspect_ttl: 100,
@@ -1038,6 +1079,60 @@ mod tests {
         assert_eq!(fetches(&mut gateway), 1);
         gateway.on_ring_version(Time(50), NodeId(1), 1);
         assert_eq!(fetches(&mut gateway), 0);
+    }
+
+    /// An answer to a read sent before a write through the gateway never
+    /// caches the key's metadata, even once other keys have taken the
+    /// key's place in the cache.
+    #[test]
+    fn a_write_outlasts_its_key_leaving_the_cache() {
+        let mut gateway = gateway_holding(1);
+        let key = |name: &str| ObjectKey {
+            bucket: "b".into(),
+            key: name.into(),
+        };
+        let answer = |etag: &str| {
+            let etag = ETag(format!("\"{etag}\""));
+            let head = ResponseHead {
+                status: 200,
+                etag: Some(etag.clone()),
+                content_range: None,
+                content_length: 64,
+                headers: Vec::new(),
+            };
+            let meta = ObjectMeta {
+                etag,
+                size: 64,
+                headers: Vec::new(),
+                age: 0,
+            };
+            (head, Some(meta))
+        };
+        let home_read = |actions: Vec<Action>| {
+            actions.into_iter().find_map(|action| match action {
+                Action::Send {
+                    id,
+                    read: Read::Object { .. },
+                    ..
+                } => Some(id),
+                _ => None,
+            })
+        };
+        gateway.on_request(Time(0), ClientRequestId(1), Request::head(key("k")));
+        let racing = home_read(gateway.drain()).expect("the home is asked");
+        let home = gateway.ring().owner(Placement::Home(&key("k")).hash());
+        gateway.on_write(Time(1), &key("k"), home);
+        gateway.on_request(Time(2), ClientRequestId(2), Request::head(key("other")));
+        let other = home_read(gateway.drain()).expect("the home is asked");
+        let (head, meta) = answer("other");
+        gateway.on_node_response(Time(3), other, head, meta);
+        gateway.drain();
+        // The home's answer from before the write arrives last.
+        let (head, meta) = answer("old");
+        gateway.on_node_response(Time(4), racing, head, meta);
+        gateway.drain();
+        gateway.on_request(Time(5), ClientRequestId(3), Request::head(key("k")));
+        assert!(home_read(gateway.drain()).is_some());
     }
 
     /// A node answers the same request twice while the gateway forwards

@@ -47,3 +47,24 @@ fn a_change_s3_reveals_outweighs_a_previous_homes_metadata() {
         panic!("{failure}");
     }
 }
+
+/// Seed 2921: a gateway that holds the metadata of three objects wrote a
+/// key, and other keys evicted the key's entry, which carried the time of
+/// the write; the home's answer to a read sent before the write then
+/// restored the old version's metadata.
+#[test]
+fn a_write_marker_outlasts_cache_eviction() {
+    if let Err(failure) = Simulator::from_seed(2921).run() {
+        panic!("{failure}");
+    }
+}
+
+/// Seed 2093: a gateway routing around a home it suspected wrote a key
+/// through another node, whose notice to the home a partition dropped. Once
+/// the suspicion ended, the gateway read the old version from the home.
+#[test]
+fn a_write_around_a_suspected_home_is_read_from_s3() {
+    if let Err(failure) = Simulator::from_seed(2093).run() {
+        panic!("{failure}");
+    }
+}

@@ -9,6 +9,7 @@ pub mod http;
 pub mod membership_engine;
 pub mod node_engine;
 pub mod origin;
+pub mod passthrough;
 pub mod peers;
 pub mod protocol;
 pub mod server;

@@ -849,15 +849,20 @@ impl Node {
     }
 
     /// As `on_write`, for a write another node passed on, which goes no
-    /// further. Otherwise, within the fallback window, the node passes the
-    /// write to the key's home under its other ring: a gateway told one
-    /// home of the write, and the other may hold or ask for the metadata.
+    /// further. Otherwise the node passes the write to the key's home when
+    /// that is another node, as when a gateway's ring differs from this
+    /// node's, and within the fallback window to the key's home under the
+    /// previous ring too, which may hold or ask for the metadata.
     pub fn on_write_from(&mut self, now: Time, key: &ObjectKey, passed_on: bool) {
         self.now = self.now.max(now);
         self.changed(key);
-        if !passed_on && let Some((previous, _)) = &self.previous {
+        if !passed_on {
             let placement = Placement::Home(key).hash();
-            let homes = [self.ring.owner(placement), previous.owner(placement)];
+            let previous = self.previous.as_ref();
+            let homes = [
+                self.ring.owner(placement),
+                previous.and_then(|(previous, _)| previous.owner(placement)),
+            ];
             let mut told = BTreeSet::new();
             for home in homes.into_iter().flatten() {
                 if home != self.id && told.insert(home) {

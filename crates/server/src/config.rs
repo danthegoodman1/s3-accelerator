@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub origin: OriginConfig,
+    /// S3, which only storage nodes reach.
+    pub origin: Option<OriginConfig>,
     #[serde(default)]
     pub clients: Vec<Client>,
     #[serde(default)]
@@ -126,6 +127,9 @@ impl Config {
             }
         }
         if let Some(node) = &self.node {
+            if self.origin.is_none() {
+                return Err("a node needs [origin]".into());
+            }
             if !ids.contains(&node.id) {
                 return Err(format!("node {} is not in cluster.nodes", node.id));
             }

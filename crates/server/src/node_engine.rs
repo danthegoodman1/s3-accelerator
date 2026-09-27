@@ -12,8 +12,9 @@
 use crate::disk::Disk;
 use crate::http::{Connection, Framing, Response, header};
 use crate::origin::{self, Origin, OriginBody};
+use crate::passthrough;
 use crate::peers::{Exchanged, Peers};
-use crate::protocol::{self, NodeAnswer, NodeRequest};
+use crate::protocol::{self, Forward, NodeAnswer, NodeRequest};
 use bytes::Bytes;
 use hyper::body::Incoming;
 use s3_accelerator_core::Time;
@@ -756,16 +757,28 @@ async fn connection(stream: TcpStream, engine: &SharedNode, secret: &str) -> io:
     let mut connection = Connection::new(stream);
     while let Some(head) = connection.read_head().await? {
         let len = head.content_length().map_err(io::Error::other)?;
-        connection.read_body(len).await?;
         if header(&head.headers, protocol::SECRET) != Some(secret) {
-            return refuse(&mut connection, 403).await;
+            return refuse(&mut connection, 403, len).await;
         }
-        let reply = match protocol::decode_request(&head.path, &head.headers) {
+        let request = protocol::decode_request(&head.path, &head.query, &head.headers, len);
+        let request = match request {
             Err(error) => {
                 eprintln!("a gateway's request: {error}");
-                return refuse(&mut connection, 400).await;
+                return refuse(&mut connection, 400, len).await;
             }
-            Ok(NodeRequest::Written { key, passed_on }) => {
+            Ok(NodeRequest::Forward(forward)) => {
+                if forward_to_s3(&mut connection, engine, &forward, head.keep_alive).await? {
+                    continue;
+                }
+                return Ok(());
+            }
+            Ok(request) => request,
+        };
+        // Only forwarded requests carry a body.
+        connection.read_body(len).await?;
+        let reply = match request {
+            NodeRequest::Forward(_) => unreachable!("forwarded above"),
+            NodeRequest::Written { key, passed_on } => {
                 NodeEngine::written(engine, &key, passed_on);
                 Reply {
                     answer: NodeAnswer::Written,
@@ -774,7 +787,7 @@ async fn connection(stream: TcpStream, engine: &SharedNode, secret: &str) -> io:
                     sending: None,
                 }
             }
-            Ok(NodeRequest::Ring) => Reply {
+            NodeRequest::Ring => Reply {
                 answer: NodeAnswer::Ring {
                     ring: NodeEngine::ring(engine),
                     addresses: engine.borrow().addresses.clone(),
@@ -783,7 +796,7 @@ async fn connection(stream: TcpStream, engine: &SharedNode, secret: &str) -> io:
                 len: 0,
                 sending: None,
             },
-            Ok(NodeRequest::Read(read)) => {
+            NodeRequest::Read(read) => {
                 let head_only =
                     matches!(&read, Read::Object { request, .. } if request.method == Method::Head);
                 let Ok(mut reply) = NodeEngine::read(engine, read).await else {
@@ -817,14 +830,72 @@ async fn connection(stream: TcpStream, engine: &SharedNode, secret: &str) -> io:
     Ok(())
 }
 
-async fn refuse(connection: &mut Connection, status: u16) -> io::Result<()> {
+/// Answers `status` without reading the request's `len`-byte body, and
+/// closes the connection.
+async fn refuse(connection: &mut Connection, status: u16, len: u64) -> io::Result<()> {
     let response = Response {
         status,
         headers: Vec::new(),
         content_length: 0,
         body: Bytes::new(),
     };
-    connection.write_response(&response, false).await
+    connection.write_response(&response, false).await?;
+    if len > 0 {
+        connection.linger().await;
+    }
+    Ok(())
+}
+
+/// Passes a gateway's forwarded request to S3 and S3's answer back, and
+/// returns whether the connection can take another request. A write S3
+/// accepted changes the node's view of its object before the gateway
+/// hears, so the gateway's next read sees the write.
+async fn forward_to_s3(
+    connection: &mut Connection,
+    engine: &SharedNode,
+    forward: &Forward,
+    keep_alive: bool,
+) -> io::Result<bool> {
+    let origin = engine.borrow().origin.clone();
+    let sent = passthrough::to_s3(&origin, forward, connection).await;
+    let response = match sent.response {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("forwarding to S3: {error}");
+            let unread = if sent.body_read { 0 } else { forward.len };
+            refuse(connection, 502, unread).await?;
+            return Ok(false);
+        }
+    };
+    let status = response.status().as_u16();
+    if status < 300
+        && let Some(key) = passthrough::written_key(&forward.method, &forward.path)
+    {
+        NodeEngine::written(engine, &key, false);
+    }
+    let answer = passthrough::forwarded(&forward.method, &response);
+    let length = match &answer {
+        NodeAnswer::Forwarded { length, .. } => *length,
+        _ => None,
+    };
+    let bodiless = passthrough::bodiless(&forward.method, status);
+    let framing = match (bodiless, length) {
+        (true, _) => Framing::Length(0),
+        (false, Some(length)) => Framing::Length(length),
+        (false, None) => Framing::Chunked,
+    };
+    let version = NodeEngine::ring(engine).version();
+    let (status, headers) = protocol::encode_answer(&answer, version);
+    let keep_alive = keep_alive && sent.body_read;
+    connection
+        .write_response_head(status, &headers, framing, keep_alive)
+        .await?;
+    let complete = bodiless || passthrough::stream_body(connection, response, framing).await?;
+    if !sent.body_read {
+        // S3 answered before the body ended.
+        connection.linger().await;
+    }
+    Ok(complete && keep_alive)
 }
 
 /// Sends a reply's body and returns how many bytes went. Runs of stored

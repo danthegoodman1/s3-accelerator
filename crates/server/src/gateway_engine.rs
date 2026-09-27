@@ -20,6 +20,8 @@ use tokio::sync::mpsc;
 
 /// How long a gateway waits for each node's ring.
 const RING_WAIT: Duration = Duration::from_secs(1);
+/// How long a gateway waits for homes to hear of writes before it answers.
+const WRITTEN_WAIT: Duration = Duration::from_secs(5);
 
 /// What a client's connection does next for its read.
 pub enum Event {
@@ -106,28 +108,89 @@ impl GatewayEngine {
         start(engine, work);
     }
 
-    /// A write to `key` through this gateway succeeded: the gateway forgets
-    /// the key's metadata, and tells the key's home.
-    pub fn written(engine: &SharedGateway, key: &ObjectKey) {
-        let (home, peers) = {
-            let mut this = engine.borrow_mut();
-            let now = this.now();
-            this.gateway.on_write(now, key);
-            let home = this.gateway.ring().owner(Placement::Home(key).hash());
-            (home, this.peers.clone())
+    /// A write through this gateway to `key` succeeded, and `via`, the
+    /// node that passed it to S3, has told the key's home: the gateway
+    /// forgets the key's metadata.
+    pub fn written_via(engine: &SharedGateway, key: &ObjectKey, via: NodeId) {
+        let mut this = engine.borrow_mut();
+        let now = this.now();
+        this.gateway.on_write(now, key, Some(via));
+    }
+
+    /// Writes through this gateway to `keys` succeeded, and no node told
+    /// their homes: the gateway tells each home, and then forgets the keys'
+    /// metadata, so its next read of a key sees its write.
+    pub async fn written(engine: &SharedGateway, keys: Vec<ObjectKey>) {
+        let (peers, homes) = {
+            let this = engine.borrow();
+            let ring = this.gateway.ring();
+            let homes: Vec<Option<NodeId>> = keys
+                .iter()
+                .map(|key| ring.owner(Placement::Home(key).hash()))
+                .collect();
+            (this.peers.clone(), homes)
         };
-        if let Some(home) = home {
-            let request = NodeRequest::Written {
-                key: key.clone(),
-                passed_on: false,
-            };
-            tokio::task::spawn_local(async move {
-                match peers.exchange(home, &request).await {
-                    Ok(exchanged) => peers.idle(exchanged.body),
-                    Err(error) => eprintln!("telling node {} of a write: {error}", home.0),
+        let mut by_home: BTreeMap<NodeId, Vec<usize>> = BTreeMap::new();
+        for (index, home) in homes.iter().enumerate() {
+            if let Some(home) = home {
+                by_home.entry(*home).or_default().push(index);
+            }
+        }
+        let keys = Rc::new(keys);
+        let heard = Rc::new(RefCell::new(vec![false; keys.len()]));
+        let mut telling = tokio::task::JoinSet::new();
+        for (home, indexes) in by_home {
+            let (peers, keys, heard) = (peers.clone(), keys.clone(), heard.clone());
+            telling.spawn_local(async move {
+                for index in indexes {
+                    let request = NodeRequest::Written {
+                        key: keys[index].clone(),
+                        passed_on: false,
+                    };
+                    match peers.exchange(home, &request).await {
+                        Ok(exchanged) => {
+                            peers.idle(exchanged.body);
+                            heard.borrow_mut()[index] = true;
+                        }
+                        Err(error) => {
+                            eprintln!("telling node {} of a write: {error}", home.0);
+                            return;
+                        }
+                    }
                 }
             });
         }
+        let told = async { while telling.join_next().await.is_some() {} };
+        if tokio::time::timeout(WRITTEN_WAIT, told).await.is_err() {
+            eprintln!("homes took too long to hear of writes");
+        }
+        let heard = heard.borrow();
+        let mut this = engine.borrow_mut();
+        let now = this.now();
+        for (index, key) in keys.iter().enumerate() {
+            let via = homes[index].filter(|_| heard[index]);
+            this.gateway.on_write(now, key, via);
+        }
+    }
+
+    /// The nodes to pass a request for `target` through to S3, best first.
+    pub fn pass_candidates(engine: &SharedGateway, target: &ObjectKey) -> Vec<NodeId> {
+        engine.borrow().gateway.pass_candidates(target)
+    }
+
+    pub fn peers(engine: &SharedGateway) -> Rc<Peers> {
+        engine.borrow().peers.clone()
+    }
+
+    /// `node` answered under a ring of `version`.
+    pub fn ring_version(engine: &SharedGateway, node: NodeId, version: u64) {
+        let work = {
+            let mut this = engine.borrow_mut();
+            let now = this.now();
+            this.gateway.on_ring_version(now, node, version);
+            this.pump()
+        };
+        start(engine, work);
     }
 
     /// Lets the gateway fail over from nodes that time out.

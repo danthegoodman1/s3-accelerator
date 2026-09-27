@@ -156,6 +156,36 @@ async fn overwrite_changes_etag_and_body() {
     assert_eq!(output.body.collect().await.unwrap().to_vec(), body);
 }
 
+/// Reads of a version the cache holds, then an overwrite and a delete:
+/// each read after a write sees it, as S3's read-after-write promises.
+#[tokio::test]
+#[ignore = "needs an S3 endpoint: scripts/s3proxy start"]
+async fn reads_after_an_overwrite_and_a_delete_see_them() {
+    let client = client();
+    let bucket = bucket(&client, "read-after-write").await;
+    let read = |client: &aws_sdk_s3::Client| client.get_object().bucket(&bucket).key("k").send();
+    let first = pattern(300, 8);
+    put(&client, &bucket, "k", &first).await;
+    for _ in 0..2 {
+        let output = read(&client).await.unwrap();
+        assert_eq!(output.body.collect().await.unwrap().to_vec(), first);
+    }
+    let body = pattern(200, 9);
+    let second = put(&client, &bucket, "k", &body).await;
+    let output = read(&client).await.unwrap();
+    assert_eq!(output.e_tag(), Some(second.as_str()));
+    assert_eq!(output.body.collect().await.unwrap().to_vec(), body);
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key("k")
+        .send()
+        .await
+        .expect("delete object");
+    let error = read(&client).await.expect_err("the key is gone");
+    assert_eq!(status(&error), Some(404));
+}
+
 #[tokio::test]
 #[ignore = "needs an S3 endpoint: scripts/s3proxy start"]
 async fn head_object_reports_size_and_etag() {

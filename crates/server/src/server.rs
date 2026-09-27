@@ -1,23 +1,21 @@
 //! Accepts S3 clients, authenticates and authorizes each request, and serves
 //! `GetObject` and `HeadObject` through the core. Other operations pass
-//! through to S3 under the cluster's signature.
+//! through a storage node, which signs them for S3.
 
 use crate::config::{Client, Config};
 use crate::disk::Disk;
 use crate::gateway_engine::{Event, GatewayEngine, SharedGateway};
 use crate::http::{Connection, Framing, RequestHead, Response};
-use crate::http::{etag_condition, format_content_range, header, parse_range};
+use crate::http::{etag_condition, format_content_range, header, parse_range, split_path};
 use crate::membership_engine;
 use crate::node_engine::{self, NodeEngine};
-use crate::origin::{self, Origin, RequestBody};
+use crate::origin::{self, Origin};
+use crate::passthrough::{self, ToNode};
 use crate::peers::Peers;
+use crate::protocol::{self, NodeAnswer, NodeRequest};
 use crate::sigv4::{self, AuthError, Credentials, Signable};
 use crate::zero_copy::{self, Short};
 use bytes::Bytes;
-use http_body_util::channel::{Channel, Sender as BodySender};
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
-use percent_encoding::percent_decode_str;
 use s3_accelerator_core::Time;
 use s3_accelerator_core::membership::{Membership, Peer};
 use s3_accelerator_core::node::Node;
@@ -35,7 +33,6 @@ use tokio::sync::watch;
 
 struct Context {
     gateway: SharedGateway,
-    origin: Rc<Origin>,
     clients: Vec<Client>,
 }
 
@@ -97,15 +94,6 @@ pub async fn run_with(
     stop: impl Future<Output = ()> + 'static,
     leave: impl Future<Output = ()> + 'static,
 ) -> io::Result<()> {
-    let credentials = Credentials {
-        access_key_id: config.origin.access_key_id.clone(),
-        secret_access_key: config.origin.secret_access_key.clone(),
-    };
-    let origin = Rc::new(Origin::new(
-        &config.origin.endpoint,
-        &config.origin.region,
-        credentials,
-    ));
     let secret: Rc<str> = config.cluster.secret.as_str().into();
     let peers = Peers::new(config.addresses(), secret.clone());
     let (stopping, stopped) = watch::channel(false);
@@ -117,6 +105,15 @@ pub async fn run_with(
     });
     let node = match (&config.node, listeners.node) {
         (Some(node), Some(listener)) => {
+            let origin = config
+                .origin
+                .as_ref()
+                .expect("checked: a node has an origin");
+            let credentials = Credentials {
+                access_key_id: origin.access_key_id.clone(),
+                secret_access_key: origin.secret_access_key.clone(),
+            };
+            let origin = Rc::new(Origin::new(&origin.endpoint, &origin.region, credentials));
             let node_config = config.cache.node_config();
             let (disk, recovery) = Disk::open(Path::new(&node.data_dir), node_config.store)?;
             let id = NodeId(node.id);
@@ -138,7 +135,7 @@ pub async fn run_with(
             );
             let engine = NodeEngine::new(
                 recovered,
-                origin.clone(),
+                origin,
                 peers.clone(),
                 Arc::new(disk),
                 config.addresses(),
@@ -192,7 +189,6 @@ pub async fn run_with(
         let gateway = GatewayEngine::new(config.ring(), config.cache.gateway_config(), peers);
         let context = Rc::new(Context {
             gateway,
-            origin,
             clients: config.clients,
         });
         serve_clients(listener, context, stopped_signal(stopped)).await?;
@@ -353,7 +349,7 @@ async fn handle(
         }
         return read(connection, request, head.keep_alive, context).await;
     }
-    let request = Forward {
+    let request = Passing {
         head,
         payload_hash,
         digest,
@@ -361,7 +357,7 @@ async fn handle(
         bucket: &bucket,
         key: &key,
     };
-    forward(connection, request, context).await
+    pass(connection, request, context).await
 }
 
 /// The core's request, if the core serves this one.
@@ -497,8 +493,8 @@ fn answer(head: &ResponseHead, method: Method) -> Response {
     }
 }
 
-/// A request the gateway passes to S3.
-struct Forward<'a> {
+/// A request the gateway passes to S3 through a storage node.
+struct Passing<'a> {
     head: &'a RequestHead,
     payload_hash: &'a str,
     /// The body's SHA-256, when the client signed it.
@@ -508,12 +504,14 @@ struct Forward<'a> {
     key: &'a str,
 }
 
-/// Passes a request to S3 and its response back. The body streams to S3
-/// as it arrives, except a `DeleteObjects` list, which the gateway reads
-/// to learn the keys it deletes.
-async fn forward(
+/// Passes a request to S3 through a storage node, and S3's answer back.
+/// An object's request goes through its home, and a bucket's through a
+/// node chosen by the bucket. The body streams to the node as it arrives,
+/// except a `DeleteObjects` list, which the gateway reads to learn the keys
+/// it deletes.
+async fn pass(
     connection: &mut Connection,
-    request: Forward<'_>,
+    request: Passing<'_>,
     context: &Context,
 ) -> io::Result<bool> {
     let head = request.head;
@@ -538,223 +536,178 @@ async fn forward(
     if request.len > 0 && expects_continue {
         connection.write_continue().await?;
     }
-    let (sent, listed) = match deletes_objects {
+    let listed = match deletes_objects {
         true => {
-            let body = Bytes::from(connection.read_body(request.len).await?);
+            let body = connection.read_body(request.len).await?;
             if request
                 .digest
                 .as_ref()
                 .is_some_and(|digest| hex::encode(Sha256::digest(&body)) != *digest)
             {
-                connection.write_response(&hash_mismatch(), true).await?;
+                connection
+                    .write_response(&hash_mismatch(), head.keep_alive)
+                    .await?;
                 return Ok(true);
             }
-            let keys = listed_keys(&String::from_utf8_lossy(&body));
-            let body = Full::new(body).map_err(|never| match never {}).boxed();
-            let sent = send_to_s3(&request, body, context).await;
-            (
-                Sent {
-                    response: sent,
-                    body_read: true,
-                    matched: true,
-                },
-                Some(keys),
-            )
+            Some(body)
         }
-        false => (upload(connection, &request, context).await, None),
+        false => None,
     };
-    if !sent.matched {
-        connection
-            .write_response(&hash_mismatch(), sent.body_read)
-            .await?;
-        return Ok(sent.body_read);
+    let forward = NodeRequest::Forward(protocol::Forward {
+        method: head.method.clone(),
+        path: head.path.clone(),
+        query: head.query.clone(),
+        headers: head
+            .headers
+            .iter()
+            .filter(|(name, _)| !origin::is_hop_header(name))
+            .cloned()
+            .collect(),
+        payload_hash: request.payload_hash.to_string(),
+        len: request.len,
+    });
+    let target = ObjectKey {
+        bucket: request.bucket.to_string(),
+        key: request.key.to_string(),
+    };
+    let peers = GatewayEngine::peers(&context.gateway);
+    let mut opened = None;
+    for node in GatewayEngine::pass_candidates(&context.gateway, &target) {
+        match peers.send_head(node, &forward, request.len).await {
+            Ok(connection) => {
+                opened = Some((node, connection));
+                break;
+            }
+            Err(failure) => eprintln!("passing a request to node {}: {failure}", node.0),
+        }
     }
-    let response = match sent.response {
-        Ok(response) => response,
-        Err(failure) => {
-            let response = error(502, "BadGateway", &failure.to_string());
+    let Some((node, mut to_node)) = opened else {
+        let response = error(503, "ServiceUnavailable", "no storage node answered");
+        connection.write_response(&response, false).await?;
+        return Ok(listed.is_some());
+    };
+    let body_read = match &listed {
+        Some(body) => to_node.write_all(body).await.is_ok(),
+        None => {
+            let stream = to_node.stream();
+            let digest = request.digest.as_deref();
+            let passing = passthrough::pass_body(connection, request.len, digest, ToNode(stream));
+            // The node may answer before the body ends, such as when S3
+            // refuses it.
+            let answered = async {
+                let _ = stream.peek(&mut [0; 1]).await;
+            };
+            let passed = tokio::select! {
+                biased;
+                passed = passing => Some(passed),
+                () = answered => None,
+            };
+            match passed {
+                Some(Ok(true)) => true,
+                Some(Ok(false)) => {
+                    // Closing the node's connection ends the body short,
+                    // so S3 never takes it.
+                    connection
+                        .write_response(&hash_mismatch(), head.keep_alive)
+                        .await?;
+                    return Ok(true);
+                }
+                Some(Err(Short::Source(failure))) => return Err(failure),
+                Some(Err(Short::Destination(_))) | None => false,
+            }
+        }
+    };
+    let answered = match to_node.read_response_head().await {
+        Ok((status, headers)) => protocol::decode_answer(status, &headers)
+            .map(|answer| (answer, headers))
+            .map_err(io::Error::other),
+        Err(failure) => Err(failure),
+    };
+    let (status, headers, length, node_closes) = match answered {
+        Ok((
+            NodeAnswer::Forwarded {
+                status,
+                headers,
+                length,
+            },
+            hop,
+        )) => {
+            if let Some(version) = protocol::ring_version(&hop) {
+                GatewayEngine::ring_version(&context.gateway, node, version);
+            }
+            let closes = header(&hop, "connection").is_some_and(|value| value == "close");
+            (status, headers, length, closes)
+        }
+        Ok(_) | Err(_) => {
+            if let Err(failure) = answered {
+                eprintln!("passing a request through node {}: {failure}", node.0);
+            }
+            let response = error(502, "BadGateway", "the storage node failed");
             connection.write_response(&response, false).await?;
             return Ok(false);
         }
     };
-    if response.status().as_u16() < 300 && !request.bucket.is_empty() {
-        let keys = listed.unwrap_or_else(|| written_keys(head, request.key));
-        for key in keys {
-            let key = ObjectKey {
-                bucket: request.bucket.to_string(),
-                key,
-            };
-            GatewayEngine::written(&context.gateway, &key);
-        }
-    }
-    let passed = pass_response(connection, head, response).await?;
-    Ok(passed && sent.body_read)
-}
-
-/// How a forwarded request went.
-struct Sent {
-    response: io::Result<hyper::Response<Incoming>>,
-    /// Whether the client's body was read to its end.
-    body_read: bool,
-    /// Whether the body matched its signed hash.
-    matched: bool,
-}
-
-async fn send_to_s3(
-    request: &Forward<'_>,
-    body: RequestBody,
-    context: &Context,
-) -> io::Result<hyper::Response<Incoming>> {
-    let head = request.head;
-    let sent = context.origin.forward(
-        &head.method,
-        &head.path,
-        &head.query,
-        &head.headers,
-        request.payload_hash,
-        body,
-        request.len,
-    );
-    tokio::time::timeout(origin::READ_TIMEOUT, sent)
-        .await
-        .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
-}
-
-/// Streams the client's body to S3 while S3's answer is awaited. S3 may
-/// answer before the body ends, such as to refuse it.
-async fn upload(connection: &mut Connection, request: &Forward<'_>, context: &Context) -> Sent {
-    let (sender, body) = Channel::<Bytes, io::Error>::new(2);
-    let head = request.head;
-    let sent = context.origin.forward(
-        &head.method,
-        &head.path,
-        &head.query,
-        &head.headers,
-        request.payload_hash,
-        body.boxed(),
-        request.len,
-    );
-    let mut sent = std::pin::pin!(sent);
-    let mut passing = std::pin::pin!(pass_body(connection, request, sender));
-    let mut passed = None;
-    let response = loop {
-        tokio::select! {
-            result = &mut passing, if passed.is_none() => passed = Some(result),
-            response = &mut sent => break response,
-        }
-        if passed.is_some() {
-            // The body is sent; S3 has a while to answer.
-            break tokio::time::timeout(origin::READ_TIMEOUT, &mut sent)
-                .await
-                .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()));
-        }
-    };
-    Sent {
-        response,
-        body_read: matches!(passed, Some(Ok(_))),
-        matched: !matches!(passed, Some(Ok(false))),
-    }
-}
-
-/// Passes the client's body to S3 as it arrives, and returns whether it
-/// matched its signed hash. The last bytes wait until the whole body is
-/// checked, so S3 never receives a body that fails its hash.
-async fn pass_body(
-    connection: &mut Connection,
-    request: &Forward<'_>,
-    mut sender: BodySender<Bytes, io::Error>,
-) -> io::Result<bool> {
-    let mut hasher = Sha256::new();
-    let mut remaining = request.len;
-    let mut held: Option<Bytes> = None;
-    while remaining > 0 {
-        let max = usize::try_from(remaining).unwrap_or(usize::MAX);
-        let chunk = match connection.read_some(max).await {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                sender.abort(io::Error::other("the client's body ended early"));
-                return Err(error);
+    if status < 300 {
+        match listed {
+            Some(body) => {
+                let keys = listed_keys(&String::from_utf8_lossy(&body))
+                    .into_iter()
+                    .map(|key| ObjectKey {
+                        bucket: request.bucket.to_string(),
+                        key,
+                    })
+                    .collect();
+                GatewayEngine::written(&context.gateway, keys).await;
             }
-        };
-        remaining -= chunk.len() as u64;
-        if request.digest.is_some() {
-            hasher.update(&chunk);
-        }
-        if let Some(previous) = held.replace(chunk)
-            && sender.send_data(previous).await.is_err()
-        {
-            return Err(io::Error::other("S3 stopped taking the body"));
+            None => {
+                if let Some(key) = passthrough::written_key(&head.method, &head.path) {
+                    GatewayEngine::written_via(&context.gateway, &key, node);
+                }
+            }
         }
     }
-    if let Some(digest) = &request.digest
-        && hex::encode(hasher.finalize()) != *digest
-    {
-        sender.abort(io::Error::other("the body does not match its hash"));
-        return Ok(false);
-    }
-    if let Some(last) = held
-        && sender.send_data(last).await.is_err()
-    {
-        return Err(io::Error::other("S3 stopped taking the body"));
-    }
-    Ok(true)
-}
-
-/// Sends S3's response on to the client as it arrives, and returns whether
-/// it arrived in full.
-async fn pass_response(
-    connection: &mut Connection,
-    head: &RequestHead,
-    response: hyper::Response<Incoming>,
-) -> io::Result<bool> {
-    let status = response.status().as_u16();
-    let headers = origin::header_pairs(response.headers());
-    let length = header(&headers, "content-length").and_then(|value| value.parse::<u64>().ok());
-    let hop = [
-        "connection",
-        "content-length",
-        "keep-alive",
-        "transfer-encoding",
-    ];
-    let headers: Vec<(String, String)> = headers
-        .into_iter()
-        .filter(|(name, _)| !hop.contains(&name.as_str()))
-        .collect();
-    let bodiless = head.method == "HEAD" || status == 204 || status == 304;
+    let bodiless = passthrough::bodiless(&head.method, status);
     let framing = match (bodiless, length) {
         (true, length) => Framing::Length(length.unwrap_or(0)),
         (false, Some(length)) => Framing::Length(length),
         (false, None) => Framing::Chunked,
     };
+    let keep_alive = head.keep_alive && body_read;
     connection
-        .write_response_head(status, &headers, framing, head.keep_alive)
+        .write_response_head(status, &headers, framing, keep_alive)
         .await?;
-    if bodiless {
-        return Ok(true);
-    }
-    let mut body = response.into_body();
-    let mut sent = 0;
-    loop {
-        match origin::next_frame(&mut body).await {
-            Ok(Some(chunk)) => {
-                match framing {
-                    Framing::Length(_) => connection.write_all(&chunk).await?,
-                    Framing::Chunked => connection.write_chunk(&chunk).await?,
-                }
-                sent += chunk.len() as u64;
+    let complete = match (bodiless, framing) {
+        (true, _) => true,
+        (false, Framing::Length(length)) => {
+            let (copied, relayed) =
+                zero_copy::relay(to_node.stream(), connection.stream(), length).await;
+            if let Err(Short::Destination(failure)) = relayed {
+                return Err(failure);
             }
+            copied == length
+        }
+        (false, Framing::Chunked) => relay_chunks(&mut to_node, connection).await?,
+    };
+    if complete && body_read && !node_closes {
+        peers.keep(node, to_node);
+    }
+    Ok(complete && body_read)
+}
+
+/// Relays a chunked body from a node to the client, and returns whether it
+/// arrived in full.
+async fn relay_chunks(from: &mut Connection, to: &mut Connection) -> io::Result<bool> {
+    let mut left = 0;
+    loop {
+        match from.read_chunked(&mut left).await {
+            Ok(Some(piece)) => to.write_chunk(&piece).await?,
             Ok(None) => break,
-            // The client's body ends short, and the connection with it.
+            // The body ends short, and the connection with it.
             Err(_) => return Ok(false),
         }
     }
-    match framing {
-        Framing::Chunked => {
-            connection.finish_chunks().await?;
-            Ok(true)
-        }
-        Framing::Length(length) => Ok(sent == length),
-    }
+    to.finish_chunks().await?;
+    Ok(true)
 }
 
 fn hash_mismatch() -> Response {
@@ -763,15 +716,6 @@ fn hash_mismatch() -> Response {
         "XAmzContentSHA256Mismatch",
         "the body does not match its hash",
     )
-}
-
-/// The key a successful request wrote: the path's key for a `PUT`, `POST`
-/// or `DELETE` of an object.
-fn written_keys(head: &RequestHead, key: &str) -> Vec<String> {
-    match (head.method.as_str(), key.is_empty()) {
-        ("PUT" | "POST" | "DELETE", false) => vec![key.to_string()],
-        _ => Vec::new(),
-    }
 }
 
 /// The `<Key>` elements of a `DeleteObjects` request body.
@@ -793,14 +737,6 @@ fn listed_keys(xml: &str) -> Vec<String> {
 fn copy_source(value: &str) -> (String, String) {
     let value = value.split_once('?').map_or(value, |(source, _)| source);
     split_path(&format!("/{}", value.trim_start_matches('/')))
-}
-
-/// A path-style request's bucket and key, decoded.
-fn split_path(path: &str) -> (String, String) {
-    let path = path.strip_prefix('/').unwrap_or(path);
-    let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
-    let decode = |part: &str| percent_decode_str(part).decode_utf8_lossy().into_owned();
-    (decode(bucket), decode(key))
 }
 
 fn auth_error(failure: AuthError) -> Response {

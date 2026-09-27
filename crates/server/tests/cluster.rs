@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{CLUSTER_CACHE, Cluster, data_dir, object, start_origin, try_get};
+use common::{CLUSTER_CACHE, Cluster, LISTING, data_dir, object, send, start_origin, try_get};
 use std::time::Duration;
 use tokio::task::LocalSet;
 
@@ -221,6 +221,64 @@ async fn a_node_starts_while_another_address_does_not_resolve() {
                 answer = cluster.get("k").await;
             }
             assert_eq!(answer, (200, origin.object("/bucket/k")));
+        })
+        .await;
+}
+
+/// A gateway holds no S3 credentials: writes, deletes and listings pass
+/// through storage nodes, and a listing S3 sends chunked reaches the client
+/// whole.
+#[tokio::test(flavor = "current_thread")]
+async fn requests_the_cache_does_not_serve_pass_through_nodes() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            origin.chunked.set(true);
+            let cluster = Cluster::with_nodes(&data_dir(), origin_port, CLUSTER_CACHE, 2, "", &[]);
+            let gateway = std::fs::read_to_string(&cluster.gateway).unwrap();
+            assert!(!gateway.contains("[origin]"));
+            let _nodes = [cluster.start(0).await, cluster.start(1).await];
+            let _gateway = cluster.start_gateway().await;
+            let port = cluster.gateway_port;
+            let body = b"written through a node".to_vec();
+            let (status, _) = send(port, "PUT", "/bucket/new", "", &[], body.clone()).await;
+            assert_eq!(status, 200);
+            assert_eq!(*origin.uploads.borrow(), [body]);
+            // The second listing reuses the node connection the first left.
+            for _ in 0..2 {
+                let listed = send(port, "GET", "/bucket", "list-type=2", &[], Vec::new()).await;
+                assert_eq!(listed, (200, LISTING.as_bytes().to_vec()));
+            }
+            let (status, _) = send(port, "DELETE", "/bucket/new", "", &[], Vec::new()).await;
+            assert_eq!(status, 200);
+        })
+        .await;
+}
+
+/// A write through a gateway reaches the key's home before the client
+/// hears, so the gateway's next read returns what was written, though the
+/// gateway and the home both held the old version's metadata and the home
+/// its blocks.
+#[tokio::test(flavor = "current_thread")]
+async fn a_read_after_a_write_through_the_gateway_sees_the_write() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            let cluster = Cluster::with_nodes(&data_dir(), origin_port, CLUSTER_CACHE, 2, "", &[]);
+            let _nodes = [cluster.start(0).await, cluster.start(1).await];
+            let _gateway = cluster.start_gateway().await;
+            let port = cluster.gateway_port;
+            let path = "/changing/k";
+            let first = origin.object(path);
+            for _ in 0..2 {
+                let read = send(port, "GET", path, "", &[], Vec::new()).await;
+                assert!(read == (200, first.clone()));
+            }
+            let written = b"the new version".to_vec();
+            let (status, _) = send(port, "PUT", path, "", &[], written.clone()).await;
+            assert_eq!(status, 200);
+            let read = send(port, "GET", path, "", &[], Vec::new()).await;
+            assert_eq!(read, (200, written));
         })
         .await;
 }

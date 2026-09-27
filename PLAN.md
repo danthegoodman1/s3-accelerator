@@ -307,11 +307,11 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 5A: Writes through the home | Missing: implementation. |
+| Complete | Work | 5A: Writes through the home | Gateways pass every request the cache doesn't serve through a storage node, which re-signs it, and need no `[origin]` (`crates/server/src/passthrough.rs`, `NodeRequest::Forward`; `requests_the_cache_does_not_serve_pass_through_nodes`, including a chunked listing; `scripts/cluster`'s gateway has no credentials). The node drops the home's metadata before the gateway hears (`a_read_after_a_write_through_the_gateway_sees_the_write`); a node other than the home passes the write on (`a_write_around_a_suspected_home_reaches_the_home`); a gateway reads a key it wrote around the home directly from S3 until the bucket's TTL passes (`a_gateway_reads_a_key_it_wrote_around_its_home_from_s3`; seed 2093); a gateway's write markers outlast cache eviction (`a_write_outlasts_its_key_leaving_the_cache`; seed 2921). The simulator passes writes through gateways and nodes as messages in three seeds of four. Conformance `reads_after_an_overwrite_and_a_delete_see_them` passes against s3proxy, one process and a three-node cluster (11 of 11). `scripts/mutants` catches the new planted bugs (a write marker leaving with its cache entry, a gateway trusting a home it wrote around, a node keeping a write from the home, a gateway or node skipping its half of a write, a chunked answer relayed unframed) and the seven earlier write and pass-through bugs, four of them repointed at code that moved. |
 | Incomplete | Work | 5B: `events` freshness mode | Missing: implementation and event model. |
 | Incomplete | Work | 5C: Hot-key leases | Missing: implementation. |
 | Incomplete | Work | 5D: Warming on write and metadata prefetch | Missing: implementation and format-aware object model. |
-| Incomplete | Test | 5E: Write, hot-key and prefetch properties | Missing: properties. |
+| Incomplete | Test | 5E: Write, hot-key and prefetch properties | Done: a read through the gateway that passed a write, sent after the write succeeded, sees it while the gateway's ring stays the same (`Simulator::answer`); 10,000 seeds pass. Missing: hot-key load spread and prefetch properties. |
 | Incomplete | Work | 5F: Durable purge | Missing: implementation and scenario. |
 | Incomplete | Gate | 10,000-seed sweep with writes | Missing: sweep output. |
 | Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |

@@ -3,6 +3,7 @@
 //! header formats S3 and the cluster share.
 
 use bytes::Bytes;
+use percent_encoding::percent_decode_str;
 use s3_accelerator_core::s3::{ByteRange, ContentRange, ETag};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -157,14 +158,70 @@ impl Connection {
         headers: &[(String, String)],
         body: &[u8],
     ) -> io::Result<()> {
+        self.write_request_head(method, target, headers, body.len() as u64)
+            .await?;
+        self.write_all(body).await
+    }
+
+    /// Sends a request's head; its `len`-byte body follows.
+    pub async fn write_request_head(
+        &mut self,
+        method: &str,
+        target: &str,
+        headers: &[(String, String)],
+        len: u64,
+    ) -> io::Result<()> {
         let mut head = format!("{method} {target} HTTP/1.1\r\n");
         for (name, value) in headers {
             head.push_str(&format!("{name}: {value}\r\n"));
         }
-        head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
-        self.stream.write_all(head.as_bytes()).await?;
-        self.stream.write_all(body).await?;
-        self.stream.flush().await
+        head.push_str(&format!("Content-Length: {len}\r\n\r\n"));
+        self.write_all(head.as_bytes()).await
+    }
+
+    /// The next piece of a chunked body, or `None` at its end. `left`
+    /// carries the bytes left in the current chunk from call to call, and
+    /// starts at 0.
+    pub async fn read_chunked(&mut self, left: &mut u64) -> io::Result<Option<Bytes>> {
+        if *left == 0 {
+            let line = self.read_line().await?;
+            let size = line.split(';').next().unwrap_or_default().trim();
+            let size = u64::from_str_radix(size, 16).map_err(|_| invalid("bad chunk size"))?;
+            if size == 0 {
+                // Trailers, if any, end at an empty line.
+                while !self.read_line().await?.is_empty() {}
+                return Ok(None);
+            }
+            *left = size;
+        }
+        let piece = self
+            .read_some(usize::try_from(*left).unwrap_or(usize::MAX))
+            .await?;
+        *left -= piece.len() as u64;
+        if *left == 0 && !self.read_line().await?.is_empty() {
+            return Err(invalid("a chunk runs past its size"));
+        }
+        Ok(Some(piece))
+    }
+
+    /// The next line, without its CRLF.
+    async fn read_line(&mut self) -> io::Result<String> {
+        loop {
+            if let Some(end) = self.buffer.windows(2).position(|pair| pair == b"\r\n") {
+                let line = String::from_utf8_lossy(&self.buffer[..end]).into_owned();
+                self.buffer.drain(..end + 2);
+                return Ok(line);
+            }
+            if self.buffer.len() > MAX_HEAD {
+                return Err(invalid("line too long"));
+            }
+            let mut chunk = [0; 8 * 1024];
+            let read = self.stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
     }
 
     /// The next response's status and headers. Reads no byte past the
@@ -295,6 +352,31 @@ impl Connection {
     pub async fn finish_chunks(&mut self) -> io::Result<()> {
         self.write_all(b"0\r\n\r\n").await
     }
+}
+
+/// Writes all of `bytes` to a shared socket, which another task may read
+/// meanwhile, failing if the peer takes none of them for `WRITE_IDLE`.
+pub async fn write_shared(stream: &TcpStream, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        tokio::time::timeout(WRITE_IDLE, stream.writable())
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+        match stream.try_write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// A path-style request's bucket and key, decoded.
+pub fn split_path(path: &str) -> (String, String) {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
+    let decode = |part: &str| percent_decode_str(part).decode_utf8_lossy().into_owned();
+    (decode(bucket), decode(key))
 }
 
 /// A complete request head at the start of `buffer`, and its length.

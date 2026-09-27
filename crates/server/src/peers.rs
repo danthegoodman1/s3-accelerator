@@ -5,6 +5,8 @@
 use crate::http::{Connection, header};
 use crate::protocol::{self, NodeAnswer, NodeRequest};
 use bytes::Bytes;
+use rustix::io::Errno;
+use rustix::net::RecvFlags;
 use s3_accelerator_core::placement::NodeId;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -84,8 +86,7 @@ impl Peers {
         let address =
             address.ok_or_else(|| io::Error::other(format!("no address for node {}", node.0)))?;
         let address = address.as_str();
-        let idle = self.idle.borrow_mut().get_mut(&node).and_then(Vec::pop);
-        let (answer, ring, len, connection) = match idle {
+        let (answer, ring, len, connection) = match self.take_idle(node) {
             Some(connection) => match exchange_on(connection, request, &self.secret).await {
                 Ok(exchanged) => exchanged,
                 Err(_) => exchange_on(connect(address).await?, request, &self.secret).await?,
@@ -98,6 +99,47 @@ impl Peers {
             len,
         };
         Ok(Exchanged { answer, ring, body })
+    }
+
+    /// Sends `request`'s head to `node`, and returns the connection, which
+    /// takes the request's `len`-byte body next.
+    pub async fn send_head(
+        &self,
+        node: NodeId,
+        request: &NodeRequest,
+        len: u64,
+    ) -> io::Result<Connection> {
+        let mut connection = match self.take_idle(node) {
+            Some(connection) => connection,
+            None => {
+                let address = self.addresses.borrow().get(&node).cloned();
+                let address = address
+                    .ok_or_else(|| io::Error::other(format!("no address for node {}", node.0)))?;
+                connect(&address).await?
+            }
+        };
+        let (method, target, headers) = protocol::encode_request(request, &self.secret);
+        connection
+            .write_request_head(method, &target, &headers, len)
+            .await?;
+        Ok(connection)
+    }
+
+    /// Keeps a connection whose last answer was read in full for the next
+    /// request.
+    pub fn keep(&self, node: NodeId, connection: Connection) {
+        self.idle
+            .borrow_mut()
+            .entry(node)
+            .or_default()
+            .push(connection);
+    }
+
+    /// An idle connection to `node` the node has kept open.
+    fn take_idle(&self, node: NodeId) -> Option<Connection> {
+        let mut idle = self.idle.borrow_mut();
+        let connections = idle.get_mut(&node)?;
+        std::iter::from_fn(|| connections.pop()).find(open)
     }
 
     /// Keeps a connection for the next request if its last answer was read
@@ -121,6 +163,18 @@ impl Peers {
         self.idle(body);
         Ok(bytes.into())
     }
+}
+
+/// Whether an idle connection is still open, with nothing unread: a node
+/// that restarted closed it, and a stray byte would corrupt the next
+/// answer.
+fn open(connection: &Connection) -> bool {
+    let mut byte = [0; 1];
+    let flags = RecvFlags::PEEK | RecvFlags::DONTWAIT;
+    matches!(
+        rustix::net::recv(connection.stream(), &mut byte, flags),
+        Err(Errno::AGAIN)
+    )
 }
 
 async fn connect(address: &str) -> io::Result<Connection> {

@@ -132,6 +132,9 @@ pub struct Options {
     pub write_percent: u64,
     /// Share of writes to the TTL bucket that delete.
     pub delete_percent: u64,
+    /// Share of writes, while clients issue requests, that pass through a
+    /// gateway and a node to S3; the rest reach S3 from elsewhere.
+    pub gateway_write_percent: u64,
     /// One-way network delay, in ticks.
     pub delay_min: u64,
     pub delay_max: u64,
@@ -219,6 +222,7 @@ impl Options {
             fallback_window: 0,
             peer_timeout: 0,
             resize_per_10k: 0,
+            gateway_write_percent: 0,
         };
         // Timeouts outlast every exchange of a fault-free run, so only
         // faults make them fire: S3 answers within two hops, and a node
@@ -260,6 +264,10 @@ impl Options {
         options.resize_per_10k = match options.membership {
             true => prng.range(0..=20),
             false => 0,
+        };
+        options.gateway_write_percent = match prng.percent(25) {
+            true => 0,
+            false => prng.range(1..=100),
         };
         options
     }
@@ -319,6 +327,7 @@ impl Options {
             fallback_window: 1_000,
             peer_timeout: 50,
             resize_per_10k: 0,
+            gateway_write_percent: 0,
         }
     }
 
@@ -447,6 +456,51 @@ enum Message {
     WriteNotice {
         key: ObjectKey,
     },
+    /// A client's write through a gateway, which the gateway passes to a
+    /// node and the node to S3; `size` is `None` for a delete. Answers
+    /// carry when S3 applied it.
+    ClientWrite {
+        change: u64,
+        key: ObjectKey,
+    },
+    NodeWrite {
+        gateway: usize,
+        change: u64,
+        key: ObjectKey,
+        size: Option<u64>,
+    },
+    /// A node write that found its node down, as a refused connection.
+    NodeWriteRefused {
+        change: u64,
+    },
+    OriginWrite {
+        node: usize,
+        run: u64,
+        gateway: usize,
+        change: u64,
+        key: ObjectKey,
+        size: Option<u64>,
+    },
+    OriginWriteResponse {
+        run: u64,
+        gateway: usize,
+        change: u64,
+        key: ObjectKey,
+        status: u16,
+        applied: u64,
+    },
+    NodeWriteResponse {
+        change: u64,
+        key: ObjectKey,
+        status: u16,
+        applied: u64,
+        ring: (usize, u64),
+    },
+    ClientWriteResponse {
+        change: u64,
+        status: u16,
+        applied: u64,
+    },
     /// A node's read of a previous owner, which it numbered `origin` in its
     /// run `run`, and the answers.
     PeerRequest {
@@ -568,6 +622,38 @@ struct Pending {
     sent: u64,
 }
 
+/// An attempt at a client's read: the request, its client, the gateway
+/// it went through and that gateway's ring version, and when it went out.
+struct Attempt {
+    request: u64,
+    client: usize,
+    gateway: usize,
+    ring: u64,
+    sent: u64,
+}
+
+/// A client's write through a gateway, until the client hears or gives up.
+struct Change {
+    client: usize,
+    gateway: usize,
+    key: ObjectKey,
+    size: Option<u64>,
+    issued: u64,
+    /// The nodes the gateway has yet to try, and the version of the ring
+    /// it chose them by.
+    candidates: Vec<NodeId>,
+    ring: u64,
+}
+
+/// A write through a gateway that its client heard succeed: when S3
+/// applied it, when the client heard, and the gateway's ring version.
+#[derive(Clone, Copy)]
+struct Acknowledged {
+    applied: u64,
+    heard: u64,
+    ring: u64,
+}
+
 /// A response body as it arrived: `len` bytes long, unless it ended early.
 #[derive(Debug)]
 struct Body {
@@ -614,6 +700,8 @@ pub struct Simulator {
     tears: Prng,
     cuts: Prng,
     resizes: Prng,
+    gateway_writes: Prng,
+    write_errors: Prng,
     /// Whether faults happen: while clients are still issuing requests.
     faulty: bool,
     /// Nodes cut off from everyone, until the tick given.
@@ -651,8 +739,16 @@ pub struct Simulator {
     in_flight: Vec<usize>,
     requests: BTreeMap<u64, Pending>,
     issued: u64,
-    /// Each attempt a client sent: its request and its client.
-    attempts: BTreeMap<u64, (u64, usize, u64)>,
+    attempts: BTreeMap<u64, Attempt>,
+    /// Writes through gateways in progress, and the latest each gateway
+    /// saw succeed for each key.
+    changes: BTreeMap<u64, Change>,
+    next_change: u64,
+    acknowledged: BTreeMap<(usize, ObjectKey), Acknowledged>,
+    /// Writes S3 received, which it applies as the next tick starts.
+    origin_writes: Vec<Message>,
+    /// Scripted writes, and their statuses once they arrive.
+    watched_changes: BTreeMap<u64, Option<u16>>,
     /// When faults stopped.
     quiet_since: Option<u64>,
     next_attempt: u64,
@@ -757,6 +853,8 @@ impl Simulator {
             tears: Prng::stream(seed, "tears"),
             cuts: Prng::stream(seed, "cuts"),
             resizes: Prng::stream(seed, "resizes"),
+            gateway_writes: Prng::stream(seed, "gateway writes"),
+            write_errors: Prng::stream(seed, "write errors"),
             faulty: true,
             partitioned: BTreeMap::new(),
             down: BTreeMap::new(),
@@ -794,6 +892,11 @@ impl Simulator {
             in_flight: vec![0; options.clients],
             requests: BTreeMap::new(),
             attempts: BTreeMap::new(),
+            changes: BTreeMap::new(),
+            next_change: 0,
+            acknowledged: BTreeMap::new(),
+            origin_writes: Vec::new(),
+            watched_changes: BTreeMap::new(),
             quiet_since: None,
             next_attempt: 0,
             issued: 0,
@@ -900,16 +1003,40 @@ impl Simulator {
         self.origin.delete(self.now, key);
     }
 
-    /// Writes an object through gateway 0 and the key's home under its
-    /// ring: to the model of S3, then to the home, which learns the write
-    /// succeeded.
+    /// Writes an object through gateway 0, which passes it to the key's
+    /// home under its ring and the home to S3, and runs until the client
+    /// hears that it succeeded and the cluster is idle.
     pub fn write_through(&mut self, key: &ObjectKey, size: u64) -> Result<(), Failure> {
         self.write_through_via(0, key, size)
     }
 
-    /// Writes an object through `gateway` and the key's home under its
-    /// ring.
+    /// As `write_through`, through `gateway`.
     pub fn write_through_via(
+        &mut self,
+        gateway: usize,
+        key: &ObjectKey,
+        size: u64,
+    ) -> Result<(), Failure> {
+        let change = self.issue_change(0, gateway, key.clone(), Some(size));
+        self.watched_changes.insert(change, None);
+        let deadline = self.now + 100_000;
+        while self.watched_changes[&change].is_none() {
+            if self.now > deadline {
+                return Err(self.failure(format!("write {change} unanswered")));
+            }
+            self.tick()?;
+        }
+        self.settle()?;
+        match self.watched_changes.remove(&change).flatten() {
+            Some(status) if status < 300 => Ok(()),
+            status => Err(self.failure(format!("write {change} answered {status:?}"))),
+        }
+    }
+
+    /// Writes an object through `gateway` and the key's home under its
+    /// ring within this tick, as if the write's messages took no time, for
+    /// scripting a race against the write's answer.
+    pub fn write_at_once(
         &mut self,
         gateway: usize,
         key: &ObjectKey,
@@ -919,15 +1046,14 @@ impl Simulator {
         let home = self.gateways[gateway]
             .ring()
             .owner(Placement::Home(key).hash())
-            .expect("a node")
-            .0 as usize;
-        self.gateways[gateway].on_write(Time(self.now), key);
-        // A home that is down lost its metadata with its memory.
-        let Some(node) = self.nodes[home].as_mut() else {
-            return Ok(());
-        };
-        node.on_write(Time(self.now), key);
-        self.drain_node(home)
+            .expect("a node");
+        let now = Time(self.now);
+        if let Some(node) = self.nodes[home.0 as usize].as_mut() {
+            node.on_write(now, key);
+            self.drain_node(home.0 as usize)?;
+        }
+        self.gateways[gateway].on_write(now, key, Some(home));
+        self.drain_gateway(gateway)
     }
 
     pub fn origin(&self) -> &Origin {
@@ -1348,6 +1474,7 @@ impl Simulator {
 
     fn tick(&mut self) -> Result<(), Failure> {
         self.tick_faults()?;
+        self.apply_origin_writes();
         self.tick_writes();
         self.tick_clients();
         let mut events = 0;
@@ -1543,7 +1670,11 @@ impl Simulator {
                 + self.options.origin_timeout);
         // Membership gossips forever, so its timers and packets never run
         // out.
-        while !(self.queue.all(Event::is_membership) && self.idle()) && self.now <= deadline {
+        while !(self.queue.all(Event::is_membership)
+            && self.origin_writes.is_empty()
+            && self.idle())
+            && self.now <= deadline
+        {
             self.tick()?;
         }
         // Responses to cancelled requests that were lost never arrive.
@@ -1590,19 +1721,146 @@ impl Simulator {
         }
         let key = self.keys[self.writers.index(self.keys.len())].clone();
         let size = self.writers.range(1..=self.options.object_size_max);
+        let through_gateway = self.issued < self.options.requests
+            && self
+                .gateway_writes
+                .percent(self.options.gateway_write_percent);
         if key.bucket == IMMUTABLE_BUCKET {
-            if self.origin.current(&key).is_none() {
-                self.origin.put(self.now, &key, size, &mut self.writers);
-                self.summary.writes += 1;
+            // An immutable object is written once.
+            let writing = self.changes.values().any(|change| change.key == key);
+            if self.origin.current(&key).is_some() || writing {
+                return;
             }
+            match through_gateway {
+                true => self.write_through_gateway(key, Some(size)),
+                false => self.origin.put(self.now, &key, size, &mut self.writers),
+            }
+            self.summary.writes += 1;
             return;
         }
-        if self.writers.percent(self.options.delete_percent) {
-            self.origin.delete(self.now, &key);
-        } else {
-            self.origin.put(self.now, &key, size, &mut self.writers);
+        let delete = self.writers.percent(self.options.delete_percent);
+        match (through_gateway, delete) {
+            (true, true) => self.write_through_gateway(key.clone(), None),
+            (true, false) => self.write_through_gateway(key.clone(), Some(size)),
+            (false, true) => self.origin.delete(self.now, &key),
+            (false, false) => self.origin.put(self.now, &key, size, &mut self.writers),
+        }
+        if self.trace && !through_gateway {
+            let etag = self.origin.current(&key).map(|object| &object.etag);
+            eprintln!("{} S3 write of {key:?}: {etag:?}", self.now);
         }
         self.summary.writes += 1;
+    }
+
+    /// S3 applies the writes nodes sent it during the last tick. The model
+    /// of S3 keeps one state per key per tick, so writes land as a tick
+    /// starts, before any read in it.
+    fn apply_origin_writes(&mut self) {
+        for message in std::mem::take(&mut self.origin_writes) {
+            let Message::OriginWrite {
+                node,
+                run,
+                gateway,
+                change,
+                key,
+                size,
+            } = message
+            else {
+                unreachable!("only S3 writes wait for the tick");
+            };
+            let fails = self.faulty && self.write_errors.percent(self.options.origin_error_percent);
+            let status = match (fails, size) {
+                (true, _) => 503,
+                (false, Some(size)) => {
+                    self.origin
+                        .put(self.now, &key, size, &mut self.gateway_writes);
+                    200
+                }
+                (false, None) => {
+                    self.origin.delete(self.now, &key);
+                    204
+                }
+            };
+            if self.trace {
+                eprintln!(
+                    "{} write {change} reached S3 via node {node}: {status}",
+                    self.now
+                );
+            }
+            let response = Message::OriginWriteResponse {
+                run,
+                gateway,
+                change,
+                key,
+                status,
+                applied: self.now,
+            };
+            self.send(Address::Origin, Address::Node(node), response);
+        }
+    }
+
+    /// A random client writes `key` through a random gateway: `size` bytes,
+    /// or a delete for `None`.
+    fn write_through_gateway(&mut self, key: ObjectKey, size: Option<u64>) {
+        let client = self.gateway_writes.index(self.options.clients);
+        let gateway = self.gateway_writes.index(self.options.gateways);
+        self.issue_change(client, gateway, key, size);
+    }
+
+    fn issue_change(
+        &mut self,
+        client: usize,
+        gateway: usize,
+        key: ObjectKey,
+        size: Option<u64>,
+    ) -> u64 {
+        let change = self.next_change;
+        self.next_change += 1;
+        if self.trace {
+            eprintln!(
+                "{} write {change} of {key:?} ({size:?}) via gateway {gateway}",
+                self.now
+            );
+        }
+        let entry = Change {
+            client,
+            gateway,
+            key: key.clone(),
+            size,
+            issued: self.now,
+            candidates: Vec::new(),
+            ring: 0,
+        };
+        self.changes.insert(change, entry);
+        let message = Message::ClientWrite { change, key };
+        self.send(Address::Client(client), Address::Gateway(gateway), message);
+        change
+    }
+
+    /// Sends a write to the next node the gateway has yet to try, or
+    /// answers 503 when none is left.
+    fn pass_change(&mut self, gateway: usize, change: u64) {
+        let Some(entry) = self.changes.get_mut(&change) else {
+            return;
+        };
+        let (client, key, size) = (entry.client, entry.key.clone(), entry.size);
+        if entry.candidates.is_empty() {
+            let answer = Message::ClientWriteResponse {
+                change,
+                status: 503,
+                applied: self.now,
+            };
+            self.send(Address::Gateway(gateway), Address::Client(client), answer);
+            return;
+        }
+        let node = entry.candidates.remove(0).0 as usize;
+        let message = Message::NodeWrite {
+            gateway,
+            change,
+            key,
+            size,
+        };
+        self.send(Address::Gateway(gateway), Address::Node(node), message);
     }
 
     fn tick_clients(&mut self) {
@@ -1617,6 +1875,9 @@ impl Simulator {
             self.summary.client_retries += 1;
             self.attempt(request);
         }
+        // A write whose answer never comes may or may not have happened.
+        let before = self.now.saturating_sub(timeout);
+        self.changes.retain(|_, change| change.issued > before);
         for client in 0..self.options.clients {
             if self.issued == self.options.requests
                 || self.in_flight[client] == self.options.requests_in_flight
@@ -1657,7 +1918,16 @@ impl Simulator {
         let (client, read) = (pending.client, pending.read.clone());
         let attempt = self.next_attempt;
         self.next_attempt += 1;
-        self.attempts.insert(attempt, (request, client, self.now));
+        let ring = self.gateways[gateway].ring().version();
+        let sent = self.now;
+        let entry = Attempt {
+            request,
+            client,
+            gateway,
+            ring,
+            sent,
+        };
+        self.attempts.insert(attempt, entry);
         if self.trace {
             eprintln!(
                 "{} request {request} attempt {attempt} via gateway {gateway}: {read:?}",
@@ -1770,9 +2040,22 @@ impl Simulator {
             self.send(to, from, Message::RingFailed);
             return Ok(());
         }
+        if let (
+            Address::Node(node),
+            Message::NodeWrite {
+                gateway, change, ..
+            },
+        ) = (to, &message)
+            && self.nodes[node].is_none()
+        {
+            let refused = Message::NodeWriteRefused { change: *change };
+            self.send(to, Address::Gateway(*gateway), refused);
+            return Ok(());
+        }
         if let Address::Node(node) = to {
             let stale = match &message {
                 Message::OriginResponse { run, .. }
+                | Message::OriginWriteResponse { run, .. }
                 | Message::PeerResponse { run, .. }
                 | Message::PeerMetadata { run, .. } => *run != self.runs[node],
                 _ => false,
@@ -1843,6 +2126,147 @@ impl Simulator {
             (Address::Node(node), Message::WriteNotice { key }) => {
                 self.node(node).on_write_from(now, &key, true);
                 self.drain_node(node)
+            }
+            (Address::Gateway(gateway), Message::ClientWrite { change, key }) => {
+                let candidates = self.gateways[gateway].pass_candidates(&key);
+                let ring = self.gateways[gateway].ring().version();
+                if self.trace {
+                    let home = self.gateways[gateway]
+                        .ring()
+                        .owner(Placement::Home(&key).hash());
+                    eprintln!(
+                        "{} write {change} candidates {candidates:?} under ring {ring:x}, home {home:?}",
+                        self.now
+                    );
+                }
+                if let Some(entry) = self.changes.get_mut(&change) {
+                    (entry.candidates, entry.ring) = (candidates, ring);
+                }
+                self.pass_change(gateway, change);
+                Ok(())
+            }
+            (Address::Gateway(gateway), Message::NodeWriteRefused { change }) => {
+                self.pass_change(gateway, change);
+                Ok(())
+            }
+            (
+                Address::Node(node),
+                Message::NodeWrite {
+                    gateway,
+                    change,
+                    key,
+                    size,
+                },
+            ) => {
+                let run = self.runs[node];
+                let message = Message::OriginWrite {
+                    node,
+                    run,
+                    gateway,
+                    change,
+                    key,
+                    size,
+                };
+                self.send(Address::Node(node), Address::Origin, message);
+                Ok(())
+            }
+            (Address::Origin, message @ Message::OriginWrite { .. }) => {
+                self.origin_writes.push(message);
+                Ok(())
+            }
+            (
+                Address::Node(node),
+                Message::OriginWriteResponse {
+                    gateway,
+                    change,
+                    key,
+                    status,
+                    applied,
+                    ..
+                },
+            ) => {
+                // The home learns of the write before the gateway does.
+                if status < 300 {
+                    self.node(node).on_write(now, &key);
+                    self.drain_node(node)?;
+                }
+                let ring = (node, self.node(node).ring().version());
+                let response = Message::NodeWriteResponse {
+                    change,
+                    key,
+                    status,
+                    applied,
+                    ring,
+                };
+                self.send(Address::Node(node), Address::Gateway(gateway), response);
+                Ok(())
+            }
+            (
+                Address::Gateway(gateway),
+                Message::NodeWriteResponse {
+                    change,
+                    key,
+                    status,
+                    applied,
+                    ring: (node, version),
+                },
+            ) => {
+                if status < 300 {
+                    let via = NodeId(node as u64);
+                    let home = self.gateways[gateway]
+                        .ring()
+                        .owner(Placement::Home(&key).hash());
+                    if home != Some(via) {
+                        self.summary.detoured_writes += 1;
+                    }
+                    self.gateways[gateway].on_write(now, &key, Some(via));
+                }
+                self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version);
+                self.drain_gateway(gateway)?;
+                if let Some(entry) = self.changes.get(&change) {
+                    let client = entry.client;
+                    let response = Message::ClientWriteResponse {
+                        change,
+                        status,
+                        applied,
+                    };
+                    self.send(Address::Gateway(gateway), Address::Client(client), response);
+                }
+                Ok(())
+            }
+            (
+                Address::Client(_),
+                Message::ClientWriteResponse {
+                    change,
+                    status,
+                    applied,
+                },
+            ) => {
+                let Some(entry) = self.changes.remove(&change) else {
+                    return Ok(());
+                };
+                if self.trace {
+                    eprintln!("{} write {change} answered {status}", self.now);
+                }
+                if let Some(watched) = self.watched_changes.get_mut(&change) {
+                    *watched = Some(status);
+                }
+                if status < 300 {
+                    self.summary.gateway_writes += 1;
+                    let heard = Acknowledged {
+                        applied,
+                        heard: self.now,
+                        ring: entry.ring,
+                    };
+                    let latest = self
+                        .acknowledged
+                        .entry((entry.gateway, entry.key))
+                        .or_insert(heard);
+                    if latest.applied <= applied {
+                        *latest = heard;
+                    }
+                }
+                Ok(())
             }
             (Address::Node(node), Message::Gossip { packet }) => {
                 if let Some(membership) = self.memberships[node].as_mut() {
@@ -1982,6 +2406,12 @@ impl Simulator {
             match action {
                 gateway::Action::Send { node, id, read } => {
                     let node = self.route(node.0 as usize, &read);
+                    if self.trace {
+                        eprintln!(
+                            "{} gateway {gateway} sends node {node} {id:?}: {read:?}",
+                            self.now
+                        );
+                    }
                     let message = Message::NodeRequest { gateway, id, read };
                     self.send(Address::Gateway(gateway), Address::Node(node), message);
                 }
@@ -2090,7 +2520,7 @@ impl Simulator {
         let Some(request) = self.gateway_requests.remove(&(gateway, id)) else {
             return Err(self.failure(format!("gateway {gateway} answered {id:?} twice")));
         };
-        let (_, client, _) = self.attempts[&request];
+        let client = self.attempts[&request].client;
         let response = Message::ClientResponse {
             request,
             head,
@@ -2447,7 +2877,13 @@ impl Simulator {
     }
 
     fn answer(&mut self, attempt: u64, head: ResponseHead, body: Vec<u8>) -> Result<(), Failure> {
-        let (request, _, sent) = self
+        let Attempt {
+            request,
+            gateway,
+            ring,
+            sent,
+            ..
+        } = self
             .attempts
             .remove(&attempt)
             .expect("one response per attempt");
@@ -2515,7 +2951,18 @@ impl Simulator {
             ..
         } = self.requests.remove(&request).expect("pending");
         self.in_flight[client] -= 1;
-        let from = issued.saturating_sub(self.options.staleness(&read.key));
+        let mut from = issued.saturating_sub(self.options.staleness(&read.key));
+        // A read through the gateway that passed a write, sent once the
+        // write succeeded, sees it while the gateway's ring stays the same.
+        // Clients send before a tick's messages arrive, so a read sent in
+        // the tick its client heard came first.
+        if let Some(write) = self.acknowledged.get(&(gateway, read.key.clone()))
+            && write.heard < sent
+            && write.ring == ring
+            && self.gateways[gateway].ring().version() == ring
+        {
+            from = from.max(write.applied);
+        }
         properties::check_response(&self.origin, &read, from, self.now, &head, &body)
             .map_err(|message| self.failure(message))?;
         *self.summary.statuses.entry(head.status).or_default() += 1;
@@ -2673,7 +3120,11 @@ pub struct Summary {
     pub seed: u64,
     pub ticks: u64,
     pub statuses: BTreeMap<u16, u64>,
+    /// Writes, those that passed through a gateway and succeeded, and
+    /// those of them that went through a node other than the key's home.
     pub writes: u64,
+    pub gateway_writes: u64,
+    pub detoured_writes: u64,
     /// Requests a node sent back because their object changed.
     pub retries: u64,
     pub origin_requests: u64,
@@ -2730,7 +3181,7 @@ impl fmt::Display for Summary {
             .collect();
         write!(
             f,
-            "seed {} passed: {} ticks, {} writes, {} retries, responses {}, \
+            "seed {} passed: {} ticks, {} writes ({} through gateways, {} around homes), {} retries, responses {}, \
              {}% of body bytes from disk, {} S3 requests, {} bytes written, \
              {} blocks evicted, node reads {:?}, {} messages lost, {} server errors, \
              {} client retries, {} crashes, {} clean shutdowns, {} blocks verified, \
@@ -2739,6 +3190,8 @@ impl fmt::Display for Summary {
             self.seed,
             self.ticks,
             self.writes,
+            self.gateway_writes,
+            self.detoured_writes,
             self.retries,
             statuses.join(" "),
             self.hit_percent(),

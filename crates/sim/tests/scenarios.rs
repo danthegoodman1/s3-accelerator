@@ -211,7 +211,7 @@ fn a_first_fetch_sent_before_a_write_is_not_kept() {
     for _ in 0..4 {
         sim.step().unwrap();
     }
-    sim.write_through(&key, 120).unwrap();
+    sim.write_at_once(0, &key, 120).unwrap();
     let (_, old) = sim.finish(racing).unwrap();
     assert_eq!(old.len(), 100);
     let (head, body) = sim.read(Request::get(key.clone())).unwrap();
@@ -375,7 +375,7 @@ fn an_answer_older_than_a_write_is_not_cached() {
     for _ in 0..3 {
         sim.step().unwrap();
     }
-    sim.write_through(&key, 120).unwrap();
+    sim.write_at_once(0, &key, 120).unwrap();
     sim.finish(racing).unwrap();
     let (head, body) = sim.read(Request::get(key.clone())).unwrap();
     let current = sim.origin().current(&key).unwrap();

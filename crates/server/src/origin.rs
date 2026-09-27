@@ -56,6 +56,12 @@ const HOP_HEADERS: [&str; 10] = [
     "x-amz-security-token",
 ];
 
+/// Whether a request header describes the client's hop to the gateway, or
+/// is one signing replaces.
+pub fn is_hop_header(name: &str) -> bool {
+    HOP_HEADERS.contains(&name.to_ascii_lowercase().as_str())
+}
+
 impl Origin {
     pub fn new(endpoint: &str, region: &str, credentials: Credentials) -> Origin {
         let endpoint = endpoint.trim_end_matches('/').to_string();
@@ -141,7 +147,7 @@ impl Origin {
     ) -> io::Result<hyper::Response<Incoming>> {
         let headers = headers
             .iter()
-            .filter(|(name, _)| !HOP_HEADERS.contains(&name.to_ascii_lowercase().as_str()))
+            .filter(|(name, _)| !is_hop_header(name))
             .cloned()
             .collect();
         self.send(method, path, query, headers, payload_hash, body, Some(len))

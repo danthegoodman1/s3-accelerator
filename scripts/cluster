@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Runs a cluster of separate processes in front of the s3proxy that
-# `scripts/s3proxy` runs: storage nodes on 127.0.0.1:9101 and up, and a
-# gateway on 127.0.0.1:9000 with s3proxy's credentials, so the conformance
-# suite runs unchanged. Configs, disks and logs go in target/cluster.
+# `scripts/s3proxy` runs: storage nodes on 127.0.0.1:9101 and up, which
+# alone hold S3 credentials, and a gateway on 127.0.0.1:9000 that takes
+# s3proxy's credentials from clients, so the conformance suite runs
+# unchanged. Configs, disks and logs go in target/cluster.
 #
 #   scripts/cluster start [NODES]   # build, start, and wait until it answers
 #   scripts/cluster stop            # shut every process down cleanly
@@ -11,15 +12,15 @@ set -euo pipefail
 dir=target/cluster
 binary=target/debug/s3-accelerator
 
+origin='[origin]
+endpoint = "http://127.0.0.1:'"${S3PROXY_PORT:-8080}"'"
+region = "us-east-1"
+access_key_id = "local-identity"
+secret_access_key = "local-credential"'
+
 config() {
   local nodes=$1 role=$2
   cat <<TOML
-[origin]
-endpoint = "http://127.0.0.1:${S3PROXY_PORT:-8080}"
-region = "us-east-1"
-access_key_id = "local-identity"
-secret_access_key = "local-credential"
-
 [[clients]]
 access_key_id = "local-identity"
 secret_access_key = "local-credential"
@@ -58,7 +59,9 @@ case "${1:-}" in
     rm -rf "$dir"
     mkdir -p "$dir"
     for id in $(seq 0 $((nodes - 1))); do
-      config "$nodes" "[node]
+      config "$nodes" "$origin
+
+[node]
 id = $id
 data_dir = \"$dir/node-$id\"" >"$dir/node-$id.toml"
       "$binary" "$dir/node-$id.toml" >"$dir/node-$id.log" 2>&1 &

@@ -8,6 +8,7 @@ use s3_accelerator::http::{Connection, Framing, Response};
 use s3_accelerator::server::{self, Listeners};
 use s3_accelerator::sigv4::{self, Credentials, Signer, UNSIGNED_PAYLOAD};
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::io;
 use std::net::TcpListener as StdListener;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,9 @@ pub fn object_of(size: usize, path: &str) -> Vec<u8> {
         .collect()
 }
 
+/// The fake S3's answer to a bucket listing.
+pub const LISTING: &str = "<ListBucketResult><Name>bucket</Name></ListBucketResult>";
+
 /// What the fake S3 has seen, and whether a `DeleteObjects` removed its
 /// object.
 pub struct Origin {
@@ -48,12 +52,16 @@ pub struct Origin {
     /// (`object_of`) rather than all sharing `object()`'s.
     pub size: Cell<usize>,
     pub distinct: Cell<bool>,
-    /// Bodies of the writes it received in full.
+    /// Bodies of the writes it received in full, and the latest by path
+    /// with its ETag, which it serves from then on.
     pub uploads: RefCell<Vec<Vec<u8>>>,
+    pub written: RefCell<BTreeMap<String, (String, Vec<u8>)>>,
     /// Refuse each `PUT` with 403 from its head, before its body arrives.
     pub refuse_writes: Cell<bool>,
     /// How long it waits before each 64 KiB of a body after the first.
     pub trickle: Cell<Duration>,
+    /// Answer bucket listings chunked, with no `Content-Length`.
+    pub chunked: Cell<bool>,
 }
 
 impl Default for Origin {
@@ -66,25 +74,35 @@ impl Default for Origin {
             size: Cell::new(SIZE),
             distinct: Cell::default(),
             uploads: RefCell::default(),
+            written: RefCell::default(),
             refuse_writes: Cell::default(),
             trickle: Cell::default(),
+            chunked: Cell::default(),
         }
     }
 }
 
 impl Origin {
-    /// The object it serves at `path`.
+    /// The object it serves at `path`, before any write to it.
     pub fn object(&self, path: &str) -> Vec<u8> {
         match self.distinct.get() {
             true => object_of(self.size.get(), path),
             false => object_of(self.size.get(), ""),
         }
     }
+
+    /// The ETag and bytes it serves at `path` now.
+    fn current(&self, path: &str) -> (String, Vec<u8>) {
+        match self.written.borrow().get(path) {
+            Some(version) => version.clone(),
+            None => (ETAG.to_string(), self.object(path)),
+        }
+    }
 }
 
 /// Serves an object at any path, honoring `Range` and `If-Match`, until a
-/// `DeleteObjects` removes it. Answers every other request with 200 once
-/// its body arrives.
+/// `DeleteObjects` removes it, and `LISTING` for a bucket. Answers every
+/// other request with 200 once its body arrives.
 async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
     loop {
         let (stream, _) = listener.accept().await.unwrap();
@@ -110,23 +128,48 @@ async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
                 origin.requests.set(origin.requests.get() + 1);
                 origin.paths.borrow_mut().push(head.path.clone());
                 if head.method == "PUT" {
+                    let etag = format!("\"written-{}\"", origin.uploads.borrow().len());
+                    let version = (etag, upload.clone());
+                    origin
+                        .written
+                        .borrow_mut()
+                        .insert(head.path.clone(), version);
                     origin.uploads.borrow_mut().push(upload);
                 }
-                let object = origin.object(&head.path);
+                let (etag, object) = origin.current(&head.path);
                 let mut headers = Vec::new();
                 let (status, body) = match head.method.as_str() {
                     "POST" if head.query.contains("delete") => {
                         origin.deleted.set(true);
                         (200, Vec::new())
                     }
+                    "GET" if !head.path.trim_start_matches('/').contains('/') => {
+                        (200, LISTING.as_bytes().to_vec())
+                    }
                     "GET" | "HEAD" if origin.deleted.get() => (404, Vec::new()),
                     "GET" | "HEAD" => {
-                        headers.push(("ETag".to_string(), ETAG.to_string()));
-                        read(&head.headers, &object, &mut headers)
+                        headers.push(("ETag".to_string(), etag.clone()));
+                        read(&head.headers, &object, &etag, &mut headers)
                     }
                     _ => (200, Vec::new()),
                 };
                 tokio::time::sleep(origin.delay.get()).await;
+                let listing = head.method == "GET" && body == LISTING.as_bytes();
+                if listing && origin.chunked.get() {
+                    let written = async {
+                        connection
+                            .write_response_head(status, &headers, Framing::Chunked, true)
+                            .await?;
+                        for piece in body.chunks(7) {
+                            connection.write_chunk(piece).await?;
+                        }
+                        connection.finish_chunks().await
+                    };
+                    if written.await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let framing = Framing::Length(body.len() as u64);
                 if connection
                     .write_response_head(status, &headers, framing, true)
@@ -156,10 +199,11 @@ async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
 fn read(
     request: &[(String, String)],
     object: &[u8],
+    current: &str,
     headers: &mut Vec<(String, String)>,
 ) -> (u16, Vec<u8>) {
     let header = |name| s3_accelerator::http::header(request, name);
-    if header("if-match").is_some_and(|etag| etag != ETAG) {
+    if header("if-match").is_some_and(|etag| etag != current) {
         return (412, Vec::new());
     }
     let size = object.len();
@@ -504,8 +548,9 @@ pub async fn listening(port: u16) {
 /// The `[cache]` settings of `Cluster`s by default.
 pub const CLUSTER_CACHE: &str = "block_size = 65536\nextent_size = 1048576\nextents = 32";
 
-/// Configs for storage nodes and a gateway, in `dir`, whose bucket
-/// `bucket` is immutable and admits blocks on their first read.
+/// Configs for storage nodes and a gateway, in `dir`. Bucket `bucket` is
+/// immutable, bucket `changing` keeps metadata for ten minutes, and both
+/// admit blocks on their first read.
 pub struct Cluster {
     pub gateway_port: u16,
     pub gateway: PathBuf,
@@ -553,23 +598,31 @@ impl Cluster {
                 .collect();
             entries.join(", ")
         };
-        let shared = |everyone: bool| {
-            let named = named(everyone);
-            format!(
-                r#"
+        // Only nodes reach S3.
+        let origin = format!(
+            r#"
             [origin]
             endpoint = "http://127.0.0.1:{origin_port}"
             region = "us-east-1"
             access_key_id = "origin"
             secret_access_key = "origin-secret"
+            "#
+        );
+        let shared = |everyone: bool| {
+            let named = named(everyone);
+            format!(
+                r#"
             [[clients]]
             access_key_id = "reader"
             secret_access_key = "reader-secret"
-            grants = [{{ bucket = "bucket" }}]
+            grants = [{{ bucket = "bucket" }}, {{ bucket = "changing" }}]
             [cache]
             {cache}
             [cache.buckets.bucket]
             immutable = true
+            admit_on_first_read = true
+            [cache.buckets.changing]
+            ttl_ms = 600000
             admit_on_first_read = true
             [cluster]
             secret = "cluster-secret"
@@ -588,7 +641,7 @@ impl Cluster {
                     dir.join(format!("disk-{id}")).display()
                 );
                 let shared = shared(unnamed.contains(&id));
-                std::fs::write(&config, format!("{shared}\n{role}")).unwrap();
+                std::fs::write(&config, format!("{origin}\n{shared}\n{role}")).unwrap();
                 (port, config)
             })
             .collect();

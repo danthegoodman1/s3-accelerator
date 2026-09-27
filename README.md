@@ -2,7 +2,7 @@
 
 A distributed NVMe read cache in front of S3. [spec.md](spec.md) describes the design.
 
-The core serves reads from each object's home node, which keeps the object's metadata and caches its blocks under the block store policy. The server runs gateways and storage nodes, separately or together in one process: gateways serve S3 clients over plaintext HTTP/1.1 and send reads to nodes over the cluster protocol, and nodes keep blocks and immutable-bucket metadata on disk. Nodes find each other by SWIM gossip, and after the cluster grows or shrinks, new owners read what they took over from the nodes that held it. Every operation other than `GetObject` and `HeadObject` passes through to S3. [PLAN.md](PLAN.md) tracks the remaining work.
+The core serves reads from each object's home node, which keeps the object's metadata and caches its blocks under the block store policy. The server runs gateways and storage nodes, separately or together in one process: gateways serve S3 clients over plaintext HTTP/1.1 and send reads to nodes over the cluster protocol, and nodes keep blocks and immutable-bucket metadata on disk. Nodes find each other by SWIM gossip, and after the cluster grows or shrinks, new owners read what they took over from the nodes that held it. Every operation other than `GetObject` and `HeadObject` passes through a storage node to S3: an object's through its home, which learns of each write before the client does. Only nodes hold S3 credentials, so a gateway's config needs no `[origin]`. [PLAN.md](PLAN.md) tracks the remaining work.
 
 ## Running a cluster
 
