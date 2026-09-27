@@ -89,3 +89,21 @@ fn a_known_object_prefetches_from_its_first_spot_read() {
     sim.read(read(footer)).unwrap();
     assert_eq!(sim.summary().origin_requests, before.origin_requests);
 }
+
+/// A prefetch the fill budget would not store sends nothing: its bytes
+/// would come from S3 and be thrown away.
+#[test]
+fn a_prefetch_past_the_fill_budget_sends_nothing() {
+    let mut options = Options::scenario();
+    options.fill_budget_blocks = 0;
+    let mut sim = Simulator::new(1, options);
+    let key = key("table/part-0.parquet");
+    sim.put(&key, 3_000);
+    let read = Request {
+        range: Some(ByteRange::Suffix { length: 8 }),
+        ..Request::get(key.clone())
+    };
+    sim.read(read).unwrap();
+    assert_eq!(sim.summary().origin_requests, 1);
+    assert_eq!(sim.summary().prefetched_blocks, 0);
+}

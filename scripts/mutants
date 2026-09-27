@@ -379,15 +379,15 @@ MUTANTS = [
     (
         "a block is recorded before its bytes are durable",
         [
-            (NODE, "self.actions.push(Action::Record { location, record });\n        if self.in_flight", "if self.in_flight"),
+            (NODE, "if !purged {\n            self.actions.push(Action::Record { location, record });\n        }", "let _ = (purged, record);"),
             (NODE, "self.writes.insert(location, origin);",
              "self.writes.insert(location, origin);\n        let block = self.store.block_at(location).expect(\"reserved\");\n        let record = self.slot_record(block);\n        self.actions.push(Action::Record { location, record });"),
         ],
     ),
     (
         "eviction leaves the slot's record",
-        [(NODE, "self.purging.remove(&evicted);\n            self.actions.push(Action::Clear { location });",
-          "self.purging.remove(&evicted);\n            let _ = location;")],
+        [(NODE, "self.stats.evicted_blocks += 1;\n            self.actions.push(Action::Clear { location });",
+          "self.stats.evicted_blocks += 1;\n            let _ = location;")],
     ),
     (
         "a restart after a crash trusts its blocks",
@@ -399,8 +399,8 @@ MUTANTS = [
     ),
     (
         "a verified block is not recorded again",
-        [(NODE, "let record = self.slot_record(block);\n            self.actions.push(Action::Record { location, record });\n            for waiter in waiters {",
-          "for waiter in waiters {")],
+        [(NODE, "let record = self.slot_record(block);\n                self.actions.push(Action::Record { location, record });\n            }\n            for waiter in waiters {",
+          "}\n            for waiter in waiters {")],
     ),
     (
         "a restarted home fetches whole objects it holds blocks of",
@@ -493,7 +493,8 @@ MUTANTS = [
     ),
     (
         "a gateway keeps its entry after a write it passed to a node",
-        [(SERVER, "GatewayEngine::written_via(&context.gateway, &key, node);", "let _ = (&key, node);")],
+        [(SERVER, "if let Some(key) = passthrough::written_key(&head.method, &head.path) {\n                    GatewayEngine::written_via(&context.gateway, &key, node);",
+          "if let Some(key) = passthrough::written_key(&head.method, &head.path) {\n                    let _ = (&key, node);")],
     ),
     (
         "a node answers a write before the home forgets the key",
@@ -584,12 +585,21 @@ MUTANTS = [
     ),
     (
         "a purge an owner missed while down is never told again",
-        [(NODE, "let nodes = nodes.clone();\n            self.pass_purge(&key, &nodes);", "let _ = nodes;")],
+        [(NODE, "self.pass_purge(&key, &nodes);", "let _ = nodes;")],
     ),
     (
         "a restarted coordinator forgets its purges",
         [(NODE, "false => node\n                    .purges\n                    .insert(key, (nodes.into_iter().collect(), Time::default())),",
           "false => {\n                    let _ = (key, nodes);\n                    None\n                }")],
+    ),
+    (
+        "a purge keeps the records of blocks being read",
+        [(NODE, "if entry.state == BlockState::Ready {\n                    let location = entry.location;\n                    self.actions.push(Action::Clear { location });",
+          "if entry.state == BlockState::Ready && !entry.pinned() {\n                    let location = entry.location;\n                    self.actions.push(Action::Clear { location });")],
+    ),
+    (
+        "a purge tells nodes out of every ring",
+        [(NODE, ".filter(|&node| self.in_rings(node))", ".filter(|&node| node.0 < u64::MAX)")],
     ),
 ]
 

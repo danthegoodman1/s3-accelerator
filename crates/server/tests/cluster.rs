@@ -535,7 +535,7 @@ async fn a_purge_reaches_a_node_that_was_down() {
                 cluster.gateway_port,
                 "POST",
                 &path,
-                "x-accel-purge",
+                "x-accel-purge=",
                 &[],
                 Vec::new(),
             )

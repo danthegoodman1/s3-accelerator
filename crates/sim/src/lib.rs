@@ -1213,13 +1213,19 @@ impl Simulator {
     /// Purges `key` through its home under gateway 0's ring, if the home is
     /// up, and runs until the cluster is idle.
     pub fn purge(&mut self, key: &ObjectKey) -> Result<(), Failure> {
+        self.start_purge(key)?;
+        self.settle()
+    }
+
+    /// Purges `key` through its home under gateway 0's ring, if the home is
+    /// up, without waiting.
+    pub fn start_purge(&mut self, key: &ObjectKey) -> Result<(), Failure> {
         let home = self.gateways[0]
             .ring()
             .owner(Placement::Home(key).hash())
             .expect("a node")
             .0 as usize;
-        self.purge_at(home, key)?;
-        self.settle()
+        self.purge_at(home, key)
     }
 
     /// Has `node` coordinate a purge of `key`, and syncs its disk.
@@ -1230,9 +1236,30 @@ impl Simulator {
         };
         up.on_purge(now, key, false);
         self.drain_node(node)?;
+        self.purged(node, key)
+    }
+
+    /// A node that purged `key` syncs its disk before it confirms, and then
+    /// records no block of it: blocks still being read go once free, but
+    /// a restart must not bring them back.
+    fn purged(&mut self, node: usize, key: &ObjectKey) -> Result<(), Failure> {
         let unsynced = self.disks[node].unsynced();
         self.disks[node].keep_appended(unsynced);
+        let recorded = self.recorded_blocks_of(node, key);
+        if recorded > 0 {
+            return Err(self.failure(format!(
+                "node {node} purged {key:?} but still records {recorded} of its blocks"
+            )));
+        }
         Ok(())
+    }
+
+    /// Responses `node` is still sending.
+    pub fn sends_in_progress(&self, node: usize) -> usize {
+        self.sending
+            .keys()
+            .filter(|(owner, _)| *owner == node)
+            .count()
     }
 
     /// Blocks of any version of `key` that `node`'s slot table records.
@@ -2568,9 +2595,7 @@ impl Simulator {
             (Address::Node(to), Message::PurgeNotice { from, run, key }) => {
                 self.node(to).on_purge(now, &key, true);
                 self.drain_node(to)?;
-                // The node syncs before it confirms.
-                let unsynced = self.disks[to].unsynced();
-                self.disks[to].keep_appended(unsynced);
+                self.purged(to, &key)?;
                 let confirmed = Message::PurgeConfirmed { run, key, from: to };
                 self.send(Address::Node(to), Address::Node(from), confirmed);
                 Ok(())

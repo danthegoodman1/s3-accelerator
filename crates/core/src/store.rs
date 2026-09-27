@@ -109,6 +109,8 @@ pub struct Entry {
     /// must match before it is served.
     pub verify: Option<u64>,
     pins: u32,
+    /// A purge dropped the block's record; the block goes once free.
+    purged: bool,
     freq: u8,
     queue: Queue,
     /// Tells this entry's place in a queue from places a removed block with
@@ -120,6 +122,11 @@ impl Entry {
     /// Whether a response or check holds the block in its slot.
     pub fn pinned(&self) -> bool {
         self.pins > 0
+    }
+
+    /// Whether a purge dropped the block, which goes once free.
+    pub fn purged(&self) -> bool {
+        self.purged
     }
 }
 
@@ -276,6 +283,7 @@ impl Store {
                 placement,
                 verify: None,
                 pins: 0,
+                purged: false,
                 freq: 0,
                 queue: Queue::None,
                 seq: 0,
@@ -340,6 +348,7 @@ impl Store {
                 placement,
                 verify,
                 pins: 0,
+                purged: false,
                 freq: 0,
                 queue: Queue::Small,
                 seq,
@@ -373,6 +382,13 @@ impl Store {
             entry.queue = Queue::Small;
             self.small.push_back((key, seq));
             self.small_bytes += size;
+        }
+    }
+
+    /// Marks a block purged: it is neither recorded nor served once free.
+    pub fn purge(&mut self, key: BlockKey) {
+        if let Some(entry) = self.blocks.get_mut(&key) {
+            entry.purged = true;
         }
     }
 

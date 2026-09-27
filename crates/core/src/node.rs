@@ -395,8 +395,6 @@ pub struct Node {
     /// Purges this node coordinates: the nodes yet to confirm each, and
     /// when to tell them again.
     purges: BTreeMap<ObjectKey, (BTreeSet<NodeId>, Time)>,
-    /// Purged blocks still being written or read, dropped once free.
-    purging: BTreeSet<BlockKey>,
     config: Config,
     objects: BTreeMap<ObjectKey, Object>,
     /// Known objects by when they were last used, oldest first.
@@ -605,7 +603,6 @@ impl Node {
             inspected: BTreeSet::new(),
             spots: BTreeMap::new(),
             purges: BTreeMap::new(),
-            purging: BTreeSet::new(),
             store: Store::new(config.store),
             doorkeeper: Doorkeeper::new(config.doorkeeper_window),
             config,
@@ -1199,7 +1196,16 @@ impl Node {
             .collect();
         for version in versions {
             for block in self.store.blocks_of(version) {
-                self.purging.insert(block);
+                let Some(entry) = self.store.get(&block) else {
+                    continue;
+                };
+                // The record goes now, so the purge is durable once the
+                // table is, even for a block that is still being read.
+                if entry.state == BlockState::Ready {
+                    let location = entry.location;
+                    self.actions.push(Action::Clear { location });
+                }
+                self.store.purge(block);
                 self.drop_purged(block);
             }
         }
@@ -1255,6 +1261,40 @@ impl Node {
             .collect()
     }
 
+    /// A coordinator tells the nodes of its rings again of each purge they
+    /// have yet to confirm, every few peer timeouts. A node out of every
+    /// ring waits until it is back, with the blocks it kept.
+    fn tick_purges(&mut self, now: Time) {
+        let due: Vec<(ObjectKey, BTreeSet<NodeId>)> = self
+            .purges
+            .iter()
+            .filter(|(_, (_, again))| *again <= now)
+            .map(|(key, (nodes, _))| {
+                let nodes = nodes
+                    .iter()
+                    .copied()
+                    .filter(|&node| self.in_rings(node))
+                    .collect();
+                (key.clone(), nodes)
+            })
+            .collect();
+        let again = Time(now.0 + self.purge_retry());
+        for (key, nodes) in due {
+            self.purges.get_mut(&key).expect("due purge").1 = again;
+            self.pass_purge(&key, &nodes);
+        }
+    }
+
+    /// Whether `node` is in this node's ring, or its previous one.
+    fn in_rings(&self, node: NodeId) -> bool {
+        let previous = self.previous.iter().flat_map(|(ring, _)| ring.members());
+        self.ring
+            .members()
+            .iter()
+            .chain(previous)
+            .any(|member| member.id == node)
+    }
+
     fn pass_purge(&mut self, key: &ObjectKey, nodes: &BTreeSet<NodeId>) {
         for &node in nodes {
             let key = key.clone();
@@ -1267,30 +1307,25 @@ impl Node {
         4 * self.config.peer_timeout.max(1)
     }
 
-    /// Drops a purged block, erasing its slot, unless it is still being
-    /// written or read; it goes once free.
+    /// Frees a purged block's slot and erases it, once the block is no
+    /// longer being written or read.
     fn drop_purged(&mut self, block: BlockKey) {
         let Some(entry) = self.store.get(&block) else {
-            self.purging.remove(&block);
             return;
         };
-        if entry.state != BlockState::Ready || entry.pinned() {
+        if !entry.purged() || entry.state != BlockState::Ready || entry.pinned() {
             return;
         }
         let (location, len) = (entry.location, self.config.store.slot_size(entry.len));
-        self.purging.remove(&block);
         self.store.remove(block);
-        self.actions.push(Action::Clear { location });
         self.actions.push(Action::Erase { location, len });
         self.unref(block.version);
     }
 
-    /// Unpins a block, and drops it if a purge waited for it.
+    /// Unpins a block, and frees it if a purge waited for it.
     fn unpin(&mut self, block: BlockKey) {
         self.store.unpin(block);
-        if self.purging.contains(&block) {
-            self.drop_purged(block);
-        }
+        self.drop_purged(block);
     }
 
     /// The key's home and, while the fallback window lasts, its home under
@@ -1586,19 +1621,6 @@ impl Node {
         self.now = self.now.max(now);
         self.events.retain(|_, (_, until)| *until > now);
         self.tick_leases(now);
-        let retry = self.purge_retry();
-        let due: Vec<ObjectKey> = self
-            .purges
-            .iter()
-            .filter(|(_, (_, again))| *again <= now)
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in due {
-            let (nodes, again) = self.purges.get_mut(&key).expect("due purge");
-            *again = Time(now.0 + retry);
-            let nodes = nodes.clone();
-            self.pass_purge(&key, &nodes);
-        }
         if self
             .previous
             .as_ref()
@@ -1610,6 +1632,7 @@ impl Node {
             self.store
                 .disown(|placement| ring.owner(placement) == Some(id));
         }
+        self.tick_purges(now);
         let expired: Vec<OriginRequestId> = self
             .origins
             .iter()
@@ -1649,7 +1672,11 @@ impl Node {
         let record = self.slot_record(block);
         self.filling_bytes -= record.len;
         self.stats.written_bytes += record.len;
-        self.actions.push(Action::Record { location, record });
+        // A purged block is never recorded, so no restart brings it back.
+        let purged = self.store.get(&block).is_some_and(|entry| entry.purged());
+        if !purged {
+            self.actions.push(Action::Record { location, record });
+        }
         if self.in_flight.get(&block) == Some(&origin) {
             self.in_flight.remove(&block);
             self.unref(block.version);
@@ -1658,9 +1685,7 @@ impl Node {
         for waiter in self.awaiting_writes.remove(&location).unwrap_or_default() {
             self.arrived(waiter, Await::Written(location));
         }
-        if self.purging.contains(&block) {
-            self.drop_purged(block);
-        }
+        self.drop_purged(block);
         self.inspect(block.version);
     }
 
@@ -1751,35 +1776,47 @@ impl Node {
         span: std::ops::Range<u64>,
     ) {
         let layout = self.config.layout;
-        let chunk_blocks = usize::try_from(layout.chunk_size() / layout.block_size()).unwrap_or(1);
-        let missing: Vec<u64> = layout
-            .blocks_covering(span.start, span.end - 1)
-            .filter(|&index| {
-                let block = BlockKey { version, index };
-                let placement = layout.placement(key, size, index).hash();
-                self.store.get(&block).is_none()
-                    && !self.in_flight.contains_key(&block)
-                    && self.ring.owner(placement) == Some(self.id)
-            })
-            .collect();
+        let blocks: Vec<u64> = layout.blocks_covering(span.start, span.end - 1).collect();
         let mut next = 0;
-        while next < missing.len() {
-            let placement = layout.placement(key, size, missing[next]).hash();
-            let run = missing[next..]
-                .iter()
-                .enumerate()
-                .take_while(|&(offset, &index)| {
-                    index == missing[next] + offset as u64
-                        && layout.placement(key, size, index).hash() == placement
-                })
-                .take(chunk_blocks)
-                .count();
-            let first = missing[next];
-            let last = missing[next + run - 1];
-            self.stats.prefetched_blocks += last - first + 1;
-            self.fill(key, etag, size, version, first..=last, true);
+        while next < blocks.len() {
+            let first = blocks[next];
+            let placement = layout.placement(key, size, first).hash();
+            let run = match self.ring.owner(placement) == Some(self.id) {
+                true => self.fill_run(key, size, version, &blocks[next..]),
+                false => 0,
+            };
+            if run == 0 {
+                next += 1;
+                continue;
+            }
+            let last = blocks[next + run - 1];
+            // A fill the budget would not store fetches bytes nobody reads.
+            let bytes = layout.block_span(size, last).end - layout.block_span(size, first).start;
+            if self.filling_bytes + bytes <= self.config.fill_budget {
+                self.stats.prefetched_blocks += last - first + 1;
+                self.fill(key, etag, size, version, first..=last, true);
+            }
             next += run;
         }
+    }
+
+    /// How many of `blocks`, contiguous indices from the first, one range
+    /// GET fills: the missing blocks that share the first one's placement,
+    /// up to a chunk. One owner holds such a run, and held it before.
+    fn fill_run(&self, key: &ObjectKey, size: u64, version: VersionId, blocks: &[u64]) -> usize {
+        let layout = self.config.layout;
+        let chunk_blocks = usize::try_from(layout.chunk_size() / layout.block_size()).unwrap_or(1);
+        let placement = layout.placement(key, size, blocks[0]).hash();
+        blocks
+            .iter()
+            .take_while(|&&index| {
+                let block = BlockKey { version, index };
+                self.store.get(&block).is_none()
+                    && !self.in_flight.contains_key(&block)
+                    && layout.placement(key, size, index).hash() == placement
+            })
+            .take(chunk_blocks)
+            .count()
     }
 
     /// S3's response body ended before the bytes for the slot at
@@ -1802,7 +1839,6 @@ impl Node {
             .filter(|&waiter| self.abandon_plan(waiter))
             .collect();
         self.store.remove(block);
-        self.purging.remove(&block);
         self.filling_bytes -= len;
         self.unref(block.version);
         // Later reads fill the block again instead of reading this body.
@@ -1830,18 +1866,17 @@ impl Node {
         self.stats.verified_blocks += 1;
         if intact {
             self.store.verified(block);
-            let record = self.slot_record(block);
-            self.actions.push(Action::Record { location, record });
+            if !self.store.get(&block).is_some_and(|entry| entry.purged()) {
+                let record = self.slot_record(block);
+                self.actions.push(Action::Record { location, record });
+            }
             for waiter in waiters {
                 self.arrived(waiter, Await::Verify(location));
             }
-            if self.purging.contains(&block) {
-                self.drop_purged(block);
-            }
+            self.drop_purged(block);
             return;
         }
         self.stats.corrupt_blocks += 1;
-        self.purging.remove(&block);
         let waiters: Vec<GatewayRequestId> = waiters
             .into_iter()
             .filter(|&waiter| self.abandon_plan(waiter))
@@ -2385,7 +2420,6 @@ impl Node {
         }
         let mut awaiting = BTreeSet::new();
         let layout = self.config.layout;
-        let chunk_blocks = (layout.chunk_size() / layout.block_size()) as usize;
         let blocks: Vec<u64> = layout.blocks_covering(first, last).collect();
         let mut next = 0;
         while next < blocks.len() {
@@ -2427,20 +2461,9 @@ impl Node {
             let origin = match in_flight {
                 Some(origin) => origin,
                 None => {
-                    // Fetch this block and every missing block after it
-                    // with the same placement, up to a chunk, in one range
-                    // GET: one owner holds the run, and held it before.
-                    let placement = layout.placement(key, size, index).hash();
-                    let run_end = blocks[next..]
-                        .iter()
-                        .take_while(|&&index| {
-                            let block = BlockKey { version, index };
-                            self.store.get(&block).is_none()
-                                && !self.in_flight.contains_key(&block)
-                                && layout.placement(key, size, index).hash() == placement
-                        })
-                        .take(chunk_blocks)
-                        .count();
+                    // Fetch this block and the missing blocks after it
+                    // that one range GET can.
+                    let run_end = self.fill_run(key, size, version, &blocks[next..]);
                     let run = blocks[next]..=blocks[next + run_end - 1];
                     self.fill(key, etag, size, version, run, false)
                 }
@@ -2963,7 +2986,6 @@ impl Node {
         }
         for (evicted, location) in self.store.drain_evicted() {
             self.stats.evicted_blocks += 1;
-            self.purging.remove(&evicted);
             self.actions.push(Action::Clear { location });
             self.unref(evicted.version);
         }
@@ -3193,6 +3215,47 @@ mod tests {
             size: 10,
             headers: Vec::new(),
         }
+    }
+
+    /// A coordinator tells the nodes of its rings of a purge again until
+    /// each confirms, and waits for a node out of every ring to come back
+    /// rather than tell it in vain.
+    #[test]
+    fn a_purge_is_told_again_to_nodes_in_the_ring() {
+        let ring = |ids: &[u64]| {
+            let members = ids
+                .iter()
+                .map(|&id| Member {
+                    id: NodeId(id),
+                    weight: NonZeroU32::MIN,
+                })
+                .collect();
+            Ring::new(ids.len() as u64, members)
+        };
+        let told = |node: &mut Node| -> Vec<u64> {
+            node.drain()
+                .into_iter()
+                .filter_map(|action| match action {
+                    Action::PassPurge { node, .. } => Some(node.0),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut node = Node::new(NodeId(0), ring(&[0, 1, 2]), config(4));
+        node.on_purge(Time(1), &key("k"), false);
+        assert_eq!(told(&mut node), [1, 2]);
+        node.on_purge_confirmed(Time(2), &key("k"), NodeId(1));
+        node.on_tick(Time(500));
+        assert_eq!(told(&mut node), [2]);
+        // Node 2 leaves, and once the fallback window ends, no ring holds
+        // it: the purge waits on it without telling it.
+        node.on_ring(Time(600), ring(&[0, 1]));
+        node.on_tick(Time(2_000));
+        assert_eq!(told(&mut node), Vec::<u64>::new());
+        assert_eq!(node.pending_purges(), [(key("k"), vec![NodeId(2)])]);
+        node.on_ring(Time(2_100), ring(&[0, 1, 2]));
+        node.on_tick(Time(2_500));
+        assert_eq!(told(&mut node), [2]);
     }
 
     /// The metadata file holds an entry each time the home learned a key,

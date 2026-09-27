@@ -195,16 +195,20 @@ pub async fn to_s3(
     }
 }
 
-/// Whether a request uploads a whole object's body: a `PutObject`, rather
-/// than a part or a copy.
+/// Whether a request uploads a whole object's bytes as its body: a
+/// `PutObject`, rather than a part, a copy, or a body in aws-chunked
+/// encoding, whose bytes on the wire are not the object's.
 pub fn uploads_object(forward: &Forward) -> bool {
     let part = forward
         .query
         .split('&')
         .any(|pair| pair.starts_with("partNumber=") || pair.starts_with("uploadId="));
+    let chunked = forward.payload_hash.starts_with("STREAMING-")
+        || header(&forward.headers, "x-amz-decoded-content-length").is_some();
     forward.method == "PUT"
         && forward.len > 0
         && !part
+        && !chunked
         && header(&forward.headers, "x-amz-copy-source").is_none()
 }
 
@@ -280,5 +284,38 @@ pub async fn stream_body(
             Ok(true)
         }
         Framing::Length(length) => Ok(sent == length),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put(payload_hash: &str, headers: &[(&str, &str)]) -> Forward {
+        Forward {
+            method: "PUT".into(),
+            path: "/b/k".into(),
+            query: String::new(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            payload_hash: payload_hash.into(),
+            len: 100,
+        }
+    }
+
+    #[test]
+    fn only_whole_bodies_are_uploads() {
+        assert!(uploads_object(&put("UNSIGNED-PAYLOAD", &[])));
+        let trailer = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+        let decoded = [("x-amz-decoded-content-length", "80")];
+        assert!(!uploads_object(&put(trailer, &decoded)));
+        assert!(!uploads_object(&put("UNSIGNED-PAYLOAD", &decoded)));
+        let copy = [("x-amz-copy-source", "b/other")];
+        assert!(!uploads_object(&put("UNSIGNED-PAYLOAD", &copy)));
+        let mut part = put("UNSIGNED-PAYLOAD", &[]);
+        part.query = "partNumber=1&uploadId=x".into();
+        assert!(!uploads_object(&part));
     }
 }

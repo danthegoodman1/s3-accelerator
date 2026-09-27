@@ -91,3 +91,32 @@ fn a_home_restarted_during_a_purge_still_tells_the_owners() {
     wait(&mut sim);
     assert_purged(&sim);
 }
+
+/// A purge that arrives while a response is still sending its blocks drops
+/// their records at once, so a crash before the send ends brings nothing
+/// back; the blocks go once the send is done.
+#[test]
+fn a_purge_during_a_read_leaves_nothing_a_crash_restores() {
+    let mut options = options();
+    options.send_delay_max = 100;
+    let mut sim = Simulator::new(1, options);
+    let key = key();
+    sim.put(&key, 1_500);
+    for _ in 0..2 {
+        sim.read(Request::get(key.clone())).unwrap();
+    }
+    let home = sim.home(&key);
+    sim.start(Request::get(key.clone()));
+    for _ in 0..50 {
+        if sim.sends_in_progress(home) > 0 {
+            break;
+        }
+        sim.step().unwrap();
+    }
+    assert!(sim.sends_in_progress(home) > 0);
+    sim.start_purge(&key).unwrap();
+    assert_eq!(sim.recorded_blocks_of(home, &key), 0);
+    sim.crash(home).unwrap();
+    sim.restart(home).unwrap();
+    assert_eq!(sim.recorded_blocks_of(home, &key), 0);
+}

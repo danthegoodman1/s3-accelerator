@@ -349,7 +349,10 @@ async fn handle(
     let is_digest = payload_hash.len() == 64 && payload_hash.bytes().all(|b| b.is_ascii_hexdigit());
     let digest = is_digest.then(|| payload_hash.to_ascii_lowercase());
     let (bucket, key) = split_path(&head.path);
-    let purges = head.query.split('&').any(|pair| pair == PURGE);
+    let purges = head
+        .query
+        .split('&')
+        .any(|pair| pair.split('=').next() == Some(PURGE));
     if head.method == "POST" && purges && !bucket.is_empty() && !key.is_empty() {
         if len > 0 {
             let response = error(400, "InvalidRequest", "a purge has no body");

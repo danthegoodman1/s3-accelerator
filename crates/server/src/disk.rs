@@ -255,21 +255,16 @@ impl Disk {
         Ok(())
     }
 
-    /// Records durably that `key`'s purge waits on `nodes`.
+    /// Appends to the purge log that `key`'s purge waits on `nodes`.
+    /// `sync_purges` makes entries durable.
     pub fn save_purge(&self, key: &ObjectKey, nodes: &[NodeId]) -> io::Result<()> {
-        let mut payload = Vec::new();
-        for text in [&key.bucket, &key.key] {
-            payload.extend_from_slice(&(text.len() as u32).to_le_bytes());
-            payload.extend_from_slice(text.as_bytes());
-        }
-        payload.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
-        for node in nodes {
-            payload.extend_from_slice(&node.0.to_le_bytes());
-        }
         let file = self.purges.lock().expect("purges lock");
         let end = file.metadata()?.len();
-        file.write_all_at(&framed(&payload), end)?;
-        file.sync_data()
+        file.write_all_at(&purge_entry(key, nodes), end)
+    }
+
+    pub fn sync_purges(&self) -> io::Result<()> {
+        self.purges.lock().expect("purges lock").sync_data()
     }
 
     /// Frees the storage behind a slot a purge dropped, so its bytes are
@@ -487,9 +482,39 @@ fn unframed(bytes: &[u8]) -> Option<(&[u8], usize)> {
     (xxh3_64(payload) == check).then_some((payload, 12 + len))
 }
 
-/// The purge log's entries up to the first torn one, which a crash left;
-/// the file is cut there.
+fn purge_entry(key: &ObjectKey, nodes: &[NodeId]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for text in [&key.bucket, &key.key] {
+        payload.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        payload.extend_from_slice(text.as_bytes());
+    }
+    payload.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
+    for node in nodes {
+        payload.extend_from_slice(&node.0.to_le_bytes());
+    }
+    framed(&payload)
+}
+
+/// The purges still waiting on nodes, from the purge log's entries up to
+/// the first torn one, which a crash left. The log is rewritten to hold
+/// just those, so it stays as long as the purges in progress.
 fn read_purges(file: &mut File) -> io::Result<Vec<(ObjectKey, Vec<NodeId>)>> {
+    let mut latest = BTreeMap::new();
+    for (key, nodes) in read_purge_entries(file)? {
+        latest.insert(key, nodes);
+    }
+    latest.retain(|_, nodes: &mut Vec<NodeId>| !nodes.is_empty());
+    let mut log = Vec::new();
+    for (key, nodes) in &latest {
+        log.extend(purge_entry(key, nodes));
+    }
+    file.set_len(0)?;
+    file.write_all_at(&log, 0)?;
+    file.sync_data()?;
+    Ok(latest.into_iter().collect())
+}
+
+fn read_purge_entries(file: &mut File) -> io::Result<Vec<(ObjectKey, Vec<NodeId>)>> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     let mut entries = Vec::new();
@@ -512,7 +537,6 @@ fn read_purges(file: &mut File) -> io::Result<Vec<(ObjectKey, Vec<NodeId>)>> {
         entries.push(entry);
         at += len;
     }
-    file.set_len(at as u64)?;
     Ok(entries)
 }
 

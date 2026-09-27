@@ -124,6 +124,9 @@ pub struct NodeEngine {
     events: Events,
     /// Bytes of uploads the node may still keep for warming.
     warm_budget: u64,
+    /// An append to the purge log failed since the last purge, which then
+    /// fails rather than confirm.
+    purge_log_failed: bool,
 }
 
 /// Messages from S3's event queue while the core works through their
@@ -192,6 +195,7 @@ impl NodeEngine {
             unsynced_metadata: false,
             events: Events::default(),
             warm_budget: WARM_BUDGET,
+            purge_log_failed: false,
         }));
         // A recovering node's first actions clear records it cannot use.
         let work = engine.borrow_mut().pump();
@@ -305,17 +309,22 @@ impl NodeEngine {
     /// Purges `key`, coordinating the purge unless another node
     /// `passed_on` it, and returns once the purge is durable.
     pub async fn purge(engine: &SharedNode, key: &ObjectKey, passed_on: bool) -> io::Result<()> {
-        let work = {
+        let (work, logged) = {
             let mut this = engine.borrow_mut();
             let now = this.now();
             this.node.on_purge(now, key, passed_on);
-            this.pump()
+            let work = this.pump();
+            (work, !std::mem::take(&mut this.purge_log_failed))
         };
         start(engine, work);
+        if !logged {
+            return Err(io::Error::other("the purge log could not be written"));
+        }
         let disk = engine.borrow().disk.clone();
         tokio::task::spawn_blocking(move || {
             disk.sync_table()?;
-            disk.sync_metadata()
+            disk.sync_metadata()?;
+            disk.sync_purges()
         })
         .await
         .map_err(io::Error::other)?
@@ -566,6 +575,8 @@ impl NodeEngine {
                 checksum,
             } => self.work.verifies.push((location, len, checksum)),
             node::Action::ReadSpot { version, parts } => self.work.spots.push((version, parts)),
+            // Erasing in order with the node's actions finishes before any
+            // later write can reuse the slot.
             node::Action::Erase { location, len } => {
                 if let Err(error) = self.disk.erase(location, len) {
                     eprintln!("erasing {location:?}: {error}");
@@ -574,6 +585,7 @@ impl NodeEngine {
             node::Action::SavePurge { key, nodes } => {
                 if let Err(error) = self.disk.save_purge(&key, &nodes) {
                     eprintln!("saving the purge of {key:?}: {error}");
+                    self.purge_log_failed = true;
                 }
             }
             node::Action::PassPurge { node, key } => self.work.purges.push((node, key)),

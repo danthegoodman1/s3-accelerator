@@ -152,12 +152,14 @@ fn change(record: &Value) -> Result<(ObjectKey, Option<ETag>), String> {
         .decode_utf8()
         .map_err(|error| error.to_string())?
         .into_owned();
-    let removed = record["eventName"]
+    // Only a creation names the version the object now holds; any other
+    // event, such as a removal or a lifecycle expiration, drops metadata.
+    let created = record["eventName"]
         .as_str()
-        .is_some_and(|name| name.starts_with("ObjectRemoved"));
+        .is_some_and(|name| name.starts_with("ObjectCreated"));
     let etag = object["eTag"]
         .as_str()
-        .filter(|_| !removed)
+        .filter(|_| created)
         .map(|etag| ETag(format!("\"{}\"", etag.trim_matches('"'))));
     let key = ObjectKey {
         bucket: bucket.to_string(),
@@ -201,6 +203,12 @@ mod tests {
             changes(&body).unwrap(),
             [(key("k"), Some(ETag("\"ff\"".into())))]
         );
+    }
+
+    #[test]
+    fn an_expiration_drops_metadata() {
+        let body = r#"{"Records":[{"eventName":"LifecycleExpiration:Delete","s3":{"bucket":{"name":"logs"},"object":{"key":"old","eTag":"ab"}}}]}"#;
+        assert_eq!(changes(body).unwrap(), [(key("old"), None)]);
     }
 
     #[test]
