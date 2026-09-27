@@ -325,10 +325,11 @@ fn read_trace(path: &Path, from: f64, until: f64) -> Vec<Call> {
     let mut unfinished: BTreeMap<&str, (&str, f64, String)> = BTreeMap::new();
     let mut calls = Vec::new();
     for line in trace.lines() {
-        let Some((pid, rest)) = line.split_once(' ') else {
+        // Some versions pad the PID column.
+        let Some((pid, rest)) = line.trim_start().split_once(' ') else {
             continue;
         };
-        let Some((time, rest)) = rest.split_once(' ') else {
+        let Some((time, rest)) = rest.trim_start().split_once(' ') else {
             continue;
         };
         let Ok(time) = time.parse::<f64>() else {
