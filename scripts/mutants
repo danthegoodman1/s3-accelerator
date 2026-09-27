@@ -1029,6 +1029,15 @@ MUTANTS = [
         [(NODE_ENGINE, "disk.applied(issued);\n                disk.write(location, &bytes)", "disk.write(location, &bytes)")],
     ),
     (
+        "readers of a block being written wait for its sync",
+        [(NODE, "let written = self.readable.contains(&location);", "let written = false;")],
+    ),
+    (
+        "a block whose sync fails is freed while reads still send it",
+        [(NODE, "match self.store.get(&block).is_some_and(|entry| entry.pinned()) {\n            true => {",
+                "match false {\n            true => {")],
+    ),
+    (
         "request IDs never reach nodes",
         [(PEERS, "headers.push((protocol::REQUEST_ID.to_string(), id.to_string()));", "let _ = id;")],
     ),

@@ -312,9 +312,15 @@ impl Disk {
     }
 
     /// Writes a block's bytes into its slot and syncs them, after any
-    /// cleared records. Returns `None`, writing nothing, while a socket or
-    /// pipe still holds any of the old pages the bytes would overwrite.
-    pub fn write(&self, location: Location, bytes: &[u8]) -> io::Result<Option<Written>> {
+    /// cleared records, calling `readable` once the bytes are in the file
+    /// and before the sync. Returns `None`, writing nothing, while a socket
+    /// or pipe still holds any of the old pages the bytes would overwrite.
+    pub fn write(
+        &self,
+        location: Location,
+        bytes: &[u8],
+        readable: impl FnOnce(),
+    ) -> io::Result<Option<Written>> {
         let offset = self.offset(location);
         let len = bytes.len() as u64;
         let range = offset..offset + len;
@@ -349,6 +355,7 @@ impl Disk {
             let _writing = self.writing.lock().expect("writing lock");
             self.slabs.write_all_at(bytes, offset)?;
         }
+        readable();
         let sync = self.slab_sync.sync(first, || self.slabs.sync_data())?;
         let checksum = xxh3_64(bytes);
         self.checksums
@@ -1021,7 +1028,7 @@ mod tests {
             extent: 1,
             offset: 0,
         };
-        assert!(disk.write(at, &[7; 8192]).unwrap().is_some());
+        assert!(disk.write(at, &[7; 8192], || {}).unwrap().is_some());
         let blocks = || std::fs::metadata(dir.join("slabs")).unwrap().blocks();
         let reserved = blocks();
         disk.erase(at, 8192).unwrap();
@@ -1112,9 +1119,13 @@ mod tests {
         {
             let (disk, recovery) = Disk::open(&dir, config()).unwrap();
             assert!(recovery.records.is_empty());
-            assert!(disk.write(at(1, 4096), &[1; 1000]).unwrap().is_some());
+            assert!(
+                disk.write(at(1, 4096), &[1; 1000], || {})
+                    .unwrap()
+                    .is_some()
+            );
             disk.record(at(1, 4096), record()).unwrap();
-            assert!(disk.write(at(2, 0), &[2; 1000]).unwrap().is_some());
+            assert!(disk.write(at(2, 0), &[2; 1000], || {}).unwrap().is_some());
             disk.record(at(2, 0), record()).unwrap();
             disk.clear(at(2, 0)).unwrap();
             disk.append(&key(), None).unwrap();

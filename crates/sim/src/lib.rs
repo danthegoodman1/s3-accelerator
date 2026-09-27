@@ -697,6 +697,12 @@ enum Event {
         to: Address,
         message: Message,
     },
+    /// A node's write reached the page cache: its bytes are readable.
+    Readable {
+        node: usize,
+        run: u64,
+        location: Location,
+    },
     /// A node's write reached its disk.
     Written {
         node: usize,
@@ -855,6 +861,8 @@ struct Write {
     origin: OriginRequestId,
     offset: u64,
     len: u64,
+    /// The bytes reached the disk, not yet durable.
+    readable: bool,
 }
 
 /// A node response whose body is being sent.
@@ -934,6 +942,7 @@ pub struct Simulator {
     peer_fetches: BTreeSet<(usize, u64, OriginRequestId)>,
     disk_delays: Prng,
     send_delays: Prng,
+    sync_delays: Prng,
     now: u64,
     queue: Queue<Event>,
     origin: Origin,
@@ -1098,6 +1107,7 @@ impl Simulator {
             peer_fetches: BTreeSet::new(),
             disk_delays: Prng::stream(seed, "disk delays"),
             send_delays: Prng::stream(seed, "send delays"),
+            sync_delays: Prng::stream(seed, "sync delays"),
             now: 0,
             queue: Queue::default(),
             origin,
@@ -2508,6 +2518,7 @@ impl Simulator {
         match event {
             Event::Deliver { to, message } => self.deliver(to, message),
             Event::Written { node, run, .. }
+            | Event::Readable { node, run, .. }
             | Event::Sent { node, run, .. }
             | Event::Verified { node, run, .. }
             | Event::SpotRead { node, run, .. }
@@ -2530,6 +2541,7 @@ impl Simulator {
                 }
                 self.drain_membership(node)
             }
+            Event::Readable { node, location, .. } => self.readable(node, location),
             Event::Written { node, location, .. } => self.written(node, location),
             Event::Forwarded {
                 gateway,
@@ -3423,6 +3435,7 @@ impl Simulator {
                         origin,
                         offset,
                         len,
+                        readable: false,
                     };
                     if self.writes.insert((node, location), write).is_some() {
                         return Err(
@@ -3430,12 +3443,20 @@ impl Simulator {
                         );
                     }
                     let delay = self.disk_delays.range(0..=self.options.disk_delay_max);
+                    let readable = Event::Readable {
+                        node,
+                        run,
+                        location,
+                    };
+                    self.queue.push(self.now + delay, readable);
+                    // The sync that makes the bytes durable follows.
+                    let sync = self.sync_delays.range(0..=self.options.disk_delay_max);
                     let written = Event::Written {
                         node,
                         run,
                         location,
                     };
-                    self.queue.push(self.now + delay, written);
+                    self.queue.push(self.now + delay + sync, written);
                 }
                 node::Action::Record { location, record } => {
                     self.disks[node].record(location, record);
@@ -3509,11 +3530,60 @@ impl Simulator {
 
     /// Copies a write's bytes from the body it names, as the server would
     /// once the body arrives, and tells the node they are durable.
+    /// A write's bytes reach the node's disk, readable, and the node hears.
+    fn readable(&mut self, node: usize, location: Location) -> Result<(), Failure> {
+        let Some(write) = self.writes.get(&(node, location)) else {
+            return Ok(());
+        };
+        if write.readable {
+            return Ok(());
+        }
+        let (origin, offset, len) = (write.origin, write.offset, write.len);
+        match self.write_bytes(node, origin, offset, len)? {
+            Some(bytes) => {
+                self.disks[node].write(location, &bytes);
+                self.writes
+                    .get_mut(&(node, location))
+                    .expect("a write was scheduled")
+                    .readable = true;
+                self.node(node).on_readable(location);
+            }
+            None => {
+                self.writes.remove(&(node, location));
+                self.node(node).on_write_failed(location);
+            }
+        }
+        self.drain_node(node)
+    }
+
+    /// A write's bytes, from its body, or `None` if the body ended first.
+    fn write_bytes(
+        &self,
+        node: usize,
+        origin: OriginRequestId,
+        offset: u64,
+        len: u64,
+    ) -> Result<Option<Vec<u8>>, Failure> {
+        let Some(body) = self.origin_bodies.get(&(node, origin)) else {
+            return Err(self.failure(format!("node {node} released {origin:?} before writing it")));
+        };
+        if offset + len > body.len {
+            return Err(self.failure(format!("node {node} wrote past the end of {origin:?}")));
+        }
+        let bytes = body.bytes.get(offset as usize..(offset + len) as usize);
+        Ok(bytes.map(<[u8]>::to_vec))
+    }
+
     fn written(&mut self, node: usize, location: Location) -> Result<(), Failure> {
-        let write = self
-            .writes
-            .remove(&(node, location))
-            .expect("a write was scheduled");
+        // A write whose body ended before its bytes arrived already failed.
+        let Some(write) = self.writes.remove(&(node, location)) else {
+            return Ok(());
+        };
+        if write.readable {
+            self.node(node).on_written(location);
+            self.check_disk(node, Some(location))?;
+            return self.drain_node(node);
+        }
         let Some(body) = self.origin_bodies.get(&(node, write.origin)) else {
             return Err(self.failure(format!(
                 "node {node} released {:?} before writing it",

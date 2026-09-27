@@ -1254,13 +1254,27 @@ fn write(engine: &SharedNode, location: Location, bytes: Bytes) {
         let mut recheck = PAGES_RECHECK;
         let written = loop {
             let (disk, bytes) = (disk.clone(), bytes.clone());
-            let written = tokio::task::spawn_blocking(move || {
+            let (bytes_in, readable) = oneshot::channel::<()>();
+            let writing = tokio::task::spawn_blocking(move || {
                 disk.applied(issued);
-                disk.write(location, &bytes)
-            })
-            .await
-            .map_err(io::Error::other)
-            .and_then(|written| written);
+                disk.write(location, &bytes, move || {
+                    let _ = bytes_in.send(());
+                })
+            });
+            // Reads may take the bytes once they are in the slab file,
+            // before the sync that makes them durable.
+            if readable.await.is_ok() {
+                let work = {
+                    let mut this = engine.borrow_mut();
+                    this.node.on_readable(location);
+                    this.pump()
+                };
+                start(&engine, work);
+            }
+            let written = writing
+                .await
+                .map_err(io::Error::other)
+                .and_then(|written| written);
             match written {
                 Ok(None) if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(recheck).await;

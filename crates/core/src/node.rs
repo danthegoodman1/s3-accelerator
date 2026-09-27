@@ -486,8 +486,15 @@ pub struct Node {
     in_flight: BTreeMap<BlockKey, OriginRequestId>,
     /// Slots being written, and the response bodies they copy from.
     writes: BTreeMap<Location, OriginRequestId>,
+    /// Slots being written whose bytes are in the slab file, readable
+    /// though not yet durable.
+    readable: BTreeSet<Location>,
     /// Requests that read slots a first fetch is writing.
     awaiting_writes: BTreeMap<Location, Vec<GatewayRequestId>>,
+    /// Blocks whose write failed after reads of their bytes began: new
+    /// reads fetch them again, and the slot is freed once the last read
+    /// lets go.
+    unwritten: BTreeSet<BlockKey>,
     /// While the node handles a first fetch's head: its streaming body's
     /// version and span. Requests queued behind the fetch may read the
     /// body only then, since it streams through.
@@ -702,7 +709,9 @@ impl Node {
             next_origin: 0,
             in_flight: BTreeMap::new(),
             writes: BTreeMap::new(),
+            readable: BTreeSet::new(),
             awaiting_writes: BTreeMap::new(),
+            unwritten: BTreeSet::new(),
             arriving: None,
             recovered: BTreeSet::new(),
             verifying: BTreeMap::new(),
@@ -933,9 +942,9 @@ impl Node {
         }
     }
 
-    /// Answers a new owner's read from stored blocks, or with 404 if any
-    /// is missing or unverified. The blocks gain no hits, since their new
-    /// owner will hold them.
+    /// Answers a new owner's read from stored blocks, readable or durable,
+    /// or with 404 if any is missing or unverified. The blocks gain no hits,
+    /// since their new owner will hold them.
     fn serve_stored(&mut self, id: GatewayRequestId, range: RangeRead) {
         let layout = self.config.layout;
         let version = VersionId::of(&range.key, &range.etag);
@@ -947,7 +956,11 @@ impl Node {
         {
             let block = BlockKey { version, index };
             match self.store.get(&block) {
-                Some(entry) if entry.state == BlockState::Ready && entry.verify.is_none() => {
+                Some(entry)
+                    if (entry.state == BlockState::Ready && entry.verify.is_none())
+                        || (self.readable.contains(&entry.location)
+                            && !self.unwritten.contains(&block)) =>
+                {
                     blocks.push((block, entry.location, layout.block_span(range.size, index)));
                 }
                 _ => {
@@ -1455,6 +1468,12 @@ impl Node {
     /// Unpins a block, and frees it if a purge waited for it.
     fn unpin(&mut self, block: BlockKey) {
         self.store.unpin(block);
+        let pinned = self.store.get(&block).is_some_and(|entry| entry.pinned());
+        if !pinned && self.unwritten.remove(&block) {
+            self.store.remove(block);
+            self.unref(block.version);
+            return;
+        }
         self.drop_purged(block);
     }
 
@@ -1802,12 +1821,26 @@ impl Node {
         }
     }
 
+    /// The bytes for the slot at `location` are in the slab file, though
+    /// not yet durable: reads waiting for them go ahead, and later reads
+    /// read the slot. The block is recorded once the bytes are durable.
+    pub fn on_readable(&mut self, location: Location) {
+        if !self.writes.contains_key(&location) {
+            return;
+        }
+        self.readable.insert(location);
+        for waiter in self.awaiting_writes.remove(&location).unwrap_or_default() {
+            self.arrived(waiter, Await::Written(location));
+        }
+    }
+
     /// The bytes for the slot at `location` are durable.
     pub fn on_written(&mut self, location: Location) {
         let origin = self
             .writes
             .remove(&location)
             .expect("a write was in progress");
+        self.readable.remove(&location);
         let block = self
             .store
             .block_at(location)
@@ -1955,7 +1988,7 @@ impl Node {
             .iter()
             .take_while(|&&index| {
                 let block = BlockKey { version, index };
-                self.store.get(&block).is_none()
+                (self.store.get(&block).is_none() || self.unwritten.contains(&block))
                     && !self.in_flight.contains_key(&block)
                     && layout.placement(key, size, index).hash() == placement
             })
@@ -1970,6 +2003,7 @@ impl Node {
             .writes
             .remove(&location)
             .expect("a write was in progress");
+        self.readable.remove(&location);
         let block = self
             .store
             .block_at(location)
@@ -1982,10 +2016,19 @@ impl Node {
             .into_iter()
             .filter(|&waiter| self.abandon_plan(waiter))
             .collect();
-        self.store.remove(block);
+        // Reads of its readable bytes may still be sending; the slot stays
+        // theirs until the last lets go.
+        match self.store.get(&block).is_some_and(|entry| entry.pinned()) {
+            true => {
+                self.unwritten.insert(block);
+            }
+            false => {
+                self.store.remove(block);
+                self.unref(block.version);
+            }
+        }
         self.stats.unfilled_blocks += 1;
         self.filling_bytes -= len;
-        self.unref(block.version);
         // Later reads fill the block again instead of reading this body.
         if self.in_flight.get(&block) == Some(&origin) {
             self.in_flight.remove(&block);
@@ -2608,8 +2651,11 @@ impl Node {
                     self.store.hit(block);
                     Some((location, unverified.then_some(Await::Verify(location))))
                 }
-                (Some((location, BlockState::Filling, _)), None) => {
-                    Some((location, Some(Await::Written(location))))
+                (Some((location, BlockState::Filling, _)), None)
+                    if !self.unwritten.contains(&block) =>
+                {
+                    let written = self.readable.contains(&location);
+                    Some((location, (!written).then_some(Await::Written(location))))
                 }
                 _ => None,
             };
@@ -3176,7 +3222,10 @@ impl Node {
     ) -> Option<Location> {
         let layout = self.config.layout;
         let placement = layout.placement(key, size, block.index).hash();
-        if self.ring.owner(placement) != Some(self.id) && !self.leased(placement) {
+        let owns = self.ring.owner(placement) == Some(self.id) || self.leased(placement);
+        // A block whose failed write reads still hold keeps its entry until
+        // they let go, so this fetch serves without storing it.
+        if !owns || self.unwritten.contains(&block) {
             return None;
         }
         let hash = block_hash(block.version, layout.block_size(), block.index);
@@ -3545,6 +3594,94 @@ mod tests {
             |action| matches!(action, Action::Fetch { request, .. } if request.key == key("k")),
         );
         assert!(fetches, "the home kept the replaced version's metadata");
+    }
+
+    /// Reads take a block a first fetch is writing once its bytes are in
+    /// the slab file, before the sync. When the sync then fails, later
+    /// reads fetch the block again without storing it while an earlier
+    /// read still sends its bytes, and the slot is freed once that read
+    /// ends.
+    #[test]
+    fn a_block_is_readable_before_it_is_durable() {
+        let policy = BucketPolicy {
+            freshness: Freshness::Immutable,
+            admit_on_first_read: true,
+            warm_on_write: false,
+        };
+        let config = Config {
+            default_policy: policy,
+            ..config(16)
+        };
+        let member = Member {
+            id: NodeId(0),
+            weight: NonZeroU32::MIN,
+        };
+        let mut node = Node::new(NodeId(0), Ring::new(1, vec![member]), config);
+        let read = || Read::Object {
+            request: Request::get(key("k")),
+            stale: None,
+            direct: false,
+        };
+        let etag = ETag("\"v1\"".into());
+        node.on_request(Time(0), GatewayRequestId(1), read());
+        let first = node
+            .drain()
+            .into_iter()
+            .find_map(|action| match action {
+                Action::Fetch { origin, .. } => Some(origin),
+                _ => None,
+            })
+            .expect("a first fetch");
+        let head = ResponseHead {
+            status: 200,
+            etag: Some(etag),
+            content_range: None,
+            content_length: 50,
+            headers: Vec::new(),
+        };
+        node.on_origin_response(Time(1), first, head);
+        let written = node
+            .drain()
+            .into_iter()
+            .find_map(|action| match action {
+                Action::Write { location, .. } => Some(location),
+                _ => None,
+            })
+            .expect("the block is written");
+        // Before its bytes are in, a read waits; once they are, it reads
+        // the slot.
+        node.on_request(Time(2), GatewayRequestId(2), read());
+        let answered = |actions: Vec<Action>, id| {
+            actions.into_iter().any(|action| {
+                matches!(action, Action::Respond { request, ref body, .. }
+                    if request == id && matches!(body[..], [Segment::Slot { .. }]))
+            })
+        };
+        assert!(!answered(node.drain(), GatewayRequestId(2)));
+        node.on_readable(written);
+        assert!(answered(node.drain(), GatewayRequestId(2)));
+        node.on_request(Time(3), GatewayRequestId(3), read());
+        assert!(answered(node.drain(), GatewayRequestId(3)));
+        // The sync fails while both still send.
+        node.on_write_failed(written);
+        node.drain();
+        node.on_request(Time(4), GatewayRequestId(4), read());
+        let actions = node.drain();
+        let refetched = actions
+            .iter()
+            .any(|action| matches!(action, Action::Fetch { .. }));
+        let stored = actions
+            .iter()
+            .any(|action| matches!(action, Action::Write { .. }));
+        assert!(refetched && !stored, "{actions:?}");
+        let blocks =
+            |node: &Node| -> u64 { node.usage().classes.iter().map(|class| class.blocks).sum() };
+        assert_eq!(blocks(&node), 1);
+        node.on_sent(GatewayRequestId(2));
+        assert_eq!(blocks(&node), 1);
+        // The last read lets go, and the slot is free.
+        node.on_sent(GatewayRequestId(3));
+        assert_eq!(blocks(&node), 0);
     }
 
     /// A restarted node forgot the writes it had heard of, so it takes no
