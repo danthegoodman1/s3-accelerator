@@ -273,7 +273,7 @@ MUTANTS = [
     ),
     (
         "a reply waits for the whole arriving body",
-        [(NODE_ENGINE, "while arrived < len\n                    && let Some(chunk) = chunks.recv().await", "while let Some(chunk) = chunks.recv().await")],
+        [(ZERO_COPY, "while arrived < len\n            && let Some(chunk) = chunks.recv().await", "while let Some(chunk) = chunks.recv().await")],
     ),
     (
         "a hit is copied rather than sent with sendfile",
@@ -858,15 +858,32 @@ MUTANTS = [
     ),
     (
         "the read-ahead window never moves",
-        [(GATEWAY, "self.ask_ahead(id);\n        if self.reads.contains_key(&id) {", "if self.reads.contains_key(&id) {")],
+        [
+            (GATEWAY, "self.ask_ahead(id);\n        if self.reads.contains_key(&id) {", "if self.reads.contains_key(&id) {"),
+            (GATEWAY, "if read.ahead.is_some() {\n                return self.ask_ahead(id);\n            }",
+                      "if read.ahead.is_some() {\n                return;\n            }"),
+        ],
     ),
     (
         "runs pending from an earlier plan survive replanning",
         [(GATEWAY, 'self.reads.get_mut(&id).expect("a planned read exists").ahead = None;', "")],
     ),
     (
-        "a refused part keeps the runs still to ask for",
-        [(GATEWAY, "read.ahead = None;\n                self.abandon_parts_except(id, from);", "self.abandon_parts_except(id, from);")],
+        "a read with its whole body forwarded asks for more",
+        [
+            (GATEWAY, "if *remaining == 0 {\n                self.reads.remove(&id);", "if *remaining == 0 && read.ahead.is_none() {\n                self.reads.remove(&id);"),
+            (GATEWAY, "read.ahead = None;\n                self.abandon_parts_except(id, from);", "self.abandon_parts_except(id, from);"),
+        ],
+    ),
+    (
+        "S3 bodies are received on the event loop",
+        [(ORIGIN, "let reading = workers().spawn(async move { origin.read_here(&request, hold).await });\n        reading\n            .await\n            .unwrap_or_else(|_| (ResponseHead::status(503), OriginBody::Held(Bytes::new())))",
+                  "origin.read_here(&request, hold).await")],
+    ),
+    (
+        "arriving bodies are written on the event loop",
+        [(NODE_ENGINE, "let arrived = zero_copy::write_arriving(connection.stream(), chunks, len).await?;",
+                       "let mut chunks = chunks; let mut arrived = 0u64; while arrived < len && let Some(chunk) = chunks.recv().await { connection.write_all(&chunk).await?; arrived += chunk.len() as u64; }")],
     ),
     (
         "reads waiting on a newly down node wait out the timeout",

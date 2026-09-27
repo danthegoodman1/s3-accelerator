@@ -18,6 +18,7 @@ use crate::protocol::{self, Forward, Hint, NodeAnswer, NodeRequest, Versions};
 use crate::sigv4::constant_time_eq;
 use crate::sqs::{self, Queue};
 use crate::tls::{self, Tls};
+use crate::zero_copy;
 use bytes::Bytes;
 use hyper::body::Incoming;
 use s3_accelerator_core::Time;
@@ -107,7 +108,7 @@ const PAGES_RECHECK: Duration = Duration::from_millis(10);
 
 pub struct NodeEngine {
     started: Instant,
-    origin: Rc<Origin>,
+    origin: Arc<Origin>,
     peers: Rc<Peers>,
     disk: Arc<Disk>,
     node: Node,
@@ -183,7 +184,7 @@ impl NodeEngine {
     /// first ring are reached.
     pub fn new(
         node: Node,
-        origin: Rc<Origin>,
+        origin: Arc<Origin>,
         peers: Rc<Peers>,
         disk: Arc<Disk>,
         addresses: BTreeMap<NodeId, String>,
@@ -1499,21 +1500,18 @@ async fn send_body(
                 sent += total;
             }
             Part::Held { bytes, len } => {
-                connection.write_all(&bytes).await?;
-                sent += bytes.len() as u64;
-                if (bytes.len() as u64) < len {
+                let held = bytes.len() as u64;
+                match bytes.len() < zero_copy::INLINE_WRITE {
+                    true => connection.write_all(&bytes).await?,
+                    false => zero_copy::write_on_workers(connection.stream(), bytes).await?,
+                }
+                sent += held;
+                if held < len {
                     return Ok(sent);
                 }
             }
-            Part::Arriving { mut chunks, len } => {
-                let mut arrived = 0;
-                // The body goes on for other readers after this one's bytes.
-                while arrived < len
-                    && let Some(chunk) = chunks.recv().await
-                {
-                    connection.write_all(&chunk).await?;
-                    arrived += chunk.len() as u64;
-                }
+            Part::Arriving { chunks, len } => {
+                let arrived = zero_copy::write_arriving(connection.stream(), chunks, len).await?;
                 sent += arrived;
                 if arrived < len {
                     return Ok(sent);

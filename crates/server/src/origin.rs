@@ -4,6 +4,7 @@
 
 use crate::http::{format_range, header, parse_content_range};
 use crate::sigv4::{self, Credentials, Signer, UNSIGNED_PAYLOAD};
+use crate::zero_copy::workers;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty};
@@ -14,6 +15,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use s3_accelerator_core::s3::{ETag, Method, ObjectKey, Request, ResponseHead};
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -81,10 +83,23 @@ impl Origin {
         }
     }
 
-    /// Sends a request from the core. `hold` is the most body bytes to read
-    /// in full before answering; without it, a body of known length is
-    /// left arriving. A failure to reach S3 answers 503.
-    pub async fn read(&self, request: &Request, hold: Option<u64>) -> (ResponseHead, OriginBody) {
+    /// Sends a request from the core, from a worker, which receives S3's
+    /// answer. `hold` is the most body bytes to read in full before
+    /// answering; without it, a body of known length is left arriving. A
+    /// failure to reach S3 answers 503.
+    pub async fn read(
+        self: &Arc<Self>,
+        request: &Request,
+        hold: Option<u64>,
+    ) -> (ResponseHead, OriginBody) {
+        let (origin, request) = (self.clone(), request.clone());
+        let reading = workers().spawn(async move { origin.read_here(&request, hold).await });
+        reading
+            .await
+            .unwrap_or_else(|_| (ResponseHead::status(503), OriginBody::Held(Bytes::new())))
+    }
+
+    async fn read_here(&self, request: &Request, hold: Option<u64>) -> (ResponseHead, OriginBody) {
         let failed = || (ResponseHead::status(503), OriginBody::Held(Bytes::new()));
         // S3 answers a whole object with its checksums, which the home
         // keeps with the metadata.
@@ -125,11 +140,12 @@ impl Origin {
         }
     }
 
-    /// Passes a client's request to S3 under the cluster's signature. The
-    /// body, `len` bytes, and its payload hash travel unchanged.
+    /// Passes a client's request to S3 under the cluster's signature, from
+    /// a worker. The body, `len` bytes, and its payload hash travel
+    /// unchanged.
     #[allow(clippy::too_many_arguments)]
     pub async fn forward(
-        &self,
+        self: &Arc<Self>,
         method: &str,
         path: &str,
         query: &str,
@@ -143,8 +159,16 @@ impl Origin {
             .filter(|(name, _)| !is_hop_header(name))
             .cloned()
             .collect();
-        self.send(method, path, query, headers, payload_hash, body, Some(len))
-            .await
+        let origin = self.clone();
+        let (method, path, query) = (method.to_string(), path.to_string(), query.to_string());
+        let payload_hash = payload_hash.to_string();
+        let sending = workers().spawn(async move {
+            let len = Some(len);
+            origin
+                .send(&method, &path, &query, headers, &payload_hash, body, len)
+                .await
+        });
+        sending.await.map_err(io::Error::other)?
     }
 
     #[allow(clippy::too_many_arguments)]

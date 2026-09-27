@@ -7,6 +7,7 @@
 //! acknowledges it, or, over loopback, after the reader reads it. A slot's
 //! pages are overwritten only once they are free (see [`PageCache`]).
 
+use bytes::Bytes;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{Advice, fadvise};
 use rustix::io::Errno;
@@ -24,6 +25,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::Interest;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 
 /// How long a transfer waits for a socket to take or give more bytes.
 pub const IDLE: Duration = Duration::from_secs(60);
@@ -75,7 +77,7 @@ pub enum Short {
 /// Sockets never block `splice`, so the relay runs on this thread's event
 /// loop, unless `kernel_tls` says either socket carries a kernel TLS
 /// session: then each `splice` encrypts or decrypts, and the relay runs on
-/// the relay runtime's threads so the crypto leaves the event loop free.
+/// the workers so the crypto leaves the event loop free.
 pub async fn relay(
     from: &TcpStream,
     to: &TcpStream,
@@ -93,7 +95,7 @@ pub async fn relay(
         Ok(to) => std::net::TcpStream::from(to),
         Err(error) => return (0, Err(Short::Destination(error))),
     };
-    let relayed = relays().spawn(async move {
+    let relayed = workers().spawn(async move {
         let from = match TcpStream::from_std(from) {
             Ok(from) => from,
             Err(error) => return (0, Err(Short::Source(error))),
@@ -109,20 +111,73 @@ pub async fn relay(
         .unwrap_or_else(|error| (0, Err(Short::Source(io::Error::other(error)))))
 }
 
-/// The runtime that relays over kernel TLS, one thread per core: its
-/// threads take the crypto off the event loop, and a slow client holds no
-/// thread while it waits.
-fn relays() -> &'static tokio::runtime::Runtime {
-    static RELAYS: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RELAYS.get_or_init(|| {
+/// The runtime whose threads move bytes, one per core: relays over kernel
+/// TLS, a node's S3 requests, and its writes of the bodies it holds or
+/// passes on. Its threads take the copies and the crypto off the event
+/// loop, and a slow peer holds no thread while it waits.
+pub fn workers() -> &'static tokio::runtime::Runtime {
+    static WORKERS: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    WORKERS.get_or_init(|| {
         let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get());
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(threads)
-            .thread_name("relay")
+            .thread_name("worker")
             .enable_all()
             .build()
-            .expect("the relay runtime starts")
+            .expect("the worker runtime starts")
     })
+}
+
+/// Bodies smaller than this go out on the event loop: waking a worker
+/// costs more than the copy.
+pub const INLINE_WRITE: usize = 64 << 10;
+
+/// Writes `bytes` to `socket` from a worker, through a duplicate of the
+/// socket.
+pub async fn write_on_workers(socket: &TcpStream, bytes: Bytes) -> io::Result<()> {
+    let socket = std::net::TcpStream::from(socket.as_fd().try_clone_to_owned()?);
+    let written = workers().spawn(async move {
+        let socket = TcpStream::from_std(socket)?;
+        write_idle(&socket, &bytes).await
+    });
+    written.await.map_err(io::Error::other)?
+}
+
+/// Writes chunks to `socket` as they arrive, from a worker, until `len`
+/// bytes or the chunks end, and returns the bytes written.
+pub async fn write_arriving(
+    socket: &TcpStream,
+    mut chunks: mpsc::Receiver<Bytes>,
+    len: u64,
+) -> io::Result<u64> {
+    let socket = std::net::TcpStream::from(socket.as_fd().try_clone_to_owned()?);
+    let written = workers().spawn(async move {
+        let socket = TcpStream::from_std(socket)?;
+        let mut arrived = 0;
+        // The body goes on for other readers after this one's bytes.
+        while arrived < len
+            && let Some(chunk) = chunks.recv().await
+        {
+            write_idle(&socket, &chunk).await?;
+            arrived += chunk.len() as u64;
+        }
+        Ok(arrived)
+    });
+    written.await.map_err(io::Error::other)?
+}
+
+/// Writes all of `bytes`, failing if the socket takes none for `IDLE`.
+async fn write_idle(socket: &TcpStream, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        idle(socket.writable()).await?;
+        match socket.try_write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// A relay on this thread's event loop.

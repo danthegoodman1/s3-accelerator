@@ -149,7 +149,7 @@ pub async fn run_with(
                 }
                 None => None,
             };
-            let origin = Rc::new(Origin::new(&origin.endpoint, &origin.region, credentials()));
+            let origin = Arc::new(Origin::new(&origin.endpoint, &origin.region, credentials()));
             let node_config = config.cache.node_config();
             let (disk, recovery) = Disk::open(Path::new(&node.data_dir), node_config.store)?;
             let id = NodeId(node.id);

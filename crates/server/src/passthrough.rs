@@ -15,6 +15,7 @@ use s3_accelerator_core::s3::ObjectKey;
 use sha2::{Digest, Sha256};
 use std::io;
 use std::ops::Range;
+use std::sync::Arc;
 use tokio::net::TcpStream;
 
 /// Where a passing body goes.
@@ -147,7 +148,7 @@ pub struct Sent {
 /// refuse it. The gateway checked the body's hash. The bytes within
 /// `keep` are kept as they pass.
 pub async fn to_s3(
-    origin: &Origin,
+    origin: &Arc<Origin>,
     forward: &Forward,
     source: &mut Connection,
     keep: &[Range<u64>],

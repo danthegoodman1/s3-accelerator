@@ -243,6 +243,49 @@ async fn a_purge_syncs_its_erased_bytes_before_it_confirms() {
         .await;
 }
 
+/// A first read's bytes move on worker threads: the node receives S3's
+/// body and writes it to the gateway off its event loop, the thread that
+/// owns its core, which handles only heads.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fill_moves_its_bytes_off_the_event_loop() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            origin.size.set(4 << 20);
+            let dir = data_dir();
+            let cluster = Cluster::new(&dir, origin_port, "block_size = 65536");
+            let calls = "read,recvfrom,write,writev,sendto";
+            let node = Process::traced(&cluster.node, &dir.join("node.trace"), calls);
+            common::listening(cluster.node_port).await;
+            let _gateway = cluster.start_gateway().await;
+            let body = origin.object("/bucket/k");
+            assert!(cluster.get("k").await == (200, body));
+            let event_loop = node.server_pid();
+            node.stop();
+
+            let calls = read_trace(&dir.join("node.trace"), 0.0, f64::MAX);
+            let moving: Vec<&Call> = calls
+                .iter()
+                .filter(|call| call.fds().first().is_some_and(|fd| fd.contains("TCP")))
+                .filter(|call| call.result >= 16 << 10)
+                .collect();
+            let reads = |name: &str| matches!(name, "read" | "recvfrom");
+            let received = moving.iter().filter(|call| reads(&call.name)).count();
+            let sent = moving.len() - received;
+            assert!(
+                received > 0 && sent > 0,
+                "{received} large reads, {sent} large writes"
+            );
+            let on_loop = moving
+                .iter()
+                .filter(|call| call.thread == event_loop)
+                .count();
+            assert_eq!(on_loop, 0, "large socket calls on the event loop");
+            println!("{received} large reads and {sent} large writes, all on workers");
+        })
+        .await;
+}
+
 /// Slots cleared before `time`, by slab offset: when each clear ended, and
 /// the slot's size under its last record.
 fn cleared_slots(
