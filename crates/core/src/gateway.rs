@@ -16,7 +16,7 @@
 
 use crate::Time;
 use crate::layout::Layout;
-use crate::node::{BucketPolicy, Freshness, ObjectMeta, RangeRead, Read};
+use crate::node::{BucketPolicy, Freshness, HotHint, ObjectMeta, RangeRead, Read};
 use crate::placement::{NodeId, Placement, PlacementHash, Ring};
 use crate::s3::{Answer, ContentRange, ETag, Method, ObjectKey, Request, ResponseHead, answer};
 use std::collections::{BTreeMap, VecDeque};
@@ -106,6 +106,9 @@ pub struct Gateway {
     /// the gateway reads them directly from S3: the home may keep metadata
     /// from before the write until the bucket's TTL runs out.
     detours: BTreeMap<ObjectKey, Time>,
+    /// Hot placements: the nodes the gateway spreads their reads across,
+    /// until when, and which it asks next.
+    hot: BTreeMap<PlacementHash, (Vec<NodeId>, Time, usize)>,
     /// When the gateway last asked a node for its ring, until it arrives.
     fetching_ring: Option<Time>,
     actions: Vec<Action>,
@@ -224,6 +227,7 @@ impl Gateway {
             reads: BTreeMap::new(),
             parts: BTreeMap::new(),
             detours: BTreeMap::new(),
+            hot: BTreeMap::new(),
             suspects: BTreeMap::new(),
             fetching_ring: None,
             actions: Vec::new(),
@@ -233,6 +237,23 @@ impl Gateway {
     /// The ring the gateway routes by.
     pub fn ring(&self) -> &Ring {
         &self.ring
+    }
+
+    /// A node said these placements are hot: until each hint runs out, the
+    /// gateway spreads their range reads across the nodes it names.
+    pub fn on_hot(&mut self, now: Time, hints: Vec<HotHint>) {
+        self.now = self.now.max(now);
+        for hint in hints {
+            if hint.until <= now || hint.nodes.is_empty() {
+                continue;
+            }
+            let next = self
+                .hot
+                .get(&hint.placement)
+                .map_or(0, |(_, _, next)| *next);
+            self.hot
+                .insert(hint.placement, (hint.nodes, hint.until, next));
+        }
     }
 
     /// The nodes to pass a request for `target` through to S3, best first:
@@ -321,6 +342,7 @@ impl Gateway {
         self.now = self.now.max(now);
         self.suspects.retain(|_, until| *until > now);
         self.detours.retain(|_, until| *until > now);
+        self.hot.retain(|_, (_, until, _)| *until > now);
         let oldest = self
             .reads
             .values()
@@ -565,7 +587,7 @@ impl Gateway {
     ) -> Option<VecDeque<NodeRequestId>> {
         let mut groups: Vec<(NodeId, Vec<Run>)> = Vec::new();
         for run in runs {
-            let node = self.target(run.0, tried)?;
+            let node = self.spread(run.0, tried)?;
             match groups.last_mut() {
                 Some((target, runs)) if *target == node => runs.push(run),
                 _ => groups.push((node, vec![run])),
@@ -584,6 +606,24 @@ impl Gateway {
             })
             .collect();
         Some(parts)
+    }
+
+    /// The next of a hot placement's nodes, in turn, that is not in `tried`
+    /// or suspected; otherwise the best candidate.
+    fn spread(&mut self, placement: PlacementHash, tried: &[NodeId]) -> Option<NodeId> {
+        if let Some((nodes, until, next)) = self.hot.get_mut(&placement)
+            && *until > self.now
+        {
+            let count = nodes.len();
+            for step in 0..count {
+                let node = nodes[(*next + step) % count];
+                if !tried.contains(&node) && !self.suspects.contains_key(&node) {
+                    *next = (*next + step + 1) % count;
+                    return Some(node);
+                }
+            }
+        }
+        self.target(placement, tried)
     }
 
     /// The best candidate for `placement` not in `tried`, preferring nodes

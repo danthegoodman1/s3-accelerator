@@ -6,10 +6,10 @@
 //! fetches a ring whose version differs from its own.
 
 use crate::peers::{Exchanged, NodeBody, Peers};
-use crate::protocol::{NodeAnswer, NodeRequest};
+use crate::protocol::{Hint, NodeAnswer, NodeRequest};
 use s3_accelerator_core::Time;
 use s3_accelerator_core::gateway::{self, ClientRequestId, Gateway, NodeRequestId};
-use s3_accelerator_core::node::Read;
+use s3_accelerator_core::node::{HotHint, Read};
 use s3_accelerator_core::placement::{NodeId, Placement, Ring};
 use s3_accelerator_core::s3::{ObjectKey, Request, ResponseHead};
 use std::cell::RefCell;
@@ -272,6 +272,17 @@ impl GatewayEngine {
     }
 }
 
+/// Hints on this gateway's clock.
+fn hints(now: Time, hot: Vec<Hint>) -> Vec<HotHint> {
+    hot.into_iter()
+        .map(|hint| HotHint {
+            placement: hint.placement,
+            nodes: hint.nodes,
+            until: Time(now.0 + hint.left),
+        })
+        .collect()
+}
+
 /// What the gateway's actions left to start.
 struct Work {
     sends: Vec<(NodeId, NodeRequestId, Read)>,
@@ -294,19 +305,21 @@ fn start(engine: &SharedGateway, work: Work) {
                 let version = exchanged.as_ref().ok().and_then(|exchanged| exchanged.ring);
                 match exchanged {
                     Ok(Exchanged {
-                        answer: NodeAnswer::Respond { head, meta },
+                        answer: NodeAnswer::Respond { head, meta, hot },
                         body,
                         ..
                     }) => {
                         this.relayed.insert(id, body);
+                        this.gateway.on_hot(now, hints(now, hot));
                         this.gateway.on_node_response(now, id, head, meta);
                     }
                     Ok(Exchanged {
-                        answer: NodeAnswer::Metadata(meta),
+                        answer: NodeAnswer::Metadata(meta, hot),
                         body,
                         ..
                     }) => {
                         this.peers.idle(body);
+                        this.gateway.on_hot(now, hints(now, hot));
                         this.gateway.on_node_metadata(now, id, meta);
                     }
                     Ok(Exchanged {

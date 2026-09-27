@@ -18,7 +18,7 @@ use crate::origin::is_object_header;
 use crate::sigv4;
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use s3_accelerator_core::node::{ObjectMeta, RangeRead, Read};
-use s3_accelerator_core::placement::{Member, NodeId, Ring};
+use s3_accelerator_core::placement::{Member, NodeId, PlacementHash, Ring};
 use s3_accelerator_core::s3::{ETag, Method, ObjectKey, Request, ResponseHead};
 use std::collections::BTreeMap;
 
@@ -41,6 +41,11 @@ const RING: &str = "x-accel-ring";
 const PASSED_ON: &str = "x-accel-passed-on";
 const RING_MEMBERS: &str = "x-accel-ring-members";
 const PAYLOAD: &str = "x-accel-payload";
+const HOT: &str = "x-accel-hot";
+const PLACEMENT: &str = "x-accel-placement";
+const OWNER: &str = "x-accel-owner";
+const LEFT: &str = "x-accel-left";
+const READS: &str = "x-accel-reads";
 /// Prefixes a forwarded request's or response's own headers.
 const FORWARDED: &str = "x-accel-h-";
 
@@ -59,6 +64,18 @@ pub enum NodeRequest {
     Event {
         key: ObjectKey,
         etag: Option<ETag>,
+    },
+    /// `owner` leases a hot placement to the node for `left` more
+    /// milliseconds.
+    Lease {
+        placement: PlacementHash,
+        owner: NodeId,
+        left: u64,
+    },
+    /// A replica served `reads` reads of a placement under its lease.
+    LeaseReport {
+        placement: PlacementHash,
+        reads: u64,
     },
     /// The node's ring.
     Ring,
@@ -81,14 +98,25 @@ pub struct Forward {
     pub len: u64,
 }
 
-/// A node's answer to a gateway.
+/// A hot placement's owner and replicas, which gateways spread its reads
+/// across for `left` more milliseconds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hint {
+    pub placement: PlacementHash,
+    pub nodes: Vec<NodeId>,
+    pub left: u64,
+}
+
+/// A node's answer to a gateway. Answers to reads carry hints for the hot
+/// placements they read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeAnswer {
     Respond {
         head: ResponseHead,
         meta: Option<ObjectMeta>,
+        hot: Vec<Hint>,
     },
-    Metadata(ObjectMeta),
+    Metadata(ObjectMeta, Vec<Hint>),
     Stale,
     /// The node took a write or event notice.
     Written,
@@ -118,6 +146,23 @@ pub fn encode_request(
         NodeRequest::Ring => {
             add(KIND, "ring".into());
             return ("GET", "/".into(), headers);
+        }
+        NodeRequest::Lease {
+            placement,
+            owner,
+            left,
+        } => {
+            add(KIND, "lease".into());
+            add(PLACEMENT, format!("{:016x}", placement.0));
+            add(OWNER, owner.0.to_string());
+            add(LEFT, left.to_string());
+            return ("POST", "/".into(), headers);
+        }
+        NodeRequest::LeaseReport { placement, reads } => {
+            add(KIND, "lease-report".into());
+            add(PLACEMENT, format!("{:016x}", placement.0));
+            add(READS, reads.to_string());
+            return ("POST", "/".into(), headers);
         }
         NodeRequest::Forward(forward) => {
             add(KIND, "forward".into());
@@ -193,7 +238,11 @@ pub fn encode_request(
     };
     let method = match request {
         NodeRequest::Written { .. } | NodeRequest::Event { .. } => "POST",
-        NodeRequest::Read(_) | NodeRequest::Ring | NodeRequest::Forward(_) => "GET",
+        NodeRequest::Read(_)
+        | NodeRequest::Ring
+        | NodeRequest::Forward(_)
+        | NodeRequest::Lease { .. }
+        | NodeRequest::LeaseReport { .. } => "GET",
     };
     (method, path(key), headers)
 }
@@ -207,8 +256,31 @@ pub fn decode_request(
     len: u64,
 ) -> Result<NodeRequest, String> {
     let field = |name: &str| header(headers, name).ok_or_else(|| format!("no {name}"));
+    let number = |name: &str| -> Result<u64, String> {
+        field(name)?
+            .parse()
+            .map_err(|_| format!("{name} is no number"))
+    };
+    let placement = || {
+        u64::from_str_radix(field(PLACEMENT)?, 16)
+            .map(PlacementHash)
+            .map_err(|_| format!("{PLACEMENT} is no hash"))
+    };
     match field(KIND)? {
         "ring" => return Ok(NodeRequest::Ring),
+        "lease" => {
+            return Ok(NodeRequest::Lease {
+                placement: placement()?,
+                owner: NodeId(number(OWNER)?),
+                left: number(LEFT)?,
+            });
+        }
+        "lease-report" => {
+            return Ok(NodeRequest::LeaseReport {
+                placement: placement()?,
+                reads: number(READS)?,
+            });
+        }
         "forward" => {
             return Ok(NodeRequest::Forward(Forward {
                 method: field(METHOD)?.to_string(),
@@ -222,11 +294,6 @@ pub fn decode_request(
         _ => {}
     }
     let key = key(path)?;
-    let number = |name: &str| -> Result<u64, String> {
-        field(name)?
-            .parse()
-            .map_err(|_| format!("{name} is no number"))
-    };
     let condition = |name: &str| {
         etag_condition(header(headers, name)).ok_or_else(|| format!("{name} names no one ETag"))
     };
@@ -279,7 +346,8 @@ pub fn decode_request(
 pub fn encode_answer(answer: &NodeAnswer, ring: u64) -> (u16, Vec<(String, String)>) {
     let mut headers = vec![(RING.to_string(), format!("{ring:016x}"))];
     let status = match answer {
-        NodeAnswer::Respond { head, meta } => {
+        NodeAnswer::Respond { head, meta, hot } => {
+            encode_hints(hot, &mut headers);
             headers.push((ANSWER.to_string(), "respond".into()));
             headers.push((LENGTH.to_string(), head.content_length.to_string()));
             if let Some(etag) = &head.etag {
@@ -294,7 +362,8 @@ pub fn encode_answer(answer: &NodeAnswer, ring: u64) -> (u16, Vec<(String, Strin
             }
             head.status
         }
-        NodeAnswer::Metadata(meta) => {
+        NodeAnswer::Metadata(meta, hot) => {
+            encode_hints(hot, &mut headers);
             headers.push((ANSWER.to_string(), "metadata".into()));
             encode_meta(meta, &mut headers);
             200
@@ -377,9 +446,13 @@ pub fn decode_answer(status: u16, headers: &[(String, String)]) -> Result<NodeAn
                 Some(_) => Some(decode_meta(headers)?),
                 None => None,
             };
-            Ok(NodeAnswer::Respond { head, meta })
+            let hot = decode_hints(headers)?;
+            Ok(NodeAnswer::Respond { head, meta, hot })
         }
-        "metadata" => Ok(NodeAnswer::Metadata(decode_meta(headers)?)),
+        "metadata" => Ok(NodeAnswer::Metadata(
+            decode_meta(headers)?,
+            decode_hints(headers)?,
+        )),
         "stale" => Ok(NodeAnswer::Stale),
         "written" => Ok(NodeAnswer::Written),
         "forwarded" => {
@@ -423,6 +496,45 @@ pub fn decode_answer(status: u16, headers: &[(String, String)]) -> Result<NodeAn
         }
         other => Err(format!("{ANSWER} {other}")),
     }
+}
+
+/// Each hint as `placement:left:node,node`.
+fn encode_hints(hints: &[Hint], headers: &mut Vec<(String, String)>) {
+    for hint in hints {
+        let nodes: Vec<String> = hint.nodes.iter().map(|node| node.0.to_string()).collect();
+        let value = format!(
+            "{:016x}:{}:{}",
+            hint.placement.0,
+            hint.left,
+            nodes.join(",")
+        );
+        headers.push((HOT.to_string(), value));
+    }
+}
+
+fn decode_hints(headers: &[(String, String)]) -> Result<Vec<Hint>, String> {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(HOT))
+        .map(|(_, value)| {
+            let parsed = (|| {
+                let mut parts = value.splitn(3, ':');
+                let placement = u64::from_str_radix(parts.next()?, 16).ok()?;
+                let left = parts.next()?.parse().ok()?;
+                let nodes = parts
+                    .next()?
+                    .split(',')
+                    .map(|node| node.parse().ok().map(NodeId))
+                    .collect::<Option<Vec<NodeId>>>()?;
+                Some(Hint {
+                    placement: PlacementHash(placement),
+                    nodes,
+                    left,
+                })
+            })();
+            parsed.ok_or_else(|| format!("{HOT} {value}"))
+        })
+        .collect()
 }
 
 fn encode_meta(meta: &ObjectMeta, headers: &mut Vec<(String, String)>) {
@@ -555,6 +667,15 @@ mod tests {
             etag: None,
         });
         round_trip(NodeRequest::Ring);
+        round_trip(NodeRequest::Lease {
+            placement: PlacementHash(0x0123_4567_89ab_cdef),
+            owner: NodeId(4),
+            left: 10_000,
+        });
+        round_trip(NodeRequest::LeaseReport {
+            placement: PlacementHash(7),
+            reads: 312,
+        });
         round_trip(NodeRequest::Forward(Forward {
             method: "PUT".into(),
             path: "/bucket/a%20b/../c".into(),
@@ -600,9 +721,25 @@ mod tests {
             NodeAnswer::Respond {
                 head: head.clone(),
                 meta: Some(meta.clone()),
+                hot: Vec::new(),
             },
-            NodeAnswer::Respond { head, meta: None },
-            NodeAnswer::Metadata(meta),
+            NodeAnswer::Respond {
+                head,
+                meta: None,
+                hot: vec![
+                    Hint {
+                        placement: PlacementHash(0xabcdef),
+                        nodes: vec![NodeId(3), NodeId(1), NodeId(12)],
+                        left: 9_000,
+                    },
+                    Hint {
+                        placement: PlacementHash(u64::MAX),
+                        nodes: vec![NodeId(0)],
+                        left: 1,
+                    },
+                ],
+            },
+            NodeAnswer::Metadata(meta, Vec::new()),
             NodeAnswer::Stale,
             NodeAnswer::Written,
             NodeAnswer::Ring { ring, addresses },

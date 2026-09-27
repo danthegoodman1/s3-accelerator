@@ -355,3 +355,45 @@ async fn an_event_from_the_queue_reaches_the_home() {
         })
         .await;
 }
+
+/// A key read often enough is leased to the home's next two candidates,
+/// which fill from the home and store its blocks, and the gateway spreads
+/// reads across all three. With the home stopped, reads still come from
+/// the replicas' blocks, with no request to S3.
+#[tokio::test(flavor = "current_thread")]
+async fn a_hot_key_is_read_from_its_replicas() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            let cache = format!(
+                "{CLUSTER_CACHE}\nhot_threshold = 5\nhot_window_ms = 10000\nlease_ms = 60000"
+            );
+            let cluster = Cluster::with_nodes(&data_dir(), origin_port, &cache, 3, "", &[]);
+            let mut nodes: Vec<_> = Vec::new();
+            for id in 0..3 {
+                nodes.push(Some(cluster.start(id).await));
+            }
+            let _gateway = cluster.start_gateway().await;
+            for _ in 0..30 {
+                assert_eq!(cluster.get("hot").await, (200, object()));
+            }
+            assert_eq!(origin.requests.get(), 1);
+            let members = [0, 1, 2].map(|id| Member {
+                id: NodeId(id),
+                weight: NonZeroU32::MIN,
+            });
+            let key = ObjectKey {
+                bucket: "bucket".into(),
+                key: "hot".into(),
+            };
+            let home = Ring::new(0, members.to_vec())
+                .owner(Placement::Home(&key).hash())
+                .unwrap();
+            nodes[home.0 as usize].take().unwrap().stop();
+            for _ in 0..6 {
+                assert_eq!(cluster.get("hot").await, (200, object()));
+            }
+            assert_eq!(origin.requests.get(), 1);
+        })
+        .await;
+}

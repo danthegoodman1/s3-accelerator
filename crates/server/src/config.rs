@@ -260,6 +260,14 @@ pub struct CacheConfig {
     /// blocks first, and how long a previous owner has to answer.
     pub fallback_window_ms: u64,
     pub peer_timeout_ms: u64,
+    /// A placement its owner reads `hot_threshold` times within
+    /// `hot_window_ms` is leased to its next `hot_replicas` candidates for
+    /// `lease_ms`, and gateways spread its reads across them; 0 turns
+    /// leases off.
+    pub hot_threshold: u64,
+    pub hot_window_ms: u64,
+    pub hot_replicas: usize,
+    pub lease_ms: u64,
     pub default_policy: PolicyConfig,
     pub buckets: BTreeMap<String, PolicyConfig>,
 }
@@ -282,6 +290,10 @@ impl Default for CacheConfig {
             suspect_ttl_ms: 10_000,
             fallback_window_ms: 600_000,
             peer_timeout_ms: 1_000,
+            hot_threshold: 1_000,
+            hot_window_ms: 1_000,
+            hot_replicas: 2,
+            lease_ms: 10_000,
             default_policy: PolicyConfig::default(),
             buckets: BTreeMap::new(),
         }
@@ -360,6 +372,10 @@ impl CacheConfig {
             origin_timeout: self.origin_timeout_ms,
             fallback_window: self.fallback_window_ms,
             peer_timeout: self.peer_timeout_ms,
+            hot_threshold: self.hot_threshold,
+            hot_window: self.hot_window_ms,
+            hot_replicas: self.hot_replicas,
+            lease: self.lease_ms,
             default_policy: self.default_policy.policy(),
             buckets: self
                 .buckets

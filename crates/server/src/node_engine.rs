@@ -14,15 +14,15 @@ use crate::http::{Connection, Framing, Response, header};
 use crate::origin::{self, Origin, OriginBody};
 use crate::passthrough;
 use crate::peers::{Exchanged, Peers};
-use crate::protocol::{self, Forward, NodeAnswer, NodeRequest};
+use crate::protocol::{self, Forward, Hint, NodeAnswer, NodeRequest};
 use crate::sqs::{self, Queue};
 use bytes::Bytes;
 use hyper::body::Incoming;
 use s3_accelerator_core::Time;
 use s3_accelerator_core::node::{
-    self, EventId, GatewayRequestId, Node, OriginRequestId, Read, Segment,
+    self, EventId, GatewayRequestId, HotHint, Node, OriginRequestId, Read, Segment,
 };
-use s3_accelerator_core::placement::{NodeId, Ring};
+use s3_accelerator_core::placement::{NodeId, PlacementHash, Ring};
 use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
 use s3_accelerator_core::store::Location;
 use std::cell::RefCell;
@@ -141,6 +141,8 @@ struct Work {
     passed_writes: Vec<(NodeId, ObjectKey)>,
     /// Events to pass on, and receipts of messages to delete.
     passed_events: Vec<(EventId, NodeId, ObjectKey, Option<ETag>)>,
+    /// Leases and lease reports to send.
+    notices: Vec<(NodeId, NodeRequest)>,
     deletes: Vec<String>,
     writes: Vec<(Location, Bytes)>,
     /// Slots to verify: location, length and checksum.
@@ -281,6 +283,29 @@ impl NodeEngine {
         start(engine, work);
     }
 
+    /// `owner` leased `placement` to this node for `left` milliseconds.
+    pub fn lease(engine: &SharedNode, placement: PlacementHash, owner: NodeId, left: u64) {
+        let work = {
+            let mut this = engine.borrow_mut();
+            let now = this.now();
+            this.node
+                .on_lease(now, placement, owner, Time(now.0 + left));
+            this.pump()
+        };
+        start(engine, work);
+    }
+
+    /// A replica served `reads` reads of `placement` under its lease.
+    pub fn lease_report(engine: &SharedNode, placement: PlacementHash, reads: u64) {
+        let work = {
+            let mut this = engine.borrow_mut();
+            let now = this.now();
+            this.node.on_lease_report(now, placement, reads);
+            this.pump()
+        };
+        start(engine, work);
+    }
+
     /// Another node passed on S3's event that `key` changed to `etag`.
     pub fn event_notice(engine: &SharedNode, key: &ObjectKey, etag: Option<&ETag>) {
         let work = {
@@ -365,16 +390,39 @@ impl NodeEngine {
                 head,
                 body,
                 meta,
+                hot,
             } => {
                 let len = body.iter().map(segment_len).sum();
                 let body = self.parts(&body);
-                let answer = NodeAnswer::Respond { head, meta };
+                let hot = self.hints(hot);
+                let answer = NodeAnswer::Respond { head, meta, hot };
                 if !self.reply(request, answer, body, len, true) {
                     self.node.on_sent(request);
                 }
             }
-            node::Action::Metadata { request, meta } => {
-                self.reply(request, NodeAnswer::Metadata(meta), Vec::new(), 0, false);
+            node::Action::Metadata { request, meta, hot } => {
+                let answer = NodeAnswer::Metadata(meta, self.hints(hot));
+                self.reply(request, answer, Vec::new(), 0, false);
+            }
+            node::Action::GrantLease {
+                node,
+                placement,
+                until,
+            } => {
+                let request = NodeRequest::Lease {
+                    placement,
+                    owner: self.node.id(),
+                    left: until.0.saturating_sub(self.now().0),
+                };
+                self.work.notices.push((node, request));
+            }
+            node::Action::ReportLease {
+                node,
+                placement,
+                reads,
+            } => {
+                let request = NodeRequest::LeaseReport { placement, reads };
+                self.work.notices.push((node, request));
             }
             node::Action::Stale { request } => {
                 self.reply(request, NodeAnswer::Stale, Vec::new(), 0, false);
@@ -518,6 +566,19 @@ impl NodeEngine {
         parts
     }
 
+    /// Hints as the protocol carries them, in milliseconds left rather
+    /// than this node's clock.
+    fn hints(&self, hot: Vec<HotHint>) -> Vec<Hint> {
+        let now = self.now();
+        hot.into_iter()
+            .map(|hint| Hint {
+                placement: hint.placement,
+                nodes: hint.nodes,
+                left: hint.until.0.saturating_sub(now.0),
+            })
+            .collect()
+    }
+
     fn save(&mut self, key: &ObjectKey, meta: Option<&node::Meta>) {
         match self.disk.append(key, meta) {
             Ok(()) => self.unsynced_metadata = true,
@@ -569,6 +630,17 @@ fn start(engine: &SharedNode, work: Work) {
             match peers.exchange(node, &request).await {
                 Ok(exchanged) => peers.idle(exchanged.body),
                 Err(error) => eprintln!("passing a write to node {}: {error}", node.0),
+            }
+        });
+    }
+    for (node, request) in work.notices {
+        let peers = engine.borrow().peers.clone();
+        tokio::task::spawn_local(async move {
+            let told = tokio::time::timeout(PASS_WAIT, peers.exchange(node, &request)).await;
+            match told {
+                Ok(Ok(exchanged)) => peers.idle(exchanged.body),
+                Ok(Err(error)) => eprintln!("telling node {} of a lease: {error}", node.0),
+                Err(_) => eprintln!("telling node {} of a lease: timed out", node.0),
             }
         });
     }
@@ -675,7 +747,7 @@ async fn fetch_from_peer(engine: SharedNode, origin: OriginRequestId, peer: Node
     let exchanged = peers.exchange(peer, &NodeRequest::Read(read)).await;
     let answer = match exchanged {
         Ok(Exchanged {
-            answer: NodeAnswer::Metadata(meta),
+            answer: NodeAnswer::Metadata(meta, _),
             body,
             ..
         }) => {
@@ -961,6 +1033,28 @@ async fn connection(stream: TcpStream, engine: &SharedNode, secret: &str) -> io:
         connection.read_body(len).await?;
         let reply = match request {
             NodeRequest::Forward(_) => unreachable!("forwarded above"),
+            NodeRequest::Lease {
+                placement,
+                owner,
+                left,
+            } => {
+                NodeEngine::lease(engine, placement, owner, left);
+                Reply {
+                    answer: NodeAnswer::Written,
+                    body: Vec::new(),
+                    len: 0,
+                    sending: None,
+                }
+            }
+            NodeRequest::LeaseReport { placement, reads } => {
+                NodeEngine::lease_report(engine, placement, reads);
+                Reply {
+                    answer: NodeAnswer::Written,
+                    body: Vec::new(),
+                    len: 0,
+                    sending: None,
+                }
+            }
             NodeRequest::Event { key, etag } => {
                 NodeEngine::event_notice(engine, &key, etag.as_ref());
                 Reply {

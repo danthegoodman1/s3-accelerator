@@ -25,10 +25,10 @@ use s3_accelerator_core::gateway::{self, ClientRequestId, Gateway, NodeRequestId
 use s3_accelerator_core::layout::Layout;
 use s3_accelerator_core::membership::{self, Membership, MembershipTimer, Peer};
 use s3_accelerator_core::node::{
-    self, BucketPolicy, EventId, Freshness, GatewayRequestId, Node, ObjectMeta, OriginRequestId,
-    Read, Segment, StoredBlock,
+    self, BucketPolicy, EventId, Freshness, GatewayRequestId, HotHint, Node, ObjectMeta,
+    OriginRequestId, Read, Segment, StoredBlock,
 };
-use s3_accelerator_core::placement::{Member, NodeId, Placement, Ring};
+use s3_accelerator_core::placement::{Member, NodeId, Placement, PlacementHash, Ring};
 use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
 use s3_accelerator_core::store::{Location, StoreConfig, VersionId};
 use std::collections::{BTreeMap, BTreeSet};
@@ -144,6 +144,15 @@ pub struct Options {
     pub event_delay_max: u64,
     pub event_repeat_percent: u64,
     pub visibility_timeout: u64,
+    /// A placement its owner reads `hot_threshold` times within
+    /// `hot_window` ticks is leased to `hot_replicas` more nodes for
+    /// `lease` ticks; 0 turns leases off. `hot_percent` of reads go to the
+    /// first key.
+    pub hot_threshold: u64,
+    pub hot_window: u64,
+    pub hot_replicas: usize,
+    pub lease: u64,
+    pub hot_percent: u64,
     /// One-way network delay, in ticks.
     pub delay_min: u64,
     pub delay_max: u64,
@@ -236,6 +245,11 @@ impl Options {
             event_delay_max: 0,
             event_repeat_percent: 0,
             visibility_timeout: 0,
+            hot_threshold: 0,
+            hot_window: 0,
+            hot_replicas: 0,
+            lease: 0,
+            hot_percent: 0,
         };
         // Timeouts outlast every exchange of a fault-free run, so only
         // faults make them fire: S3 answers within two hops, and a node
@@ -289,6 +303,17 @@ impl Options {
         if options.events {
             options.ttl = prng.range(2_000..=20_000);
         }
+        options.hot_threshold = match prng.percent(30) {
+            true => 0,
+            false => prng.range(3..=30),
+        };
+        options.hot_window = prng.range(50..=500);
+        options.hot_replicas = prng.range(1..=3) as usize;
+        options.lease = prng.range(100..=2_000);
+        options.hot_percent = match prng.percent(50) {
+            true => 0,
+            false => prng.range(10..=60),
+        };
         options
     }
 
@@ -352,6 +377,11 @@ impl Options {
             event_delay_max: 0,
             event_repeat_percent: 0,
             visibility_timeout: 1_000,
+            hot_threshold: 0,
+            hot_window: 100,
+            hot_replicas: 2,
+            lease: 1_000,
+            hot_percent: 0,
         }
     }
 
@@ -389,6 +419,10 @@ impl Options {
             origin_timeout: self.origin_timeout,
             fallback_window: self.fallback_window,
             peer_timeout: self.peer_timeout,
+            hot_threshold: self.hot_threshold,
+            hot_window: self.hot_window,
+            hot_replicas: self.hot_replicas,
+            lease: self.lease,
             default_policy: ttl,
             buckets: BTreeMap::from([
                 (IMMUTABLE_BUCKET.to_string(), immutable),
@@ -453,12 +487,25 @@ enum Message {
         head: ResponseHead,
         body: Body,
         meta: Option<ObjectMeta>,
+        hot: Vec<HotHint>,
         ring: (usize, u64),
     },
     NodeMetadata {
         id: NodeRequestId,
         meta: ObjectMeta,
+        hot: Vec<HotHint>,
         ring: (usize, u64),
+    },
+    /// An owner leases a hot placement to a node, and the node reports the
+    /// reads the lease served.
+    Lease {
+        owner: usize,
+        placement: PlacementHash,
+        until: u64,
+    },
+    LeaseReport {
+        placement: PlacementHash,
+        reads: u64,
     },
     NodeStale {
         id: NodeRequestId,
@@ -643,8 +690,9 @@ enum NodeAnswer {
         head: ResponseHead,
         body: Body,
         meta: Option<ObjectMeta>,
+        hot: Vec<HotHint>,
     },
-    Metadata(ObjectMeta),
+    Metadata(ObjectMeta, Vec<HotHint>),
     Stale,
 }
 
@@ -737,6 +785,7 @@ struct Sending {
     head: ResponseHead,
     body: Vec<Segment>,
     meta: Option<ObjectMeta>,
+    hot: Vec<HotHint>,
 }
 
 pub struct Simulator {
@@ -760,6 +809,7 @@ pub struct Simulator {
     gateway_writes: Prng,
     write_errors: Prng,
     events: Prng,
+    hot_reads: Prng,
     /// S3's event queue, and for each key, when S3 applied each change a
     /// node finished the event of, when, and under what ring.
     notifications: BTreeMap<u64, Notification>,
@@ -925,6 +975,7 @@ impl Simulator {
             gateway_writes: Prng::stream(seed, "gateway writes"),
             write_errors: Prng::stream(seed, "write errors"),
             events: Prng::stream(seed, "events"),
+            hot_reads: Prng::stream(seed, "hot reads"),
             notifications: BTreeMap::new(),
             next_notification: 0,
             events_to: None,
@@ -1631,6 +1682,8 @@ impl Simulator {
             summary.peer_timeouts += stats.peer_timeouts;
             summary.peer_metadata += stats.peer_metadata;
             summary.peer_bytes += stats.peer_bytes;
+            summary.leases += stats.leases_granted;
+            summary.leased_reads += stats.leased_reads;
             summary.node_reads.push(stats.reads);
         }
         summary
@@ -1750,7 +1803,12 @@ impl Simulator {
             .map(|&(_, id)| id)
             .collect();
         for id in sending {
-            let Sending { head, body, meta } = self
+            let Sending {
+                head,
+                body,
+                meta,
+                hot,
+            } = self
                 .sending
                 .remove(&(node, id))
                 .expect("a send in progress");
@@ -1763,7 +1821,12 @@ impl Simulator {
                 body.bytes
                     .truncate(self.cuts.below(body.len.max(1)) as usize);
             }
-            let answer = NodeAnswer::Response { head, body, meta };
+            let answer = NodeAnswer::Response {
+                head,
+                body,
+                meta,
+                hot,
+            };
             self.answer_request(node, requester, answer);
         }
         let writes: Vec<Location> = self
@@ -2113,7 +2176,10 @@ impl Simulator {
     /// A read of a random key, with ranges and preconditions that S3 may
     /// satisfy or reject.
     fn random_request(&mut self) -> Request {
-        let key = self.keys[self.workload.index(self.keys.len())].clone();
+        let key = match self.hot_reads.percent(self.options.hot_percent) {
+            true => self.keys[0].clone(),
+            false => self.keys[self.workload.index(self.keys.len())].clone(),
+        };
         let span = self.options.object_size_max + 1;
         let range = match self.workload.below(6) {
             0 => {
@@ -2249,10 +2315,12 @@ impl Simulator {
                     head,
                     body,
                     meta,
+                    hot,
                     ring: (node, version),
                 },
             ) => {
                 self.gateway_bodies.insert((gateway, id), body);
+                self.gateways[gateway].on_hot(now, hot);
                 self.gateways[gateway].on_node_response(now, id, head, meta);
                 self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version);
                 self.drain_gateway(gateway)
@@ -2262,9 +2330,11 @@ impl Simulator {
                 Message::NodeMetadata {
                     id,
                     meta,
+                    hot,
                     ring: (node, version),
                 },
             ) => {
+                self.gateways[gateway].on_hot(now, hot);
                 self.gateways[gateway].on_node_metadata(now, id, meta);
                 self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version);
                 self.drain_gateway(gateway)
@@ -2314,6 +2384,22 @@ impl Simulator {
                 }
                 self.pass_change(gateway, change);
                 Ok(())
+            }
+            (
+                Address::Node(node),
+                Message::Lease {
+                    owner,
+                    placement,
+                    until,
+                },
+            ) => {
+                self.node(node)
+                    .on_lease(now, placement, NodeId(owner as u64), Time(until));
+                self.drain_node(node)
+            }
+            (Address::Node(node), Message::LeaseReport { placement, reads }) => {
+                self.node(node).on_lease_report(now, placement, reads);
+                self.drain_node(node)
             }
             (Address::Node(node), Message::QueueEvent { message, key, etag }) => {
                 self.node(node).on_event(now, EventId(message), key, etag);
@@ -2835,6 +2921,7 @@ impl Simulator {
                     head,
                     body,
                     meta,
+                    hot,
                 } => {
                     if self.trace {
                         let etag = meta.as_ref().map(|meta| &meta.etag);
@@ -2849,8 +2936,13 @@ impl Simulator {
                         }
                     }
                     let delay = self.send_delays.range(0..=self.options.send_delay_max);
-                    self.sending
-                        .insert((node, request), Sending { head, body, meta });
+                    let sending = Sending {
+                        head,
+                        body,
+                        meta,
+                        hot,
+                    };
+                    self.sending.insert((node, request), sending);
                     let sent = Event::Sent {
                         node,
                         run,
@@ -2858,11 +2950,31 @@ impl Simulator {
                     };
                     self.queue.push(self.now + delay, sent);
                 }
-                node::Action::Metadata { request, meta } => {
+                node::Action::Metadata { request, meta, hot } => {
                     let Some(requester) = self.node_requests.remove(&(node, request)) else {
                         return Err(self.failure(format!("node {node} answered {request:?} twice")));
                     };
-                    self.answer_request(node, requester, NodeAnswer::Metadata(meta));
+                    self.answer_request(node, requester, NodeAnswer::Metadata(meta, hot));
+                }
+                node::Action::GrantLease {
+                    node: to,
+                    placement,
+                    until,
+                } => {
+                    let message = Message::Lease {
+                        owner: node,
+                        placement,
+                        until: until.0,
+                    };
+                    self.send(Address::Node(node), Address::Node(to.0 as usize), message);
+                }
+                node::Action::ReportLease {
+                    node: to,
+                    placement,
+                    reads,
+                } => {
+                    let message = Message::LeaseReport { placement, reads };
+                    self.send(Address::Node(node), Address::Node(to.0 as usize), message);
                 }
                 node::Action::Stale { request } => {
                     let Some(requester) = self.node_requests.remove(&(node, request)) else {
@@ -3016,7 +3128,12 @@ impl Simulator {
     /// it is sent, and forwards it. While faults happen, the connection may
     /// drop partway.
     fn sent(&mut self, node: usize, id: GatewayRequestId) -> Result<(), Failure> {
-        let Sending { head, body, meta } = self
+        let Sending {
+            head,
+            body,
+            meta,
+            hot,
+        } = self
             .sending
             .remove(&(node, id))
             .expect("a send was scheduled");
@@ -3032,7 +3149,13 @@ impl Simulator {
         let Some(requester) = self.node_requests.remove(&(node, id)) else {
             return Err(self.failure(format!("node {node} answered {id:?} twice")));
         };
-        self.answer_request(node, requester, NodeAnswer::Response { head, body, meta });
+        let answer = NodeAnswer::Response {
+            head,
+            body,
+            meta,
+            hot,
+        };
+        self.answer_request(node, requester, answer);
         self.node(node).on_sent(id);
         self.drain_node(node)
     }
@@ -3045,14 +3168,25 @@ impl Simulator {
             Requester::Gateway(gateway, id) => {
                 let ring = (node, self.node(node).ring().version());
                 let message = match answer {
-                    NodeAnswer::Response { head, body, meta } => Message::NodeResponse {
+                    NodeAnswer::Response {
+                        head,
+                        body,
+                        meta,
+                        hot,
+                    } => Message::NodeResponse {
                         id,
                         head,
                         body,
                         meta,
+                        hot,
                         ring,
                     },
-                    NodeAnswer::Metadata(meta) => Message::NodeMetadata { id, meta, ring },
+                    NodeAnswer::Metadata(meta, hot) => Message::NodeMetadata {
+                        id,
+                        meta,
+                        hot,
+                        ring,
+                    },
                     NodeAnswer::Stale => Message::NodeStale { id, ring },
                 };
                 self.send(from, Address::Gateway(gateway), message);
@@ -3069,7 +3203,7 @@ impl Simulator {
                         head,
                         body,
                     },
-                    NodeAnswer::Metadata(meta) => Message::PeerMetadata { run, origin, meta },
+                    NodeAnswer::Metadata(meta, _) => Message::PeerMetadata { run, origin, meta },
                     NodeAnswer::Stale => Message::PeerResponse {
                         run,
                         origin,
@@ -3399,6 +3533,9 @@ pub struct Summary {
     pub detoured_writes: u64,
     /// Messages from S3's event queue that nodes finished.
     pub events: u64,
+    /// Leases owners granted, and reads replicas served under them.
+    pub leases: u64,
+    pub leased_reads: u64,
     /// Requests a node sent back because their object changed.
     pub retries: u64,
     pub origin_requests: u64,
@@ -3455,7 +3592,8 @@ impl fmt::Display for Summary {
             .collect();
         write!(
             f,
-            "seed {} passed: {} ticks, {} writes ({} through gateways, {} around homes), {} events, {} retries, responses {}, \
+            "seed {} passed: {} ticks, {} writes ({} through gateways, {} around homes), {} events, \
+             {} leases serving {} reads, {} retries, responses {}, \
              {}% of body bytes from disk, {} S3 requests, {} bytes written, \
              {} blocks evicted, node reads {:?}, {} messages lost, {} server errors, \
              {} client retries, {} crashes, {} clean shutdowns, {} blocks verified, \
@@ -3467,6 +3605,8 @@ impl fmt::Display for Summary {
             self.gateway_writes,
             self.detoured_writes,
             self.events,
+            self.leases,
+            self.leased_reads,
             self.retries,
             statuses.join(" "),
             self.hit_percent(),

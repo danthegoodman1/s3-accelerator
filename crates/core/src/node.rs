@@ -31,6 +31,15 @@ pub struct GatewayRequestId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OriginRequestId(pub u64);
 
+/// A hot placement's owner and replicas, which gateways spread its reads
+/// across until `until`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HotHint {
+    pub placement: PlacementHash,
+    pub nodes: Vec<NodeId>,
+    pub until: Time,
+}
+
 /// A message from S3's event queue, numbered by the node's owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventId(pub u64);
@@ -116,6 +125,15 @@ pub struct Config {
     /// Milliseconds a previous owner has to answer before the node goes to
     /// S3 instead, and stops asking it until the next ring change.
     pub peer_timeout: u64,
+    /// A placement its owner reads `hot_threshold` times within
+    /// `hot_window` milliseconds is hot: the owner leases it to its next
+    /// `hot_replicas` rendezvous candidates for `lease` milliseconds, and
+    /// gateways spread its reads across them. A threshold of 0 leases
+    /// nothing.
+    pub hot_threshold: u64,
+    pub hot_window: u64,
+    pub hot_replicas: usize,
+    pub lease: u64,
     pub default_policy: BucketPolicy,
     pub buckets: BTreeMap<String, BucketPolicy>,
 }
@@ -179,17 +197,20 @@ pub enum Action {
     },
     /// Answer the gateway with `head`, then `body`. Call `on_sent` once the
     /// body is sent. A home that knows the object's metadata includes it.
+    /// Hints name the hot placements the request read.
     Respond {
         request: GatewayRequestId,
         head: ResponseHead,
         body: Vec<Segment>,
         meta: Option<ObjectMeta>,
+        hot: Vec<HotHint>,
     },
     /// The request reaches past the blocks the home holds: answer the
     /// gateway with the metadata, and it reads the blocks from their owners.
     Metadata {
         request: GatewayRequestId,
         meta: ObjectMeta,
+        hot: Vec<HotHint>,
     },
     /// The object changed while the node served the request; the gateway
     /// retries it.
@@ -247,6 +268,19 @@ pub enum Action {
     /// Every home of the event's key has it: delete its message from the
     /// queue.
     EventDone { event: EventId },
+    /// Lease `placement` to `node` until `until`, with `on_lease`.
+    GrantLease {
+        node: NodeId,
+        placement: PlacementHash,
+        until: Time,
+    },
+    /// Tell the owner of a leased placement how many reads the lease
+    /// served, with `on_lease_report`.
+    ReportLease {
+        node: NodeId,
+        placement: PlacementHash,
+        reads: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -271,6 +305,9 @@ pub struct Stats {
     pub peer_timeouts: u64,
     pub peer_metadata: u64,
     pub peer_bytes: u64,
+    /// Reads served under a lease, and leases granted.
+    pub leased_reads: u64,
+    pub leases_granted: u64,
 }
 
 impl std::ops::AddAssign for Stats {
@@ -287,6 +324,8 @@ impl std::ops::AddAssign for Stats {
         self.peer_timeouts += other.peer_timeouts;
         self.peer_metadata += other.peer_metadata;
         self.peer_bytes += other.peer_bytes;
+        self.leased_reads += other.leased_reads;
+        self.leases_granted += other.leases_granted;
     }
 }
 
@@ -315,6 +354,14 @@ pub struct Node {
     /// Events passed to other homes: the homes yet to hear, and when the
     /// node stops waiting, leaving the queue to offer the event again.
     events: BTreeMap<EventId, (BTreeSet<NodeId>, Time)>,
+    /// Reads of each placement this node owns in its current hot window:
+    /// when the window began, and how many.
+    read_counts: BTreeMap<PlacementHash, (Time, u64)>,
+    /// Hot placements this node owns and leases out, and leases it holds.
+    hot: BTreeMap<PlacementHash, Hot>,
+    leases: BTreeMap<PlacementHash, Lease>,
+    /// Hints for reads in progress, which their answers carry.
+    hints: BTreeMap<GatewayRequestId, Vec<HotHint>>,
     config: Config,
     objects: BTreeMap<ObjectKey, Object>,
     /// Known objects by when they were last used, oldest first.
@@ -366,6 +413,27 @@ enum Object {
         /// Its place in `recency`.
         used: u64,
     },
+}
+
+/// A hot placement this node owns: the replicas it leased it to, when their
+/// leases run out, when it granted them, the reads since, its own and those
+/// replicas reported, and whether it let the leases end.
+struct Hot {
+    replicas: Vec<NodeId>,
+    until: Time,
+    granted: Time,
+    reads: u64,
+    ending: bool,
+}
+
+/// A lease this node holds: the placement's owner, when the lease runs
+/// out, the reads it served since its last report, and whether it
+/// reported this term.
+struct Lease {
+    owner: NodeId,
+    until: Time,
+    reads: u64,
+    reported: bool,
 }
 
 /// An object's metadata, as a home keeps it and saves it.
@@ -483,6 +551,10 @@ impl Node {
             unreachable: BTreeSet::new(),
             written: BTreeMap::new(),
             events: BTreeMap::new(),
+            read_counts: BTreeMap::new(),
+            hot: BTreeMap::new(),
+            leases: BTreeMap::new(),
+            hints: BTreeMap::new(),
             store: Store::new(config.store),
             doorkeeper: Doorkeeper::new(config.doorkeeper_window),
             config,
@@ -662,6 +734,7 @@ impl Node {
     pub fn on_request(&mut self, now: Time, id: GatewayRequestId, read: Read) {
         self.now = self.now.max(now);
         self.stats.reads += 1;
+        self.note_reads(now, id, &read);
         match read {
             // Only the home keeps an object's metadata, since writes reach
             // only the home; a failover candidate reads S3 directly.
@@ -754,7 +827,12 @@ impl Node {
                 meta, validated, ..
             }) => {
                 let meta = shared(meta, *validated, self.now);
-                self.actions.push(Action::Metadata { request: id, meta });
+                let hot = self.hints.remove(&id).unwrap_or_default();
+                self.actions.push(Action::Metadata {
+                    request: id,
+                    meta,
+                    hot,
+                });
             }
             _ => self.respond(
                 id,
@@ -983,6 +1061,180 @@ impl Node {
         }
     }
 
+    /// `owner` leased `placement` to this node until `until`: the node
+    /// admits its blocks, fills them from the owner first, and reports its
+    /// reads before the lease runs out.
+    pub fn on_lease(&mut self, now: Time, placement: PlacementHash, owner: NodeId, until: Time) {
+        self.now = self.now.max(now);
+        let lease = self.leases.entry(placement).or_insert(Lease {
+            owner,
+            until,
+            reads: 0,
+            reported: false,
+        });
+        if until > lease.until {
+            (lease.owner, lease.until, lease.reported) = (owner, until, false);
+        }
+    }
+
+    /// A replica served `reads` reads of `placement` under its lease.
+    pub fn on_lease_report(&mut self, now: Time, placement: PlacementHash, reads: u64) {
+        self.now = self.now.max(now);
+        if let Some(hot) = self.hot.get_mut(&placement) {
+            hot.reads += reads;
+        }
+    }
+
+    /// Counts a gateway's read of each placement it touches: a replica's
+    /// under its lease, an owner's toward making the placement hot. The
+    /// answer carries hints for the hot ones.
+    fn note_reads(&mut self, now: Time, id: GatewayRequestId, read: &Read) {
+        let placements: BTreeSet<PlacementHash> = match read {
+            Read::Object { request, .. } => BTreeSet::from([Placement::Home(&request.key).hash()]),
+            Read::Range(range) if range.first <= range.last && range.last < range.size => {
+                let layout = self.config.layout;
+                layout
+                    .blocks_covering(range.first, range.last)
+                    .map(|index| layout.placement(&range.key, range.size, index).hash())
+                    .collect()
+            }
+            _ => BTreeSet::new(),
+        };
+        let mut hints = Vec::new();
+        for placement in placements {
+            if let Some(lease) = self.leases.get_mut(&placement)
+                && lease.until > now
+            {
+                lease.reads += 1;
+                self.stats.leased_reads += 1;
+                continue;
+            }
+            if self.ring.owner(placement) != Some(self.id) {
+                continue;
+            }
+            if let Some(hot) = self.hot.get_mut(&placement) {
+                hot.reads += 1;
+            } else if self.config.hot_threshold > 0 {
+                let window = self.config.hot_window;
+                let (start, count) = self.read_counts.entry(placement).or_insert((now, 0));
+                if start.0 + window <= now.0 {
+                    (*start, *count) = (now, 0);
+                }
+                *count += 1;
+                if *count >= self.config.hot_threshold {
+                    self.read_counts.remove(&placement);
+                    self.lease_out(now, placement);
+                }
+            }
+            if let Some(hot) = self.hot.get(&placement) {
+                let nodes = std::iter::once(self.id)
+                    .chain(hot.replicas.iter().copied())
+                    .collect();
+                hints.push(HotHint {
+                    placement,
+                    nodes,
+                    until: hot.until,
+                });
+            }
+        }
+        if !hints.is_empty() {
+            self.hints.insert(id, hints);
+        }
+    }
+
+    /// Leases a placement this node owns to its next rendezvous
+    /// candidates, anew.
+    fn lease_out(&mut self, now: Time, placement: PlacementHash) {
+        let replicas: Vec<NodeId> = self
+            .ring
+            .candidates(placement)
+            .into_iter()
+            .filter(|node| *node != self.id)
+            .take(self.config.hot_replicas)
+            .collect();
+        if replicas.is_empty() {
+            self.hot.remove(&placement);
+            return;
+        }
+        let until = Time(now.0 + self.config.lease);
+        for &node in &replicas {
+            self.stats.leases_granted += 1;
+            self.actions.push(Action::GrantLease {
+                node,
+                placement,
+                until,
+            });
+        }
+        let hot = Hot {
+            replicas,
+            until,
+            granted: now,
+            reads: 0,
+            ending: false,
+        };
+        self.hot.insert(placement, hot);
+    }
+
+    /// Whether this node holds a lease on `placement` now.
+    fn leased(&self, placement: PlacementHash) -> bool {
+        self.leases
+            .get(&placement)
+            .is_some_and(|lease| lease.until > self.now)
+    }
+
+    /// The owner that leased `placement` to this node, while the lease
+    /// lasts and the owner answers.
+    fn lease_owner(&self, placement: PlacementHash) -> Option<NodeId> {
+        let lease = self.leases.get(&placement)?;
+        let usable = lease.until > self.now
+            && lease.owner != self.id
+            && !self.unreachable.contains(&lease.owner);
+        usable.then_some(lease.owner)
+    }
+
+    /// Owners renew leases on placements that stay busy, three quarters
+    /// through the lease, and let the rest run out; replicas report their
+    /// reads halfway through, in time for the owner's decision.
+    fn tick_leases(&mut self, now: Time) {
+        let window = self.config.hot_window;
+        self.read_counts
+            .retain(|_, (start, _)| start.0 + window > now.0);
+        let (half, quarter) = (self.config.lease / 2, self.config.lease / 4);
+        let due: Vec<PlacementHash> = self
+            .hot
+            .iter()
+            .filter(|(_, hot)| !hot.ending && now.0 + quarter >= hot.until.0)
+            .map(|(&placement, _)| placement)
+            .collect();
+        for placement in due {
+            let hot = &self.hot[&placement];
+            let period = now.0.saturating_sub(hot.granted.0).max(1);
+            // At least half the promotion rate, counted over the lease.
+            let busy = hot.reads * window * 2 >= self.config.hot_threshold * period;
+            if busy && self.ring.owner(placement) == Some(self.id) {
+                self.lease_out(now, placement);
+            } else if let Some(hot) = self.hot.get_mut(&placement) {
+                hot.ending = true;
+            }
+        }
+        self.hot.retain(|_, hot| hot.until > now);
+        for (&placement, lease) in &mut self.leases {
+            if !lease.reported && now.0 + half >= lease.until.0 {
+                self.actions.push(Action::ReportLease {
+                    node: lease.owner,
+                    placement,
+                    reads: lease.reads,
+                });
+                (lease.reads, lease.reported) = (0, true);
+            }
+        }
+        self.leases.retain(|_, lease| lease.until > now);
+    }
+
+    pub fn id(&self) -> NodeId {
+        self.id
+    }
+
     /// The ring the node places blocks by.
     pub fn ring(&self) -> &Ring {
         &self.ring
@@ -1049,6 +1301,7 @@ impl Node {
     pub fn on_tick(&mut self, now: Time) {
         self.now = self.now.max(now);
         self.events.retain(|_, (_, until)| *until > now);
+        self.tick_leases(now);
         if self
             .previous
             .as_ref()
@@ -1641,9 +1894,11 @@ impl Node {
             .any(|(placement, _, _)| self.ring.owner(placement.hash()) != Some(self.id));
         if beyond_home {
             self.waiting.remove(&id);
+            let hot = self.hints.remove(&id).unwrap_or_default();
             self.actions.push(Action::Metadata {
                 request: id,
                 meta: shared,
+                hot,
             });
             return;
         }
@@ -1829,7 +2084,7 @@ impl Node {
         let placement = layout.placement(key, size, *run.start()).hash();
         let peer = match self.ring.owner(placement) == Some(self.id) {
             true => self.previous_owner(placement),
-            false => None,
+            false => self.lease_owner(placement),
         };
         let origin = match peer {
             Some(peer) => {
@@ -2102,6 +2357,7 @@ impl Node {
         if let Some(plan) = waiting.plan {
             self.release(plan.holds);
         }
+        self.hints.remove(&id);
         self.actions.push(Action::Stale { request: id });
     }
 
@@ -2167,11 +2423,13 @@ impl Node {
             }
         }
         self.sending.insert(id, holds);
+        let hot = self.hints.remove(&id).unwrap_or_default();
         self.actions.push(Action::Respond {
             request: id,
             head,
             body,
             meta,
+            hot,
         });
     }
 
@@ -2237,7 +2495,7 @@ impl Node {
     ) -> Option<Location> {
         let layout = self.config.layout;
         let placement = layout.placement(key, size, block.index).hash();
-        if self.ring.owner(placement) != Some(self.id) {
+        if self.ring.owner(placement) != Some(self.id) && !self.leased(placement) {
             return None;
         }
         let hash = block_hash(block.version, layout.block_size(), block.index);
@@ -2466,6 +2724,10 @@ mod tests {
             origin_timeout: 1_000,
             fallback_window: 1_000,
             peer_timeout: 100,
+            hot_threshold: 0,
+            hot_window: 1_000,
+            hot_replicas: 2,
+            lease: 10_000,
             default_policy: policy,
             buckets: BTreeMap::new(),
         }

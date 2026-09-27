@@ -128,10 +128,10 @@ The core decides what a node admits and evicts and which slot each block fills. 
 
 ### Hot keys
 
-1. The owner tracks each key's request rate. Above a threshold, it grants time-limited leases to the key's next K rendezvous candidates.
-2. Replicas fill from the owner.
-3. Responses carry a hot hint with K and an expiry. Gateways cache the hint and spread reads across the owner and its replicas.
-4. Replicas report their read counts to the owner when leases renew. The owner renews while the combined rate stays above half the promotion threshold.
+1. The owner of a placement counts its reads over a short window. Above a threshold, it grants time-limited leases to the placement's next K rendezvous candidates.
+2. Replicas fill from the owner before S3, and admit the placement's blocks while leased, without the doorkeeper.
+3. Answers carry a hot hint naming the owner, the replicas and the leases' end. Gateways spread a hot placement's range reads across them in turn; reads that need the home's metadata stay on the home.
+4. Replicas report their read counts to the owner halfway through a lease. Three quarters through, the owner renews while the combined rate stays above half the promotion threshold.
 5. Leases expire on their own, and losing one costs only hit rate.
 
 ### Auth
