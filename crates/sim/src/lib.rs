@@ -159,6 +159,8 @@ pub struct Options {
     /// Keys are named for formats that state their metadata's span, in
     /// turn: none, Parquet, ORC and safetensors.
     pub formats: bool,
+    /// Share of deletes from elsewhere that the key's home then purges.
+    pub purge_percent: u64,
     /// One-way network delay, in ticks.
     pub delay_min: u64,
     pub delay_max: u64,
@@ -259,6 +261,7 @@ impl Options {
             immutable_warm_on_write: false,
             ttl_warm_on_write: false,
             formats: false,
+            purge_percent: 0,
         };
         // Timeouts outlast every exchange of a fault-free run, so only
         // faults make them fire: S3 answers within two hops, and a node
@@ -326,6 +329,10 @@ impl Options {
         options.immutable_warm_on_write = prng.percent(50);
         options.ttl_warm_on_write = prng.percent(50);
         options.formats = prng.percent(50);
+        options.purge_percent = match prng.percent(50) {
+            true => 0,
+            false => prng.range(10..=100),
+        };
         options
     }
 
@@ -397,6 +404,7 @@ impl Options {
             immutable_warm_on_write: false,
             ttl_warm_on_write: false,
             formats: false,
+            purge_percent: 0,
         }
     }
 
@@ -586,6 +594,18 @@ enum Message {
     EventHeard {
         run: u64,
         event: EventId,
+        from: usize,
+    },
+    /// A purge a coordinator passes to a node, and the node's confirmation
+    /// once the purge is durable.
+    PurgeNotice {
+        from: usize,
+        run: u64,
+        key: ObjectKey,
+    },
+    PurgeConfirmed {
+        run: u64,
+        key: ObjectKey,
         from: usize,
     },
     /// A node deletes a message it finished, under its ring `ring`.
@@ -844,6 +864,7 @@ pub struct Simulator {
     write_errors: Prng,
     events: Prng,
     hot_reads: Prng,
+    purges: Prng,
     /// S3's event queue, and for each key, when S3 applied each change a
     /// node finished the event of, when, and under what ring.
     notifications: BTreeMap<u64, Notification>,
@@ -1019,6 +1040,7 @@ impl Simulator {
             write_errors: Prng::stream(seed, "write errors"),
             events: Prng::stream(seed, "events"),
             hot_reads: Prng::stream(seed, "hot reads"),
+            purges: Prng::stream(seed, "purges"),
             notifications: BTreeMap::new(),
             next_notification: 0,
             events_to: None,
@@ -1186,6 +1208,52 @@ impl Simulator {
             self.tick()?;
         }
         self.settle()
+    }
+
+    /// Purges `key` through its home under gateway 0's ring, if the home is
+    /// up, and runs until the cluster is idle.
+    pub fn purge(&mut self, key: &ObjectKey) -> Result<(), Failure> {
+        let home = self.gateways[0]
+            .ring()
+            .owner(Placement::Home(key).hash())
+            .expect("a node")
+            .0 as usize;
+        self.purge_at(home, key)?;
+        self.settle()
+    }
+
+    /// Has `node` coordinate a purge of `key`, and syncs its disk.
+    fn purge_at(&mut self, node: usize, key: &ObjectKey) -> Result<(), Failure> {
+        let now = Time(self.now);
+        let Some(up) = self.nodes[node].as_mut() else {
+            return Ok(());
+        };
+        up.on_purge(now, key, false);
+        self.drain_node(node)?;
+        let unsynced = self.disks[node].unsynced();
+        self.disks[node].keep_appended(unsynced);
+        Ok(())
+    }
+
+    /// Blocks of any version of `key` that `node`'s slot table records.
+    pub fn recorded_blocks_of(&self, node: usize, key: &ObjectKey) -> usize {
+        let versions = VersionId::all_of(VersionId::key_hash(key));
+        self.disks[node]
+            .records
+            .values()
+            .filter(|(record, _, _)| versions.contains(&record.version))
+            .count()
+    }
+
+    /// The purges `node` coordinates, and the nodes each waits on.
+    pub fn pending_purges(&self, node: usize) -> Vec<(ObjectKey, Vec<usize>)> {
+        let Some(up) = self.nodes[node].as_ref() else {
+            return Vec::new();
+        };
+        up.pending_purges()
+            .into_iter()
+            .map(|(key, nodes)| (key, nodes.into_iter().map(|node| node.0 as usize).collect()))
+            .collect()
     }
 
     /// Makes S3 write `size` bytes to `key` just before it answers the next
@@ -1530,6 +1598,7 @@ impl Simulator {
         self.down.remove(&node);
         let records = self.disks[node].start();
         let metadata = self.disks[node].metadata.clone();
+        let purges = self.disks[node].purges.clone();
         let config = self.options.node_config();
         let id = NodeId(node as u64);
         let seed = self.membership_seeds.next_u64();
@@ -1545,7 +1614,7 @@ impl Simulator {
             }
             false => self.ring.clone(),
         };
-        self.nodes[node] = Some(Node::recover(id, ring, config, records, metadata));
+        self.nodes[node] = Some(Node::recover(id, ring, config, records, metadata, purges));
         self.drain_node(node)?;
         self.start_joining(node);
         Ok(())
@@ -1744,7 +1813,7 @@ impl Simulator {
     fn tick(&mut self) -> Result<(), Failure> {
         self.tick_faults()?;
         self.apply_origin_writes();
-        self.tick_writes();
+        self.tick_writes()?;
         self.offer_events();
         self.tick_clients();
         let mut events = 0;
@@ -1995,9 +2064,9 @@ impl Simulator {
                 .count()
     }
 
-    fn tick_writes(&mut self) {
+    fn tick_writes(&mut self) -> Result<(), Failure> {
         if self.keys.is_empty() || !self.writers.percent(self.options.write_percent) {
-            return;
+            return Ok(());
         }
         let key = self.keys[self.writers.index(self.keys.len())].clone();
         let size = self.writers.range(1..=self.options.object_size_max);
@@ -2009,14 +2078,14 @@ impl Simulator {
             // An immutable object is written once.
             let writing = self.changes.values().any(|change| change.key == key);
             if self.origin.current(&key).is_some() || writing {
-                return;
+                return Ok(());
             }
             match through_gateway {
                 true => self.write_through_gateway(key, Some(size)),
                 false => self.origin.put(self.now, &key, size, &mut self.writers),
             }
             self.summary.writes += 1;
-            return;
+            return Ok(());
         }
         let delete = self.writers.percent(self.options.delete_percent);
         match (through_gateway, delete) {
@@ -2033,6 +2102,16 @@ impl Simulator {
             }
         }
         self.summary.writes += 1;
+        // A delete may be followed by a purge through the key's home.
+        if !through_gateway
+            && delete
+            && self.purges.percent(self.options.purge_percent)
+            && let Some(home) = self.current_ring().owner(Placement::Home(&key).hash())
+        {
+            self.summary.purges += 1;
+            self.purge_at(home.0 as usize, &key)?;
+        }
+        Ok(())
     }
 
     /// S3 applies the writes nodes sent it during the last tick. The model
@@ -2376,6 +2455,7 @@ impl Simulator {
                 Message::OriginResponse { run, .. }
                 | Message::OriginWriteResponse { run, .. }
                 | Message::EventHeard { run, .. }
+                | Message::PurgeConfirmed { run, .. }
                 | Message::PeerResponse { run, .. }
                 | Message::PeerMetadata { run, .. } => *run != self.runs[node],
                 _ => false,
@@ -2483,6 +2563,21 @@ impl Simulator {
             }
             (Address::Node(node), Message::LeaseReport { placement, reads }) => {
                 self.node(node).on_lease_report(now, placement, reads);
+                self.drain_node(node)
+            }
+            (Address::Node(to), Message::PurgeNotice { from, run, key }) => {
+                self.node(to).on_purge(now, &key, true);
+                self.drain_node(to)?;
+                // The node syncs before it confirms.
+                let unsynced = self.disks[to].unsynced();
+                self.disks[to].keep_appended(unsynced);
+                let confirmed = Message::PurgeConfirmed { run, key, from: to };
+                self.send(Address::Node(to), Address::Node(from), confirmed);
+                Ok(())
+            }
+            (Address::Node(node), Message::PurgeConfirmed { key, from, .. }) => {
+                self.node(node)
+                    .on_purge_confirmed(now, &key, NodeId(from as u64));
                 self.drain_node(node)
             }
             (Address::Node(node), Message::QueueEvent { message, key, etag }) => {
@@ -3153,6 +3248,18 @@ impl Simulator {
                     self.disks[node].record(location, record);
                 }
                 node::Action::Clear { location } => self.disks[node].clear(location),
+                node::Action::Erase { location, len } => self.disks[node].erase(location, len),
+                node::Action::SavePurge { key, nodes } => {
+                    self.disks[node].purges.push((key, nodes))
+                }
+                node::Action::PassPurge { node: to, key } => {
+                    let message = Message::PurgeNotice {
+                        from: node,
+                        run,
+                        key,
+                    };
+                    self.send(Address::Node(node), Address::Node(to.0 as usize), message);
+                }
                 node::Action::Remember { key, meta } => {
                     let delay = self.disk_delays.range(0..=self.options.disk_delay_max);
                     self.disks[node].append(self.now + delay, key, Some(meta));
@@ -3644,8 +3751,10 @@ pub struct Summary {
     pub writes: u64,
     pub gateway_writes: u64,
     pub detoured_writes: u64,
-    /// Messages from S3's event queue that nodes finished.
+    /// Messages from S3's event queue that nodes finished, and purges
+    /// homes coordinated.
     pub events: u64,
+    pub purges: u64,
     /// Leases owners granted, and reads replicas served under them.
     pub leases: u64,
     pub leased_reads: u64,
@@ -3709,7 +3818,7 @@ impl fmt::Display for Summary {
             .collect();
         write!(
             f,
-            "seed {} passed: {} ticks, {} writes ({} through gateways, {} around homes), {} events, \
+            "seed {} passed: {} ticks, {} writes ({} through gateways, {} around homes), {} events, {} purges, \
              {} leases serving {} reads, {} uploads warmed, {} blocks prefetched, {} retries, \
              responses {}, \
              {}% of body bytes from disk, {} S3 requests, {} bytes written, \
@@ -3723,6 +3832,7 @@ impl fmt::Display for Summary {
             self.gateway_writes,
             self.detoured_writes,
             self.events,
+            self.purges,
             self.leases,
             self.leased_reads,
             self.warmed_uploads,

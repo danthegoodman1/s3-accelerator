@@ -386,8 +386,8 @@ MUTANTS = [
     ),
     (
         "eviction leaves the slot's record",
-        [(NODE, "self.stats.evicted_blocks += 1;\n            self.actions.push(Action::Clear { location });",
-          "self.stats.evicted_blocks += 1;\n            let _ = location;")],
+        [(NODE, "self.purging.remove(&evicted);\n            self.actions.push(Action::Clear { location });",
+          "self.purging.remove(&evicted);\n            let _ = location;")],
     ),
     (
         "a restart after a crash trusts its blocks",
@@ -581,6 +581,15 @@ MUTANTS = [
     (
         "spot reads come back empty",
         [(NODE_ENGINE, "Ok(Ok(bytes)) => bytes,\n                    _ => Vec::new(),", "_ => Vec::new(),")],
+    ),
+    (
+        "a purge an owner missed while down is never told again",
+        [(NODE, "let nodes = nodes.clone();\n            self.pass_purge(&key, &nodes);", "let _ = nodes;")],
+    ),
+    (
+        "a restarted coordinator forgets its purges",
+        [(NODE, "false => node\n                    .purges\n                    .insert(key, (nodes.into_iter().collect(), Time::default())),",
+          "false => {\n                    let _ = (key, nodes);\n                    None\n                }")],
     ),
 ]
 

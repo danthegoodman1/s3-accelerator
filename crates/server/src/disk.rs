@@ -15,8 +15,9 @@
 //! response in flight keeps the bytes it was sent.
 
 use crate::zero_copy::{self, PageCache};
-use rustix::fs::{Advice, fadvise};
+use rustix::fs::{Advice, FallocateFlags, fadvise, fallocate};
 use s3_accelerator_core::node::{Meta, Recovered, SlotRecord};
+use s3_accelerator_core::placement::NodeId;
 use s3_accelerator_core::placement::PlacementHash;
 use s3_accelerator_core::s3::{ETag, ObjectKey};
 use s3_accelerator_core::store::{Location, StoreConfig, VersionId};
@@ -43,6 +44,9 @@ pub struct Disk {
     pages: PageCache,
     table: File,
     metadata: Mutex<File>,
+    /// The purge log: each purge the node coordinates, and the nodes it
+    /// still waits on.
+    purges: Mutex<File>,
     config: StoreConfig,
     run: u64,
     /// The clean mark this run started from.
@@ -59,6 +63,7 @@ pub struct Disk {
 pub struct Recovery {
     pub records: Vec<Recovered>,
     pub metadata: Vec<(ObjectKey, Option<Meta>)>,
+    pub purges: Vec<(ObjectKey, Vec<NodeId>)>,
 }
 
 impl Disk {
@@ -76,6 +81,7 @@ impl Disk {
                 .open(dir.join(name))
         };
         let (slabs, table, mut metadata) = (open("slabs")?, open("slots")?, open("metadata")?);
+        let mut purges = open("purges")?;
         let slots = config.extent_size * u64::from(config.extents) / config.min_slot;
         let table_len = HEADER_SIZE + slots * RECORD_SIZE;
         let header = read_header(&table)?.filter(|header| header.config == config);
@@ -127,11 +133,13 @@ impl Disk {
             })
             .collect();
         let metadata_entries = read_metadata(&mut metadata)?;
+        let purge_entries = read_purges(&mut purges)?;
         let disk = Disk {
             slabs,
             pages,
             table,
             metadata: Mutex::new(metadata),
+            purges: Mutex::new(purges),
             config,
             run,
             started_from: trusted_from,
@@ -141,6 +149,7 @@ impl Disk {
         let recovery = Recovery {
             records,
             metadata: metadata_entries,
+            purges: purge_entries,
         };
         Ok((disk, recovery))
     }
@@ -236,6 +245,39 @@ impl Disk {
 
     pub fn sync_metadata(&self) -> io::Result<()> {
         self.metadata.lock().expect("metadata lock").sync_data()
+    }
+
+    /// Makes the slot table's cleared records durable.
+    pub fn sync_table(&self) -> io::Result<()> {
+        let mut clears = self.clears.lock().expect("clears lock");
+        self.table.sync_data()?;
+        *clears = false;
+        Ok(())
+    }
+
+    /// Records durably that `key`'s purge waits on `nodes`.
+    pub fn save_purge(&self, key: &ObjectKey, nodes: &[NodeId]) -> io::Result<()> {
+        let mut payload = Vec::new();
+        for text in [&key.bucket, &key.key] {
+            payload.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            payload.extend_from_slice(text.as_bytes());
+        }
+        payload.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
+        for node in nodes {
+            payload.extend_from_slice(&node.0.to_le_bytes());
+        }
+        let file = self.purges.lock().expect("purges lock");
+        let end = file.metadata()?.len();
+        file.write_all_at(&framed(&payload), end)?;
+        file.sync_data()
+    }
+
+    /// Frees the storage behind a slot a purge dropped, so its bytes are
+    /// gone from the disk.
+    pub fn erase(&self, location: Location, len: u64) -> io::Result<()> {
+        let flags = FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE;
+        fallocate(&self.slabs, flags, self.offset(location), len)?;
+        Ok(())
     }
 
     /// Syncs everything and marks the table clean: this run's records are
@@ -424,11 +466,54 @@ pub fn encode_entry(key: &ObjectKey, meta: Option<&Meta>) -> Vec<u8> {
             text(&mut payload, value);
         }
     }
+    framed(&payload)
+}
+
+/// A log entry: the payload's length and checksum, then the payload.
+fn framed(payload: &[u8]) -> Vec<u8> {
     let mut entry = Vec::with_capacity(payload.len() + 12);
     entry.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    entry.extend_from_slice(&xxh3_64(&payload).to_le_bytes());
-    entry.extend_from_slice(&payload);
+    entry.extend_from_slice(&xxh3_64(payload).to_le_bytes());
+    entry.extend_from_slice(payload);
     entry
+}
+
+/// The payload of the entry at the start of `bytes`, and the entry's
+/// length, if it is whole.
+fn unframed(bytes: &[u8]) -> Option<(&[u8], usize)> {
+    let len = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?) as usize;
+    let check = u64::from_le_bytes(bytes.get(4..12)?.try_into().ok()?);
+    let payload = bytes.get(12..12 + len)?;
+    (xxh3_64(payload) == check).then_some((payload, 12 + len))
+}
+
+/// The purge log's entries up to the first torn one, which a crash left;
+/// the file is cut there.
+fn read_purges(file: &mut File) -> io::Result<Vec<(ObjectKey, Vec<NodeId>)>> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut entries = Vec::new();
+    let mut at = 0;
+    while let Some((payload, len)) = unframed(&bytes[at..]) {
+        let mut reader = Reader(payload);
+        let entry = (|| {
+            let key = ObjectKey {
+                bucket: reader.text()?,
+                key: reader.text()?,
+            };
+            let nodes = (0..reader.count()?)
+                .map(|_| reader.word().map(NodeId))
+                .collect::<Option<Vec<_>>>()?;
+            Some((key, nodes))
+        })();
+        let Some(entry) = entry else {
+            break;
+        };
+        entries.push(entry);
+        at += len;
+    }
+    file.set_len(at as u64)?;
+    Ok(entries)
 }
 
 /// The metadata file's entries up to the first torn or unreadable one,

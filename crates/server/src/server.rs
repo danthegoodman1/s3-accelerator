@@ -11,7 +11,7 @@ use crate::membership_engine;
 use crate::node_engine::{self, NodeEngine};
 use crate::origin::{self, Origin};
 use crate::passthrough::{self, ToNode};
-use crate::peers::Peers;
+use crate::peers::{Exchanged, Peers};
 use crate::protocol::{self, NodeAnswer, NodeRequest};
 use crate::sigv4::{self, AuthError, Credentials, Signable};
 use crate::sqs::Queue;
@@ -142,6 +142,7 @@ pub async fn run_with(
                 node_config,
                 recovery.records,
                 recovery.metadata,
+                recovery.purges,
             );
             let engine = NodeEngine::new(
                 recovered,
@@ -348,6 +349,16 @@ async fn handle(
     let is_digest = payload_hash.len() == 64 && payload_hash.bytes().all(|b| b.is_ascii_hexdigit());
     let digest = is_digest.then(|| payload_hash.to_ascii_lowercase());
     let (bucket, key) = split_path(&head.path);
+    let purges = head.query.split('&').any(|pair| pair == PURGE);
+    if head.method == "POST" && purges && !bucket.is_empty() && !key.is_empty() {
+        if len > 0 {
+            let response = error(400, "InvalidRequest", "a purge has no body");
+            connection.write_response(&response, false).await?;
+            return Ok(false);
+        }
+        let key = ObjectKey { bucket, key };
+        return purge(connection, head, key, context).await;
+    }
     if len == 0
         && let Some(request) = cacheable(head, &bucket, &key)
     {
@@ -372,6 +383,55 @@ async fn handle(
         key: &key,
     };
     pass(connection, request, context).await
+}
+
+/// The query parameter that makes a `POST` to an object a purge.
+const PURGE: &str = "x-accel-purge";
+
+/// Purges an object from the cache: its home, or the next candidate when
+/// the home does not answer, drops the object's metadata and blocks and
+/// has every other node drop theirs. The client hears once the purge is
+/// durable on the node that coordinates it.
+async fn purge(
+    connection: &mut Connection,
+    head: &RequestHead,
+    key: ObjectKey,
+    context: &Context,
+) -> io::Result<bool> {
+    let peers = GatewayEngine::peers(&context.gateway);
+    for node in GatewayEngine::pass_candidates(&context.gateway, &key) {
+        let request = NodeRequest::Purge {
+            key: key.clone(),
+            passed_on: false,
+        };
+        match peers.exchange(node, &request).await {
+            Ok(Exchanged {
+                answer: NodeAnswer::Written,
+                body,
+                ..
+            }) => {
+                peers.idle(body);
+                GatewayEngine::written_via(&context.gateway, &key, node);
+                let response = Response {
+                    status: 204,
+                    headers: Vec::new(),
+                    content_length: 0,
+                    body: Bytes::new(),
+                };
+                connection
+                    .write_response(&response, head.keep_alive)
+                    .await?;
+                return Ok(true);
+            }
+            Ok(_) => eprintln!("node {} answered a purge out of protocol", node.0),
+            Err(failure) => eprintln!("purging through node {}: {failure}", node.0),
+        }
+    }
+    let response = error(503, "ServiceUnavailable", "no storage node took the purge");
+    connection
+        .write_response(&response, head.keep_alive)
+        .await?;
+    Ok(true)
 }
 
 /// The core's request, if the core serves this one.

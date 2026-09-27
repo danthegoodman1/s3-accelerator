@@ -3,6 +3,7 @@
 //! table and metadata file that survive the node's restarts.
 
 use s3_accelerator_core::node::{Meta, Recovered, SlotRecord};
+use s3_accelerator_core::placement::NodeId;
 use s3_accelerator_core::s3::ObjectKey;
 use s3_accelerator_core::store::Location;
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,6 +27,9 @@ pub struct Disk {
     /// appended since, with the tick each becomes durable.
     pub metadata: Vec<(ObjectKey, Option<Meta>)>,
     unsynced: Vec<(u64, ObjectKey, Option<Meta>)>,
+    /// The purge log: each purge the node coordinates, and the nodes it
+    /// waits on. A node syncs each record before it acts on it.
+    pub purges: Vec<(ObjectKey, Vec<NodeId>)>,
 }
 
 const FILLER: u8 = 0xa5;
@@ -43,6 +47,7 @@ impl Disk {
             damaged: BTreeSet::new(),
             metadata: Vec::new(),
             unsynced: Vec::new(),
+            purges: Vec::new(),
         }
     }
 
@@ -126,6 +131,12 @@ impl Disk {
                 trusted: trusted_from.is_some_and(|from| *run >= from),
             })
             .collect()
+    }
+
+    /// Overwrites `len` bytes of a slot with filler, as a purge does.
+    pub fn erase(&mut self, location: Location, len: u64) {
+        let start = location.offset as usize;
+        self.extents[location.extent as usize][start..start + len as usize].fill(FILLER);
     }
 
     pub fn clear(&mut self, location: Location) {

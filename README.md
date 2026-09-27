@@ -18,6 +18,8 @@ visibility_timeout_s = 30
 
 Nodes poll the queue with `[origin]`'s credentials. Set the bucket's `ttl_ms` long, such as an hour: events keep its metadata fresh, and the TTL covers an event that goes missing.
 
+To remove an object from the cache, as a retention rule may require after it is deleted, send `POST /bucket/key?x-accel-purge` with a credential whose grants cover the key. Every node drops and erases the object's blocks; a node that is down drops them once it is back.
+
 ## Layout
 
 - `crates/core`: gateway and storage-node logic as deterministic state machines that do no I/O.

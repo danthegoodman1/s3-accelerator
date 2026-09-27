@@ -7,6 +7,7 @@ use common::{
     CLUSTER_CACHE, Cluster, LISTING, data_dir, object, object_of, send, start_origin, start_queue,
     try_get,
 };
+use s3_accelerator_core::layout::Layout;
 use s3_accelerator_core::placement::{Member, NodeId, Placement, Ring};
 use s3_accelerator_core::s3::ObjectKey;
 use std::num::NonZeroU32;
@@ -475,6 +476,76 @@ async fn a_parquet_footer_is_prefetched() {
             let read = send(port, "GET", path, "", &[("range", &range)], Vec::new()).await;
             assert!(read == (206, object[first..=last].to_vec()), "{}", read.0);
             assert_eq!(origin.requests.get(), 3);
+        })
+        .await;
+}
+
+/// A purge through the gateway drops an object from the cache. A node that
+/// holds some of the object's chunks is down during the purge; its home
+/// tells it again once it is back. S3's bytes change under the same ETag,
+/// so a read after the purge returns the new bytes only if no node kept
+/// the old ones.
+#[tokio::test(flavor = "current_thread")]
+async fn a_purge_reaches_a_node_that_was_down() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            origin.size.set(3_500_000);
+            let cache = format!("{CLUSTER_CACHE}\npeer_timeout_ms = 100");
+            let cluster = Cluster::with_nodes(&data_dir(), origin_port, &cache, 2, "", &[]);
+            let mut nodes: Vec<_> = Vec::new();
+            for id in 0..2 {
+                nodes.push(Some(cluster.start(id).await));
+            }
+            let _gateway = cluster.start_gateway().await;
+            // A key whose chunks are not all on its home.
+            let members = [0, 1].map(|id| Member {
+                id: NodeId(id),
+                weight: NonZeroU32::MIN,
+            });
+            let ring = Ring::new(0, members.to_vec());
+            let layout = Layout::new(65_536, 16);
+            let (name, home, other) = (0..)
+                .find_map(|index| {
+                    let key = ObjectKey {
+                        bucket: "bucket".into(),
+                        key: format!("big-{index}"),
+                    };
+                    let home = ring.owner(Placement::Home(&key).hash())?;
+                    let other = (0..layout.block_count(3_500_000))
+                        .filter_map(|block| {
+                            ring.owner(layout.placement(&key, 3_500_000, block).hash())
+                        })
+                        .find(|owner| *owner != home)?;
+                    Some((key.key, home, other))
+                })
+                .unwrap();
+            assert_ne!(home, other);
+            for _ in 0..2 {
+                assert_eq!(cluster.get(&name).await, (200, object_of(3_500_000, "")));
+            }
+            let path = format!("/bucket/{name}");
+            let changed = object_of(3_500_000, "changed");
+            origin
+                .written
+                .borrow_mut()
+                .insert(path.clone(), (common::ETAG.to_string(), changed.clone()));
+            nodes[other.0 as usize].take().unwrap().stop();
+            let (status, _) = send(
+                cluster.gateway_port,
+                "POST",
+                &path,
+                "x-accel-purge",
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(status, 204);
+            nodes[other.0 as usize] = Some(cluster.start(other.0 as usize).await);
+            // The home tells the node again every 400 ms.
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            let read = cluster.get(&name).await;
+            assert!(read == (200, changed), "{}", read.0);
         })
         .await;
 }

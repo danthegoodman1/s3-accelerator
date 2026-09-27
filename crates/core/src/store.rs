@@ -116,6 +116,13 @@ pub struct Entry {
     seq: u64,
 }
 
+impl Entry {
+    /// Whether a response or check holds the block in its slot.
+    pub fn pinned(&self) -> bool {
+        self.pins > 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Queue {
     None,
@@ -200,6 +207,19 @@ impl Store {
 
     pub fn get(&self, key: &BlockKey) -> Option<&Entry> {
         self.blocks.get(key)
+    }
+
+    /// The blocks of `version` the store holds or is filling.
+    pub fn blocks_of(&self, version: VersionId) -> Vec<BlockKey> {
+        let first = BlockKey { version, index: 0 };
+        let last = BlockKey {
+            version,
+            index: u64::MAX,
+        };
+        self.blocks
+            .range(first..=last)
+            .map(|(key, _)| *key)
+            .collect()
     }
 
     pub fn blocks(&self) -> impl Iterator<Item = (&BlockKey, &Entry)> {

@@ -59,6 +59,12 @@ pub enum NodeRequest {
         key: ObjectKey,
         passed_on: bool,
     },
+    /// Purge `key`; a node that coordinates the purge sends it with
+    /// `passed_on` set.
+    Purge {
+        key: ObjectKey,
+        passed_on: bool,
+    },
     /// S3's event that `key` changed to `etag`, or went away for `None`,
     /// which another node took from the queue.
     Event {
@@ -184,6 +190,13 @@ pub fn encode_request(
             }
             key
         }
+        NodeRequest::Purge { key, passed_on } => {
+            add(KIND, "purge".into());
+            if *passed_on {
+                add(PASSED_ON, "1".into());
+            }
+            key
+        }
         NodeRequest::Event { key, etag } => {
             add(KIND, "event".into());
             if let Some(etag) = etag {
@@ -237,7 +250,9 @@ pub fn encode_request(
         }
     };
     let method = match request {
-        NodeRequest::Written { .. } | NodeRequest::Event { .. } => "POST",
+        NodeRequest::Written { .. } | NodeRequest::Event { .. } | NodeRequest::Purge { .. } => {
+            "POST"
+        }
         NodeRequest::Read(_)
         | NodeRequest::Ring
         | NodeRequest::Forward(_)
@@ -308,6 +323,10 @@ pub fn decode_request(
     };
     match field(KIND)? {
         "written" => Ok(NodeRequest::Written {
+            key,
+            passed_on: header(headers, PASSED_ON).is_some(),
+        }),
+        "purge" => Ok(NodeRequest::Purge {
             key,
             passed_on: header(headers, PASSED_ON).is_some(),
         }),
@@ -655,6 +674,10 @@ mod tests {
             passed_on: false,
         });
         round_trip(NodeRequest::Written {
+            key: key(),
+            passed_on: true,
+        });
+        round_trip(NodeRequest::Purge {
             key: key(),
             passed_on: true,
         });

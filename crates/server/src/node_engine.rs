@@ -157,6 +157,8 @@ struct Work {
     passed_events: Vec<(EventId, NodeId, ObjectKey, Option<ETag>)>,
     /// Leases and lease reports to send.
     notices: Vec<(NodeId, NodeRequest)>,
+    /// Purges to pass on.
+    purges: Vec<(NodeId, ObjectKey)>,
     deletes: Vec<String>,
     writes: Vec<(Location, Bytes)>,
     /// Slots to verify: location, length and checksum.
@@ -295,6 +297,36 @@ impl NodeEngine {
             for (event, key, etag) in taken {
                 this.node.on_event(now, event, key, etag);
             }
+            this.pump()
+        };
+        start(engine, work);
+    }
+
+    /// Purges `key`, coordinating the purge unless another node
+    /// `passed_on` it, and returns once the purge is durable.
+    pub async fn purge(engine: &SharedNode, key: &ObjectKey, passed_on: bool) -> io::Result<()> {
+        let work = {
+            let mut this = engine.borrow_mut();
+            let now = this.now();
+            this.node.on_purge(now, key, passed_on);
+            this.pump()
+        };
+        start(engine, work);
+        let disk = engine.borrow().disk.clone();
+        tokio::task::spawn_blocking(move || {
+            disk.sync_table()?;
+            disk.sync_metadata()
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    /// `node` confirmed it purged `key`.
+    fn purge_confirmed(engine: &SharedNode, key: &ObjectKey, node: NodeId) {
+        let work = {
+            let mut this = engine.borrow_mut();
+            let now = this.now();
+            this.node.on_purge_confirmed(now, key, node);
             this.pump()
         };
         start(engine, work);
@@ -534,6 +566,17 @@ impl NodeEngine {
                 checksum,
             } => self.work.verifies.push((location, len, checksum)),
             node::Action::ReadSpot { version, parts } => self.work.spots.push((version, parts)),
+            node::Action::Erase { location, len } => {
+                if let Err(error) = self.disk.erase(location, len) {
+                    eprintln!("erasing {location:?}: {error}");
+                }
+            }
+            node::Action::SavePurge { key, nodes } => {
+                if let Err(error) = self.disk.save_purge(&key, &nodes) {
+                    eprintln!("saving the purge of {key:?}: {error}");
+                }
+            }
+            node::Action::PassPurge { node, key } => self.work.purges.push((node, key)),
             node::Action::Release { origin } => {
                 if let Some(Body::Kept { reserved, .. }) = self.bodies.remove(&origin) {
                     self.warm_budget += reserved;
@@ -717,6 +760,30 @@ fn start(engine: &SharedNode, work: Work) {
             match peers.exchange(node, &request).await {
                 Ok(exchanged) => peers.idle(exchanged.body),
                 Err(error) => eprintln!("passing a write to node {}: {error}", node.0),
+            }
+        });
+    }
+    for (node, key) in work.purges {
+        let engine = engine.clone();
+        let peers = engine.borrow().peers.clone();
+        tokio::task::spawn_local(async move {
+            let request = NodeRequest::Purge {
+                key: key.clone(),
+                passed_on: true,
+            };
+            let told = tokio::time::timeout(PASS_WAIT, peers.exchange(node, &request)).await;
+            match told {
+                Ok(Ok(Exchanged {
+                    answer: NodeAnswer::Written,
+                    body,
+                    ..
+                })) => {
+                    peers.idle(body);
+                    NodeEngine::purge_confirmed(&engine, &key, node);
+                }
+                Ok(Ok(_)) => eprintln!("node {} answered a purge out of protocol", node.0),
+                Ok(Err(error)) => eprintln!("passing a purge to node {}: {error}", node.0),
+                Err(_) => eprintln!("passing a purge to node {}: timed out", node.0),
             }
         });
     }
@@ -1146,6 +1213,17 @@ async fn connection(stream: TcpStream, engine: &SharedNode, secret: &str) -> io:
         connection.read_body(len).await?;
         let reply = match request {
             NodeRequest::Forward(_) => unreachable!("forwarded above"),
+            NodeRequest::Purge { key, passed_on } => {
+                // A purge that is not durable goes unconfirmed, and its
+                // coordinator tells the node again.
+                NodeEngine::purge(engine, &key, passed_on).await?;
+                Reply {
+                    answer: NodeAnswer::Written,
+                    body: Vec::new(),
+                    len: 0,
+                    sending: None,
+                }
+            }
             NodeRequest::Lease {
                 placement,
                 owner,

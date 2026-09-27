@@ -292,6 +292,15 @@ pub enum Action {
         version: VersionId,
         parts: Vec<(Location, u64, u64)>,
     },
+    /// Erase the `len` bytes of the slot at `location`, whose block a
+    /// purge dropped.
+    Erase { location: Location, len: u64 },
+    /// Record durably that `key`'s purge waits on `nodes` to confirm, or on
+    /// none once all have.
+    SavePurge { key: ObjectKey, nodes: Vec<NodeId> },
+    /// Tell `node` to purge `key`, with `on_purge` and `passed_on` set, and
+    /// call `on_purge_confirmed` once it confirms.
+    PassPurge { node: NodeId, key: ObjectKey },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -383,6 +392,11 @@ pub struct Node {
     /// read is in progress.
     inspected: BTreeSet<VersionId>,
     spots: BTreeMap<VersionId, Vec<BlockKey>>,
+    /// Purges this node coordinates: the nodes yet to confirm each, and
+    /// when to tell them again.
+    purges: BTreeMap<ObjectKey, (BTreeSet<NodeId>, Time)>,
+    /// Purged blocks still being written or read, dropped once free.
+    purging: BTreeSet<BlockKey>,
     config: Config,
     objects: BTreeMap<ObjectKey, Object>,
     /// Known objects by when they were last used, oldest first.
@@ -590,6 +604,8 @@ impl Node {
             hints: BTreeMap::new(),
             inspected: BTreeSet::new(),
             spots: BTreeMap::new(),
+            purges: BTreeMap::new(),
+            purging: BTreeSet::new(),
             store: Store::new(config.store),
             doorkeeper: Doorkeeper::new(config.doorkeeper_window),
             config,
@@ -626,8 +642,19 @@ impl Node {
         config: Config,
         records: impl IntoIterator<Item = Recovered>,
         metadata: impl IntoIterator<Item = (ObjectKey, Option<Meta>)>,
+        purges: impl IntoIterator<Item = (ObjectKey, Vec<NodeId>)>,
     ) -> Node {
         let mut node = Node::new(id, ring, config);
+        // The last record of each purge holds the nodes it still waits on;
+        // the first tick tells them again.
+        for (key, nodes) in purges {
+            match nodes.is_empty() {
+                true => node.purges.remove(&key),
+                false => node
+                    .purges
+                    .insert(key, (nodes.into_iter().collect(), Time::default())),
+            };
+        }
         for (key, meta) in metadata {
             match meta {
                 Some(meta) => node.keep(key, meta, Time::default()),
@@ -1156,6 +1183,116 @@ impl Node {
         }
     }
 
+    /// Purges `key`: drops its metadata and every block of every version
+    /// of it, erasing their slots, and drops blocks being written or read
+    /// once free. A node that `passed_on` is unset for coordinates the
+    /// purge: it has every other node in its rings purge the key, records
+    /// durably which have yet to confirm, and tells them again until each
+    /// does. The owner confirms once the actions are durable.
+    pub fn on_purge(&mut self, now: Time, key: &ObjectKey, passed_on: bool) {
+        self.now = self.now.max(now);
+        self.invalidate(now, key);
+        let versions: Vec<VersionId> = self
+            .versions
+            .range(VersionId::all_of(VersionId::key_hash(key)))
+            .map(|(&version, _)| version)
+            .collect();
+        for version in versions {
+            for block in self.store.blocks_of(version) {
+                self.purging.insert(block);
+                self.drop_purged(block);
+            }
+        }
+        if passed_on {
+            return;
+        }
+        let previous = self.previous.iter().flat_map(|(ring, _)| ring.members());
+        let nodes: BTreeSet<NodeId> = self
+            .ring
+            .members()
+            .iter()
+            .chain(previous)
+            .map(|member| member.id)
+            .filter(|&node| node != self.id)
+            .collect();
+        if nodes.is_empty() {
+            return;
+        }
+        let saved = nodes.iter().copied().collect();
+        self.actions.push(Action::SavePurge {
+            key: key.clone(),
+            nodes: saved,
+        });
+        self.pass_purge(key, &nodes);
+        let again = Time(now.0 + self.purge_retry());
+        self.purges.insert(key.clone(), (nodes, again));
+    }
+
+    /// `node` confirmed it purged `key`, durably.
+    pub fn on_purge_confirmed(&mut self, now: Time, key: &ObjectKey, node: NodeId) {
+        self.now = self.now.max(now);
+        let Some((nodes, _)) = self.purges.get_mut(key) else {
+            return;
+        };
+        if !nodes.remove(&node) {
+            return;
+        }
+        let saved = nodes.iter().copied().collect();
+        if nodes.is_empty() {
+            self.purges.remove(key);
+        }
+        self.actions.push(Action::SavePurge {
+            key: key.clone(),
+            nodes: saved,
+        });
+    }
+
+    /// Purges this node coordinates, and the nodes each waits on.
+    pub fn pending_purges(&self) -> Vec<(ObjectKey, Vec<NodeId>)> {
+        self.purges
+            .iter()
+            .map(|(key, (nodes, _))| (key.clone(), nodes.iter().copied().collect()))
+            .collect()
+    }
+
+    fn pass_purge(&mut self, key: &ObjectKey, nodes: &BTreeSet<NodeId>) {
+        for &node in nodes {
+            let key = key.clone();
+            self.actions.push(Action::PassPurge { node, key });
+        }
+    }
+
+    /// How long a coordinator waits before telling nodes of a purge again.
+    fn purge_retry(&self) -> u64 {
+        4 * self.config.peer_timeout.max(1)
+    }
+
+    /// Drops a purged block, erasing its slot, unless it is still being
+    /// written or read; it goes once free.
+    fn drop_purged(&mut self, block: BlockKey) {
+        let Some(entry) = self.store.get(&block) else {
+            self.purging.remove(&block);
+            return;
+        };
+        if entry.state != BlockState::Ready || entry.pinned() {
+            return;
+        }
+        let (location, len) = (entry.location, self.config.store.slot_size(entry.len));
+        self.purging.remove(&block);
+        self.store.remove(block);
+        self.actions.push(Action::Clear { location });
+        self.actions.push(Action::Erase { location, len });
+        self.unref(block.version);
+    }
+
+    /// Unpins a block, and drops it if a purge waited for it.
+    fn unpin(&mut self, block: BlockKey) {
+        self.store.unpin(block);
+        if self.purging.contains(&block) {
+            self.drop_purged(block);
+        }
+    }
+
     /// The key's home and, while the fallback window lasts, its home under
     /// the previous ring, other than this node.
     fn other_homes(&self, key: &ObjectKey) -> BTreeSet<NodeId> {
@@ -1449,6 +1586,19 @@ impl Node {
         self.now = self.now.max(now);
         self.events.retain(|_, (_, until)| *until > now);
         self.tick_leases(now);
+        let retry = self.purge_retry();
+        let due: Vec<ObjectKey> = self
+            .purges
+            .iter()
+            .filter(|(_, (_, again))| *again <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in due {
+            let (nodes, again) = self.purges.get_mut(&key).expect("due purge");
+            *again = Time(now.0 + retry);
+            let nodes = nodes.clone();
+            self.pass_purge(&key, &nodes);
+        }
         if self
             .previous
             .as_ref()
@@ -1507,6 +1657,9 @@ impl Node {
         self.stop_reading(origin);
         for waiter in self.awaiting_writes.remove(&location).unwrap_or_default() {
             self.arrived(waiter, Await::Written(location));
+        }
+        if self.purging.contains(&block) {
+            self.drop_purged(block);
         }
         self.inspect(block.version);
     }
@@ -1570,7 +1723,7 @@ impl Node {
             return;
         };
         for block in blocks {
-            self.store.unpin(block);
+            self.unpin(block);
         }
         let prefetch = self.versions.get(&version).and_then(|entry| {
             let (key, etag) = entry.name.clone()?;
@@ -1649,6 +1802,7 @@ impl Node {
             .filter(|&waiter| self.abandon_plan(waiter))
             .collect();
         self.store.remove(block);
+        self.purging.remove(&block);
         self.filling_bytes -= len;
         self.unref(block.version);
         // Later reads fill the block again instead of reading this body.
@@ -1681,9 +1835,13 @@ impl Node {
             for waiter in waiters {
                 self.arrived(waiter, Await::Verify(location));
             }
+            if self.purging.contains(&block) {
+                self.drop_purged(block);
+            }
             return;
         }
         self.stats.corrupt_blocks += 1;
+        self.purging.remove(&block);
         let waiters: Vec<GatewayRequestId> = waiters
             .into_iter()
             .filter(|&waiter| self.abandon_plan(waiter))
@@ -2713,7 +2871,7 @@ impl Node {
 
     fn release(&mut self, holds: Holds) {
         for block in holds.pins {
-            self.store.unpin(block);
+            self.unpin(block);
         }
         for origin in holds.readers {
             self.stop_reading(origin);
@@ -2805,6 +2963,7 @@ impl Node {
         }
         for (evicted, location) in self.store.drain_evicted() {
             self.stats.evicted_blocks += 1;
+            self.purging.remove(&evicted);
             self.actions.push(Action::Clear { location });
             self.unref(evicted.version);
         }
@@ -3051,7 +3210,7 @@ mod tests {
             (key("b"), Some(meta("b"))),
             (key("a"), Some(meta("a"))),
         ];
-        let mut node = Node::recover(NodeId(0), ring, config(2), Vec::new(), saved);
+        let mut node = Node::recover(NodeId(0), ring, config(2), Vec::new(), saved, Vec::new());
         for (id, name) in ["a", "b"].into_iter().enumerate() {
             let read = Read::Object {
                 request: Request::head(key(name)),
