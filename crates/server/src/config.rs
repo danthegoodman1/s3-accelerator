@@ -276,9 +276,10 @@ impl Client {
 pub struct CacheConfig {
     pub block_size: u64,
     pub chunk_blocks: u64,
-    /// Bytes per extent, the unit of disk a size class takes: by default
-    /// one block, so a class that needs room frees at most a block's worth.
-    pub extent_size: u64,
+    /// Bytes per extent, the unit of disk a size class takes, a multiple of
+    /// the block size: by default one block, so a class that needs room
+    /// frees at most a block's worth.
+    pub extent_size: Option<u64>,
     /// Extents in the slab file.
     pub extents: u32,
     pub min_slot: u64,
@@ -316,7 +317,7 @@ impl Default for CacheConfig {
         CacheConfig {
             block_size: 1 << 20,
             chunk_blocks: 16,
-            extent_size: 1 << 20,
+            extent_size: None,
             extents: 256,
             min_slot: 4 << 10,
             doorkeeper_window: 100_000,
@@ -378,7 +379,30 @@ impl PolicyConfig {
 
 impl CacheConfig {
     /// Settings the core would misbehave under.
+    /// Bytes per extent: one block unless the config names another size.
+    pub fn extent_size(&self) -> u64 {
+        self.extent_size.unwrap_or(self.block_size)
+    }
+
     pub fn check(&self) -> Result<(), String> {
+        for (name, size) in [("block_size", self.block_size), ("min_slot", self.min_slot)] {
+            if !size.is_power_of_two() {
+                return Err(format!("cache.{name} ({size}) must be a power of two"));
+            }
+        }
+        if self.min_slot > self.block_size {
+            return Err(format!(
+                "cache.min_slot ({}) must be at most cache.block_size ({})",
+                self.min_slot, self.block_size
+            ));
+        }
+        let extent = self.extent_size();
+        if extent == 0 || !extent.is_multiple_of(self.block_size) {
+            return Err(format!(
+                "cache.extent_size ({extent}) must be a multiple of cache.block_size ({})",
+                self.block_size
+            ));
+        }
         if self.node_timeout_ms < 2 * self.origin_timeout_ms {
             return Err(format!(
                 "node_timeout_ms ({}) must be at least twice origin_timeout_ms ({}): a node may wait out one S3 timeout and fetch again",
@@ -405,7 +429,7 @@ impl CacheConfig {
         node::Config {
             layout: Layout::new(self.block_size, self.chunk_blocks),
             store: StoreConfig {
-                extent_size: self.extent_size,
+                extent_size: self.extent_size(),
                 extents: self.extents,
                 min_slot: self.min_slot,
                 max_slot: self.block_size,
@@ -435,11 +459,27 @@ mod tests {
     use super::*;
 
     /// A size class takes disk one block at a time, so a class that needs
-    /// room frees at most a block's worth.
+    /// room frees at most a block's worth, whatever the block size.
     #[test]
     fn an_extent_holds_one_block_by_default() {
-        let cache = CacheConfig::default();
-        assert_eq!(cache.extent_size, cache.block_size);
+        let mut cache = CacheConfig::default();
+        assert_eq!(cache.node_config().store.extent_size, cache.block_size);
+        cache.block_size = 4 << 20;
+        assert!(cache.check().is_ok());
+        assert_eq!(cache.node_config().store.extent_size, 4 << 20);
+    }
+
+    #[test]
+    fn the_store_geometry_is_checked() {
+        let with = |change: fn(&mut CacheConfig)| {
+            let mut cache = CacheConfig::default();
+            change(&mut cache);
+            cache.check()
+        };
+        assert!(with(|cache| cache.extent_size = Some(3 << 19)).is_err());
+        assert!(with(|cache| cache.block_size = 3 << 20).is_err());
+        assert!(with(|cache| cache.min_slot = 2 << 20).is_err());
+        assert!(with(|cache| cache.extent_size = Some(64 << 20)).is_ok());
     }
 
     #[test]

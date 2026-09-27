@@ -294,8 +294,7 @@ MUTANTS = [
     ),
     (
         "a record is written before its block's sync",
-        [(DISK, "self.slabs.write_all_at(bytes, offset)?;\n        self.slab_sync.sync(|| self.slabs.sync_data())?;",
-          "self.slabs.write_all_at(bytes, offset)?;")],
+        [(DISK, "self.slab_sync.sync(first, || self.slabs.sync_data())?;", "let _ = first;")],
     ),
     (
         "a block write begins before a clear's sync",
@@ -609,40 +608,49 @@ MUTANTS = [
     ),
     (
         "a write shares a sync that began before it ended",
-        [(DISK, "let covers = state.asked;", "let covers = state.asked + 1_000_000;")],
+        [(DISK, "let needed = state.begun;", "let needed = state.finished;")],
     ),
     (
         "a write that a failed sync covered counts as durable",
-        [(DISK, "Err(_) => state.failed = state.failed.max(covers),", "Err(_) => state.durable = state.durable.max(covers),")],
+        [(DISK, "state.failed.insert(number);", "let _ = number;")],
+    ),
+    (
+        "a write during a failed sync counts as durable",
+        [(DISK, "state.failed.range(first..=needed)", "state.failed.range(needed..=needed)")],
+    ),
+    (
+        "a class's room comes from the extent with the fewest blocks",
+        [(STORE, "let extent = victims.iter().rev().copied().find(|&extent| self.idle(extent));",
+          "let extent = self.fewest_idle();")],
+    ),
+    (
+        "a reservation never empties an extent",
+        [(STORE, "self.evacuate(extent.or_else(|| self.fewest_idle())?);", "return None;")],
+    ),
+    (
+        "a busy victim's extent refuses the reservation",
+        [(STORE, "self.evacuate(extent.or_else(|| self.fewest_idle())?);", "self.evacuate(extent?);")],
+    ),
+    (
+        "extents hold 64 blocks by default",
+        [(CONFIG, "self.extent_size.unwrap_or(self.block_size)", "self.extent_size.unwrap_or(64 << 20)")],
+    ),
+    (
+        "a write drops only its own slot's pages",
+        [(DISK, "if written <= slot_size || self.pages.in_use(&self.slabs, span, range)? {", "if true {")],
     ),
     (
         "relays under kernel TLS run on the event loop",
         [(ZERO_COPY, "if !kernel_tls {", "if true {")],
     ),
     (
-        "a relay under kernel TLS copies through userspace",
-        [(ZERO_COPY, "let failure = match splice(from, None, &pipe.write, None, want, flags) {",
-          "let failure = match (|| -> rustix::io::Result<usize> { let mut buf = vec![0u8; want]; "
-          "let read = rustix::io::read(from, &mut buf[..])?; rustix::io::write(&pipe.write, &buf[..read]) })() {")],
+        "a table for other extents over the same slots is discarded",
+        [(DISK, "read_header(&table)?.filter(|header| same_slots(&header.config, &config))",
+          "read_header(&table)?.filter(|header| header.config == config)")],
     ),
     (
-        "a class's room comes from the extent with the fewest blocks",
-        [(STORE, "victims.take().is_some_and(|extent| self.evacuate(extent))",
-          "victims.take().is_some_and(|_| { let fewest = (0..self.config.extents)"
-          ".filter(|&e| self.extents[e as usize].class.is_some() && self.extents[e as usize].busy == 0)"
-          ".min_by_key(|&e| (self.extents[e as usize].held, e)); fewest.is_some_and(|e| self.evacuate(e)) })")],
-    ),
-    (
-        "a reservation never empties an extent",
-        [(STORE, "if !victims.take().is_some_and(|extent| self.evacuate(extent)) {", "if true {")],
-    ),
-    (
-        "extents hold 64 blocks by default",
-        [(CONFIG, "extent_size: 1 << 20,", "extent_size: 64 << 20,")],
-    ),
-    (
-        "a write drops only its own slot's pages",
-        [(DISK, "&& self.pages.in_use(&self.slabs, span, range)?", "&& true")],
+        "a loopback pair takes any connection",
+        [(TLS, "if from == peer {", "if true {")],
     ),
     (
         "TLS sessions stay in userspace",

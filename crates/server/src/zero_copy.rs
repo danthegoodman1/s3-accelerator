@@ -20,6 +20,7 @@ use std::io;
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::os::fd::{AsFd, OwnedFd};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::Interest;
 use tokio::net::TcpStream;
@@ -74,7 +75,7 @@ pub enum Short {
 /// Sockets never block `splice`, so the relay runs on this thread's event
 /// loop, unless `kernel_tls` says either socket carries a kernel TLS
 /// session: then each `splice` encrypts or decrypts, and the relay runs on
-/// a worker thread so the crypto leaves the event loop free.
+/// the relay runtime's threads so the crypto leaves the event loop free.
 pub async fn relay(
     from: &TcpStream,
     to: &TcpStream,
@@ -85,16 +86,43 @@ pub async fn relay(
         return relay_here(from, to, len).await;
     }
     let from = match from.as_fd().try_clone_to_owned() {
-        Ok(from) => from,
+        Ok(from) => std::net::TcpStream::from(from),
         Err(error) => return (0, Err(Short::Source(error))),
     };
     let to = match to.as_fd().try_clone_to_owned() {
-        Ok(to) => to,
+        Ok(to) => std::net::TcpStream::from(to),
         Err(error) => return (0, Err(Short::Destination(error))),
     };
-    tokio::task::spawn_blocking(move || relay_blocking(&from, &to, len))
+    let relayed = relays().spawn(async move {
+        let from = match TcpStream::from_std(from) {
+            Ok(from) => from,
+            Err(error) => return (0, Err(Short::Source(error))),
+        };
+        let to = match TcpStream::from_std(to) {
+            Ok(to) => to,
+            Err(error) => return (0, Err(Short::Destination(error))),
+        };
+        relay_here(&from, &to, len).await
+    });
+    relayed
         .await
         .unwrap_or_else(|error| (0, Err(Short::Source(io::Error::other(error)))))
+}
+
+/// The runtime that relays over kernel TLS, one thread per core: its
+/// threads take the crypto off the event loop, and a slow client holds no
+/// thread while it waits.
+fn relays() -> &'static tokio::runtime::Runtime {
+    static RELAYS: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RELAYS.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get());
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(threads)
+            .thread_name("relay")
+            .enable_all()
+            .build()
+            .expect("the relay runtime starts")
+    })
 }
 
 /// A relay on this thread's event loop.
@@ -137,55 +165,6 @@ async fn relay_here(from: &TcpStream, to: &TcpStream, len: u64) -> (u64, Result<
                 Ok(moved) => drained += moved,
                 Err(error) => return (copied + drained as u64, Err(Short::Destination(error))),
             }
-        }
-        copied += filled as u64;
-    }
-    pipe.put_back();
-    (copied, Ok(()))
-}
-
-/// A relay on a worker thread, which waits for each socket with `poll`.
-fn relay_blocking(from: &OwnedFd, to: &OwnedFd, len: u64) -> (u64, Result<(), Short>) {
-    let pipe = match Pipe::take() {
-        Ok(pipe) => pipe,
-        Err(error) => return (0, Err(Short::Source(error))),
-    };
-    let flags = SpliceFlags::MOVE | SpliceFlags::NONBLOCK;
-    let mut copied = 0;
-    while copied < len {
-        let want = usize::try_from(len - copied)
-            .unwrap_or(usize::MAX)
-            .min(pipe.capacity);
-        let filled = loop {
-            let failure = match splice(from, None, &pipe.write, None, want, flags) {
-                Ok(0) => io::ErrorKind::UnexpectedEof.into(),
-                Ok(filled) => break filled,
-                Err(Errno::INTR) => continue,
-                Err(Errno::AGAIN) => match wait(from, PollFlags::IN) {
-                    Ok(()) => continue,
-                    Err(error) => error,
-                },
-                Err(error) => error.into(),
-            };
-            pipe.put_back();
-            return (copied, Err(Short::Source(failure)));
-        };
-        let mut drained = 0;
-        while drained < filled {
-            let failure = match splice(&pipe.read, None, to, None, filled - drained, flags) {
-                Ok(0) => io::ErrorKind::WriteZero.into(),
-                Ok(moved) => {
-                    drained += moved;
-                    continue;
-                }
-                Err(Errno::INTR) => continue,
-                Err(Errno::AGAIN) => match wait(to, PollFlags::OUT) {
-                    Ok(()) => continue,
-                    Err(error) => error,
-                },
-                Err(error) => error.into(),
-            };
-            return (copied + drained as u64, Err(Short::Destination(failure)));
         }
         copied += filled as u64;
     }

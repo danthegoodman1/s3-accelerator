@@ -59,8 +59,14 @@ wait_for() {
 
 case "${1:-}" in
   start)
-    nodes=${2:-3}
-    tls=${3:-}
+    nodes=3
+    tls=
+    for arg in "${@:2}"; do
+      case "$arg" in
+        --tls) tls=--tls ;;
+        *) nodes=$arg ;;
+      esac
+    done
     cargo build -q -p s3-accelerator
     rm -rf "$dir"
     mkdir -p "$dir"

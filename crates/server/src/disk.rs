@@ -21,7 +21,7 @@ use s3_accelerator_core::placement::NodeId;
 use s3_accelerator_core::placement::PlacementHash;
 use s3_accelerator_core::s3::{ETag, ObjectKey};
 use s3_accelerator_core::store::{Location, StoreConfig, VersionId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
@@ -40,6 +40,10 @@ const NO_RUN: u64 = u64::MAX;
 
 pub struct Disk {
     slabs: File,
+    /// For each span a largest slot covers, the largest slot written there
+    /// since its pages were last dropped whole: a folio no larger may
+    /// remain cached across the span's slots.
+    written: Mutex<Vec<u64>>,
     /// Syncs the slab file once for every block write waiting on it.
     slab_sync: GroupSync,
     /// Which of the slab file's pages are cached.
@@ -60,10 +64,12 @@ pub struct Disk {
     clears: Mutex<bool>,
 }
 
-/// Syncs a file for many writers at once. Each writer waits for a sync that
-/// began after its write ended, and one sync serves every writer waiting
-/// when it begins, so concurrent block writes share each flush of the
-/// drive.
+/// Syncs a file for many writers at once. Syncs run one at a time, each
+/// serving every writer waiting when it begins, so concurrent block writes
+/// share each flush of the drive. A write is durable once a sync that began
+/// after it ended succeeds, unless a sync that could have flushed its pages
+/// failed first: the kernel may have dropped those pages, so no later sync
+/// makes it durable.
 #[derive(Default)]
 struct GroupSync {
     state: Mutex<SyncState>,
@@ -72,44 +78,48 @@ struct GroupSync {
 
 #[derive(Default)]
 struct SyncState {
-    /// Writes that have asked for a sync, each numbered in turn.
-    asked: u64,
-    /// Every write numbered below this is durable.
-    durable: u64,
-    /// Every write numbered below this was in a sync that failed. The
-    /// kernel may have dropped such a write's pages, so no later sync makes
-    /// it durable.
-    failed: u64,
-    syncing: bool,
+    /// Syncs begun and finished, numbered from 0 in the order they begin.
+    begun: u64,
+    finished: u64,
+    failed: BTreeSet<u64>,
+    /// Writes waiting for a sync.
+    waiting: u64,
 }
 
 impl GroupSync {
-    /// Makes durable the writes that ended before this call, running
-    /// `flush` if no sync that began since will.
-    fn sync(&self, mut flush: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    /// The first sync that could flush a write beginning now: the one
+    /// running, or else the next.
+    fn begin(&self) -> u64 {
+        self.state.lock().expect("sync lock").finished
+    }
+
+    /// Makes durable a write that began when `begin` returned `first` and
+    /// has ended, running `flush` if no sync that began since will.
+    fn sync(&self, first: u64, mut flush: impl FnMut() -> io::Result<()>) -> io::Result<()> {
         let mut state = self.state.lock().expect("sync lock");
-        let write = state.asked;
-        state.asked += 1;
+        // The first sync to begin after the write ended.
+        let needed = state.begun;
+        state.waiting += 1;
         loop {
-            if write < state.failed {
-                return Err(io::Error::other("a sync of the slab file failed"));
+            if state.finished > needed {
+                state.waiting -= 1;
+                return match state.failed.range(first..=needed).next() {
+                    Some(_) => Err(io::Error::other("a sync of the slab file failed")),
+                    None => Ok(()),
+                };
             }
-            if write < state.durable {
-                return Ok(());
-            }
-            if state.syncing {
+            if state.begun > state.finished {
                 state = self.done.wait(state).expect("sync lock");
                 continue;
             }
-            state.syncing = true;
-            let covers = state.asked;
+            let number = state.begun;
+            state.begun += 1;
             drop(state);
             let synced = flush();
             state = self.state.lock().expect("sync lock");
-            state.syncing = false;
-            match synced {
-                Ok(()) => state.durable = state.durable.max(covers),
-                Err(_) => state.failed = state.failed.max(covers),
+            state.finished += 1;
+            if synced.is_err() {
+                state.failed.insert(number);
             }
             self.done.notify_all();
         }
@@ -126,8 +136,9 @@ pub struct Recovery {
 
 impl Disk {
     /// Opens the store in `dir`, creating it if needed, and starts a new
-    /// run. A slot table written for another layout is discarded, with the
-    /// metadata file.
+    /// run. A slot table written for other slots is discarded, with the
+    /// metadata file; one written for other extents over the same slots is
+    /// kept, as records name slots by their offset.
     pub fn open(dir: &Path, config: StoreConfig) -> io::Result<(Disk, Recovery)> {
         std::fs::create_dir_all(dir)?;
         let open = |name: &str| {
@@ -142,7 +153,7 @@ impl Disk {
         let mut purges = open("purges")?;
         let slots = config.extent_size * u64::from(config.extents) / config.min_slot;
         let table_len = HEADER_SIZE + slots * RECORD_SIZE;
-        let header = read_header(&table)?.filter(|header| header.config == config);
+        let header = read_header(&table)?.filter(|header| same_slots(&header.config, &config));
         let (records, trusted_from, last_run) = match header {
             Some(header) => (
                 read_records(&table, slots)?,
@@ -192,7 +203,11 @@ impl Disk {
             .collect();
         let metadata_entries = read_metadata(&mut metadata)?;
         let purge_entries = read_purges(&mut purges)?;
+        // The page cache outlives the process, so any span may still hold
+        // a largest block's folio from an earlier run.
+        let spans = (slabs_len / config.max_slot) as usize;
         let disk = Disk {
+            written: Mutex::new(vec![config.max_slot; spans]),
             slabs,
             slab_sync: GroupSync::default(),
             pages,
@@ -220,16 +235,20 @@ impl Disk {
         let offset = self.offset(location);
         let len = bytes.len() as u64;
         let range = offset..offset + len;
-        let slot = offset..offset + self.config.slot_size(len);
-        // A larger block that held this space may have left its bytes cached
-        // in one folio that spans the slot, as the kernel caches a write;
-        // only dropping the whole largest slot's span releases that folio.
+        let slot_size = self.config.slot_size(len);
+        let slot = offset..offset + slot_size;
+        // A larger block written into this space may have left its bytes
+        // cached in one folio that spans the slot, as the kernel caches a
+        // write; only dropping the whole largest slot's span releases it.
         let largest = self.config.max_slot;
-        let span = offset / largest * largest..(offset / largest + 1) * largest;
-        if self.pages.in_use(&self.slabs, slot, range.clone())?
-            && self.pages.in_use(&self.slabs, span, range)?
-        {
-            return Ok(false);
+        let index = (offset / largest) as usize;
+        let span = index as u64 * largest..(index as u64 + 1) * largest;
+        if self.pages.in_use(&self.slabs, slot, range.clone())? {
+            let written = self.written.lock().expect("written lock")[index];
+            if written <= slot_size || self.pages.in_use(&self.slabs, span, range)? {
+                return Ok(false);
+            }
+            self.written.lock().expect("written lock")[index] = slot_size;
         }
         {
             let mut clears = self.clears.lock().expect("clears lock");
@@ -238,8 +257,13 @@ impl Disk {
                 *clears = false;
             }
         }
+        {
+            let mut written = self.written.lock().expect("written lock");
+            written[index] = written[index].max(slot_size);
+        }
+        let first = self.slab_sync.begin();
         self.slabs.write_all_at(bytes, offset)?;
-        self.slab_sync.sync(|| self.slabs.sync_data())?;
+        self.slab_sync.sync(first, || self.slabs.sync_data())?;
         let checksum = xxh3_64(bytes);
         self.checksums
             .lock()
@@ -386,6 +410,14 @@ fn refuse_memory_filesystems(slabs: &File) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Whether a table written for `old` describes the slots of `new`: the
+/// same slot sizes over the same bytes, whatever the extents. A record
+/// whose new extent holds another class goes when the store restores it.
+fn same_slots(old: &StoreConfig, new: &StoreConfig) -> bool {
+    let bytes = |config: &StoreConfig| config.extent_size * u64::from(config.extents);
+    old.min_slot == new.min_slot && old.max_slot == new.max_slot && bytes(old) == bytes(new)
 }
 
 /// The location of the slot whose record is at `index`.
@@ -784,6 +816,21 @@ mod tests {
             assert!(recovery.records[0].trusted);
             disk.shut_down().unwrap();
         }
+        // Extents half as large over the same slots keep the record, which
+        // lies in the third of them.
+        let halves = StoreConfig {
+            extent_size: config().extent_size / 2,
+            extents: config().extents * 2,
+            ..config()
+        };
+        let (disk, recovery) = Disk::open(&dir, halves).unwrap();
+        let [recovered] = recovery.records.as_slice() else {
+            panic!("{} records", recovery.records.len());
+        };
+        assert_eq!(recovered.location, at(2, 4096));
+        assert_eq!(recovery.metadata, vec![(key(), None)]);
+        disk.shut_down().unwrap();
+        drop(disk);
         let other = StoreConfig {
             max_slot: 4096,
             ..config()
@@ -805,7 +852,8 @@ mod tests {
         let first = {
             let group = group.clone();
             std::thread::spawn(move || {
-                group.sync(|| {
+                let write = group.begin();
+                group.sync(write, || {
                     started.send(()).unwrap();
                     released.recv().unwrap();
                     Ok(())
@@ -817,15 +865,16 @@ mod tests {
         let waiting: Vec<_> = (0..2)
             .map(|_| {
                 let (group, flushes) = (group.clone(), flushes.clone());
+                let write = group.begin();
                 std::thread::spawn(move || {
-                    group.sync(|| {
+                    group.sync(write, || {
                         *flushes.lock().unwrap() += 1;
                         Err(io::Error::other("the drive failed a flush"))
                     })
                 })
             })
             .collect();
-        while group.state.lock().unwrap().asked < 3 {
+        while group.state.lock().unwrap().waiting < 3 {
             std::thread::yield_now();
         }
         release.send(()).unwrap();
@@ -834,6 +883,42 @@ mod tests {
             assert!(write.join().unwrap().is_err());
         }
         assert_eq!(*flushes.lock().unwrap(), 1, "one sync covers both");
-        assert!(group.sync(|| Ok(())).is_ok());
+        let write = group.begin();
+        assert!(group.sync(write, || Ok(())).is_ok());
+    }
+
+    /// A write that ended while a sync that failed was flushing may have
+    /// had its pages dropped, so it fails although the next sync succeeds.
+    #[test]
+    fn a_write_during_a_failed_sync_fails() {
+        use std::sync::Arc;
+        use std::sync::mpsc::channel;
+        let group = Arc::new(GroupSync::default());
+        let write = group.begin();
+        let (started, has_started) = channel();
+        let (release, released) = channel::<()>();
+        let failing = {
+            let group = group.clone();
+            std::thread::spawn(move || {
+                let other = group.begin();
+                group.sync(other, || {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                    Err(io::Error::other("the drive failed a flush"))
+                })
+            })
+        };
+        has_started.recv().unwrap();
+        // The write ends and asks while the failing sync flushes.
+        let asking = {
+            let group = group.clone();
+            std::thread::spawn(move || group.sync(write, || Ok(())))
+        };
+        while group.state.lock().unwrap().waiting < 2 {
+            std::thread::yield_now();
+        }
+        release.send(()).unwrap();
+        assert!(failing.join().unwrap().is_err());
+        assert!(asking.join().unwrap().is_err());
     }
 }

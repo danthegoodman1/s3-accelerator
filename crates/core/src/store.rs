@@ -264,9 +264,11 @@ impl Store {
         assert!(!self.blocks.contains_key(&key), "{key:?} reserved twice");
         let class = self.class_of(len);
         let mut evictions = 0;
-        // The extent of the last block evicted, which eviction chose as the
-        // coldest, emptied if evictions free no room.
-        let mut victims = None;
+        // The extents eviction's victims left. Eviction chose those blocks
+        // as the coldest, so if evictions free no room, the latest victim's
+        // extent is emptied, or failing that another's.
+        let mut victims = Vec::new();
+        let mut emptied = false;
         let location = loop {
             if let Some(location) = self.take_free(class) {
                 break location;
@@ -275,9 +277,17 @@ impl Store {
                 self.assign(extent, class);
             } else if evictions < EVICTIONS_PER_RESERVE {
                 evictions += 1;
-                victims = Some(self.evict_one()?);
-            } else if !victims.take().is_some_and(|extent| self.evacuate(extent)) {
+                victims.push(self.evict_one()?);
+            } else if emptied {
                 return None;
+            } else {
+                let extent = victims
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&extent| self.idle(extent));
+                self.evacuate(extent.or_else(|| self.fewest_idle())?);
+                emptied = true;
             }
         };
         self.hold(location, key);
@@ -621,19 +631,31 @@ impl Store {
         entry.location
     }
 
-    /// Empties `extent` so its space can change class, unless it is free
-    /// already or holds a block filling or pinned. Its blocks lie at most
-    /// one extent from what eviction chose, since eviction left it.
-    fn evacuate(&mut self, extent: u32) -> bool {
+    /// Whether `extent` holds blocks, none of them filling or pinned.
+    fn idle(&self, extent: u32) -> bool {
         let state = &self.extents[extent as usize];
-        if state.class.is_none() || state.busy > 0 {
-            return false;
-        }
-        let keys: Vec<BlockKey> = state.slots.iter().flatten().copied().collect();
+        state.class.is_some() && state.busy == 0
+    }
+
+    /// The idle extent with the fewest blocks, for when every victim's
+    /// extent is busy.
+    fn fewest_idle(&self) -> Option<u32> {
+        (0..self.config.extents)
+            .filter(|&extent| self.idle(extent))
+            .min_by_key(|&extent| (self.extents[extent as usize].held, extent))
+    }
+
+    /// Empties an idle `extent`, so its space can change class.
+    fn evacuate(&mut self, extent: u32) {
+        let keys: Vec<BlockKey> = self.extents[extent as usize]
+            .slots
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
         for key in keys {
             self.evict(key);
         }
-        true
     }
 }
 
@@ -868,6 +890,27 @@ mod tests {
         gone.sort();
         assert_eq!(gone, (0..16).map(key).collect::<Vec<_>>());
         assert!((16..20).all(|index| store.get(&key(index)).is_some()));
+    }
+
+    /// When the victims' extent holds a block still filling, the room
+    /// comes from another idle extent instead.
+    #[test]
+    fn a_busy_victim_extent_yields_to_an_idle_one() {
+        let mut store = store();
+        // Extent 0 holds fifteen 4-byte blocks and one still filling;
+        // extent 1 holds four 16-byte blocks.
+        for index in 0..15 {
+            fill(&mut store, index, 4);
+        }
+        store.reserve(key(15), 4, 15, PlacementHash(0)).unwrap();
+        for index in 16..20 {
+            fill(&mut store, index, 16);
+        }
+        // Eight evictions take small blocks from extent 0, which the
+        // filling block keeps from being emptied.
+        let location = fill(&mut store, 100, 8).unwrap();
+        assert_eq!(location.extent, 1);
+        assert!(store.get(&key(15)).is_some());
     }
 
     #[test]

@@ -16,6 +16,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use std::io;
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
@@ -251,15 +252,28 @@ fn roots(path: &str) -> io::Result<RootCertStore> {
     Ok(roots)
 }
 
-/// A connected pair of loopback sockets.
+/// A connected pair of loopback sockets. Another local process could reach
+/// the listener first, so it takes only the connection this one opened.
 async fn loopback_pair() -> io::Result<(TcpStream, TcpStream)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let connecting = TcpStream::connect(listener.local_addr()?);
-    let (connected, accepted) = tokio::join!(connecting, listener.accept());
-    let (connected, (accepted, _)) = (connected?, accepted?);
+    let connected = TcpStream::connect(listener.local_addr()?).await?;
+    let accepting = accept_from(&listener, connected.local_addr()?);
+    let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, accepting)
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
     connected.set_nodelay(true)?;
     accepted.set_nodelay(true)?;
     Ok((connected, accepted))
+}
+
+/// The next connection `listener` takes from `peer`. Any other closes.
+async fn accept_from(listener: &TcpListener, peer: SocketAddr) -> io::Result<TcpStream> {
+    loop {
+        let (stream, from) = listener.accept().await?;
+        if from == peer {
+            return Ok(stream);
+        }
+    }
 }
 
 /// Sends a `close_notify` alert on a kernel TLS session.
@@ -301,5 +315,22 @@ fn close_notify(fd: RawFd) -> io::Result<()> {
     match sent {
         -1 => Err(io::Error::last_os_error()),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_loopback_pair_takes_only_its_own_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _stranger = TcpStream::connect(address).await.unwrap();
+        let ours = TcpStream::connect(address).await.unwrap();
+        let accepted = accept_from(&listener, ours.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(accepted.peer_addr().unwrap(), ours.local_addr().unwrap());
     }
 }
