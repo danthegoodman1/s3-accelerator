@@ -260,13 +260,28 @@ async fn a_cached_hit_is_sent_from_the_event_loop() {
             let _gateway = cluster.start_gateway().await;
             let body = origin.object("/bucket/k");
             assert!(cluster.get("k").await == (200, body.clone()));
-            // The blocks' writes finish, and their pages stay cached.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // The blocks are stored, and their pages stay cached.
+            let slots = dir.join("disk-0/slots");
+            for tries in 0.. {
+                assert!(tries < 500, "the blocks were never recorded");
+                if recorded(&slots) == 3 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             let cached = now();
             assert!(cluster.get("k").await == (200, body.clone()));
             let dropped = now();
+            // The kernel keeps pages something still holds, so the drop
+            // repeats until none of the slab file's pages are cached.
             let slabs = std::fs::File::open(dir.join("disk-0/slabs")).unwrap();
-            rustix::fs::fadvise(&slabs, 0, None, rustix::fs::Advice::DontNeed).unwrap();
+            let mut tries = 0;
+            while cached_pages(&slabs) > 0 {
+                tries += 1;
+                assert!(tries < 200, "the slab file's pages stay cached");
+                rustix::fs::fadvise(&slabs, 0, None, rustix::fs::Advice::DontNeed).unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             assert!(cluster.get("k").await == (200, body));
             let event_loop = node.server_pid();
             node.stop();
@@ -404,4 +419,39 @@ fn cleared_slots(
         }
     }
     cleared
+}
+
+/// How many of `file`'s pages the page cache holds.
+fn cached_pages(file: &std::fs::File) -> usize {
+    use std::os::fd::AsRawFd;
+    let len = file.metadata().unwrap().len() as usize;
+    let page = rustix::param::page_size();
+    // SAFETY: a read-only shared mapping of the whole file, which `mincore`
+    // reports on without touching, unmapped before returning.
+    unsafe {
+        let address = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        );
+        assert_ne!(address, libc::MAP_FAILED);
+        let mut pages = vec![0u8; len.div_ceil(page)];
+        assert_eq!(libc::mincore(address, len, pages.as_mut_ptr()), 0);
+        libc::munmap(address, len);
+        pages.iter().filter(|page| *page & 1 == 1).count()
+    }
+}
+
+/// How many records the slot table at `path` holds.
+fn recorded(path: &std::path::Path) -> usize {
+    let table = std::fs::read(path).unwrap_or_default();
+    table
+        .get(HEADER_SIZE as usize..)
+        .unwrap_or_default()
+        .chunks_exact(64)
+        .filter(|record| decode_record(record).is_some())
+        .count()
 }
