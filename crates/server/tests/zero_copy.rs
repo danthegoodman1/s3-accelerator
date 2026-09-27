@@ -448,10 +448,11 @@ fn cached_pages(file: &std::fs::File) -> usize {
 /// How many records the slot table at `path` holds.
 fn recorded(path: &std::path::Path) -> usize {
     let table = std::fs::read(path).unwrap_or_default();
-    table
-        .get(HEADER_SIZE as usize..)
-        .unwrap_or_default()
-        .chunks_exact(64)
-        .filter(|record| decode_record(record).is_some())
+    let records = table.get(HEADER_SIZE as usize..).unwrap_or_default();
+    records
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .filter(|record| decode_record(record.as_slice()).is_some())
         .count()
 }
