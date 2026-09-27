@@ -4,7 +4,7 @@
 
 Build the S3 accelerator that `spec.md` describes: a distributed NVMe read cache in front of S3 whose cache logic runs as deterministic state machines, proven in a simulator before it runs on real sockets and disks. Each core feature lands with the simulator models and properties that test it. The server track runs the same core over real I/O and passes the S3 conformance suite through the accelerator.
 
-Non-goals until a phase names them: POSIX access, multipart-upload warming, SSE-C caching, cross-zone clusters.
+Non-goals until a phase names them: POSIX access, multipart-upload warming, SSE-C caching, caching versioned reads, presigned POST uploads, cross-zone clusters.
 
 ## Implementation Principles
 
@@ -12,7 +12,7 @@ Non-goals until a phase names them: POSIX access, multipart-upload warming, SSE-
 - The core does no I/O, reads no clocks and starts no threads (`AGENTS.md`). It handles block locations and response heads; the server and simulator move bytes.
 - Every core feature ships with its simulator model, a property that fails on a wrong answer, and a planted bug that the simulator catches.
 - Build the smallest implementation that meets the phase gate. Add abstraction when a later phase needs it.
-- Execution order: Phase 1, S1, Phase 2, Phase 3, S2, Phase 4, Phase 5, S3.
+- Execution order: Phase 1, S1, Phase 2, Phase 3, S2, Phase 4, Phase 5, S3, Phase 6, Phase 7, Phase 8, Phase 9.
 
 ## Testing Strategy
 
@@ -343,3 +343,135 @@ Status ledger:
 | Complete | Doc | S3C: Storage-layout decision | `spec.md` Storage: slots of size classes in extents stay, with extents of one block by default, and a class that needs room empties the extent eviction's last victim left. The size shift cost a hot set 0.14 GiB with 64 MiB extents and none with one-block extents; `a_shift_to_smaller_blocks_keeps_the_hot_set` (store alone, hot and cold blocks sharing extents: 0 misses with one-block extents, 752 of 4,096 with 64-slot ones) and `emptying_an_extent_follows_eviction` hold the store to it. The open question is closed; unmeasured wear from small random writes is recorded. Planted bugs: a class's room from the extent with the fewest blocks, a reservation never emptying an extent, 64-block default extents. 10,000 seeds pass. |
 | Complete | Gate | Code review | `/code-review high` found 10 issues, all resolved in the commit after `1f764f0`: a reservation refused when the last victim's extent held a filling block (it tries each victim's extent, then the idle extent with the fewest blocks; `a_busy_victim_extent_yields_to_an_idle_one`); a later failed sync could fail a durable write, and a write that ended during a failed flush could count as durable (syncs are numbered, and a write fails only if a sync that overlapped it or followed it first failed; `a_write_during_a_failed_sync_fails`); the userspace-TLS loopback took whatever connection arrived first, so a local process could race in (it takes only its own; `a_loopback_pair_takes_only_its_own_connection`); raising `block_size` alone panicked (extents default to one block of whatever size, and `check` validates the store's geometry; `the_store_geometry_is_checked`); the new default extent discarded every node's cache on upgrade (a table for other extents over the same slots is kept); kTLS relays parked blocking-pool threads that disk I/O shares (they run on a relay runtime, one thread per core); every retry dropped a whole span's pages (only spans a larger block was written into since are dropped whole); the spec understated extent memory for small classes; `scripts/cluster` took `--tls` only third. Planted bugs for each code fix, checked by hand; 10,000 seeds pass. |
 | Complete | Test | Planted-bug sweep | `scripts/mutants` at `1f764f0` caught 133 of 139, with the kernel TLS tests as a layer. Of the six missed, two pointed at code that had moved: "nodes store blocks they do not own" matched a copy of the ownership check in hot-key counting, and "a kept upload is stored without the ETag check" left the size check that the Phase 5 review added, which the replacement's other size tripped; both are repointed, and `an_upload_replaced_before_its_check_is_not_stored` now also replaces the upload with one of the same size. Three had lost their scenarios since Phase 4, as writes now reach previous homes and previous owners now hold every block: new scenarios in `crates/sim/tests/resize.rs` catch them (`a_write_the_previous_home_missed_still_wins`, `a_change_the_new_home_saw_outweighs_the_previous_homes_metadata`, `blocks_a_previous_owner_lacks_come_from_s3`). "A first fetch lets an eviction drop its version" is retired: `admit` refers to the version before evictions run, so the fetch's own reference matters only if a reservation evicts the version's blocks and then finds every extent busy, which no scenario or seed reaches. The review fixes' planted bugs were checked by hand. At `fd2fdd3`, the full sweep catches all 141: 23 by the core's unit tests, 64 by the server's tests, 50 by the simulator's tests and 4 by the kernel TLS tests. |
+
+## Phase 6: Spec Reconciliation
+
+Goal:
+`spec.md` and the code agree. The code fixes the defects that an audit of the spec against the code found, the gateway accepts presigned URLs and virtual-hosted addressing, and the spec describes what the code does.
+
+Scope:
+- 6A Spec corrections where the code's behavior stands: reads with `versionId` pass through to S3; freshness and admission policies are set per bucket; the `events` mode is the cluster's queue over each bucket's TTL, under the config's real keys and defaults; a node's weight is configured, typically from its disk size; replicas hold nothing an invalidation must reach; the doorkeeper's window counts reads; growing the extent size keeps only the class that claims each merged extent first; the index's memory per block and the slot table's size; only a timeout stops a node asking a previous owner; waiters share 5xx answers as well as 404s; warming on write replaces metadata after its HEAD check; config-named nodes join the ring as down; `SIGUSR1` makes a node leave; which streaming payloads get 501; prefetch starts when a block of the version is written; where the store makes room when a victim's extent is busy. `config.rs`'s comment on which nodes a gateway reaches is corrected too.
+- 6B Dead nodes (core, simulator first): a gateway routes around a node whose connection fails or times out, and around nodes its ring reports down. The spec names both timeouts.
+- 6C Cluster secret: every gossip packet carries an HMAC under the cluster secret, and nodes drop packets without a valid one. Every check of the secret runs in constant time.
+- 6D Store and purge:
+  - A purge syncs the slab file before the node confirms it. A gateway keeps an `immutable` bucket's metadata at most a configured purge window, so a purge reaches every gateway within it.
+  - A node rewrites its metadata file in LRU order once the file passes twice the cache's capacity, so the file stays bounded and a restart loads the most recently used entries.
+  - A node preallocates its slab file at start, and a start without the space fails with a clear error.
+  - Blocks skip the doorkeeper only when a previous owner or lease owner supplies them, or when their placement is leased; a refill from S3 passes the doorkeeper.
+  - Lease renewal scales each replica's reported reads by the time they cover, so renewal takes half the promotion rate, as the spec says.
+  - SSE-C uploads skip warming.
+- 6E Gateway auth and the S3 API:
+  - Presigned URLs: SigV4 in the query string for any method, with `X-Amz-Expires` up to seven days and the same clock skew as signed headers. The gateway strips the auth parameters before it looks up the cache, so presigned GETs hit.
+  - `response-content-*` overrides, applied per request to hits and misses.
+  - Virtual-hosted-style addressing for the gateway's configured domains, alongside path style.
+  - Grants gain an access level: `read`, `write` (which includes read) or `admin` (which includes write and allows a bucket's configuration and deletion). Listings are authorized against their `prefix` parameter.
+  - Full-object checksums: the home asks S3 for them on its first fetch, keeps them in the object's metadata, and returns them on whole-object reads that ask for them.
+- 6F Conformance tests for each behavior the gateway serves: presigned GET, HEAD and PUT; expired and altered URLs; response overrides; virtual-hosted requests; grant levels and listing prefixes; copy-source grants; the SSE-C bypass; the streaming 501; the `DeleteObjects` size limit; checksums on hits.
+
+Out of scope:
+- Presigned POST uploads and caching versioned reads.
+- Per-gateway identity on nodes, and S3 credentials from IAM roles (Phase 9).
+- Kernel version checks: the spec states the kernel requirement.
+
+Completion gate:
+Each audit finding is resolved in the ledger; conformance passes against s3proxy and through the accelerator in each CI configuration; a 10,000-seed sweep passes; planted bugs are caught; `/code-review` findings are resolved.
+
+Testing plan:
+- Simulator: after a node dies, a gateway's reads pay at most one timeout per suspect window; a scan inside the fallback window gets past the doorkeeper no more than outside it; leases renew with reads spread across replicas at 55% of the promotion rate.
+- Server tests, with evidence from outside the server: a forged gossip packet leaves the ring unchanged; `strace` shows the slab's sync before a purge's confirmation; the metadata file stays bounded across restarts; a start without space fails.
+- The conformance tests in 6F.
+- Planted bugs, one per fix: a failed connection that leaves the node in rotation; unsigned gossip accepted; a purge confirmed before the slab sync; a metadata file never rewritten; a refill from S3 that skips the doorkeeper; an SSE-C upload warmed; auth parameters left in the cache key; an expired URL accepted; a `read` grant that writes; and the rest in kind.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+
+## Phase 7: Bottlenecks
+
+Goal:
+Fills run as fast as S3, the network or the drive allow, a miss holds a bounded share of the fill budget, hits keep their first-byte latency while fills run, and a node with a large drive starts quickly and keeps its index in memory.
+
+Scope:
+- 7A Profiles first: CPU profiles (`perf`) of the node and the gateway under the benchmark's fill, hit and 64 KiB range workloads, recorded in `BENCHMARKS.md`. Each later item cites the profile it answers.
+- 7B Read-ahead window (core, simulator first): a gateway asks for a response's chunks a configured number of bytes ahead of the part it relays, so a miss holds at most that much of each owner's fill budget. Failover and early ends keep their behavior. The default fill budget is revisited with the window in place.
+- 7C Fills on worker threads: the node's S3 client runs on worker threads, which receive S3's bodies, decrypt S3's TLS, relay bytes to readers and write blocks. The event loop handles heads, completions and the core's actions.
+- 7D Hit latency under fills: hits' first byte reached p99 1.19 s while fills ran. Find the queue they wait in and remove it.
+- 7E Per-request cost: a 64 KiB range hit costs 5 to 8 times the CPU per byte of a large hit. Cut the per-request work the profiles show.
+- 7F Start time and index memory at scale: the slot table holds a record for each 4 KiB of disk, and a start reads all of it, 64 GB at 4 TB; the index costs about 250 bytes per block. Measure both for a 4 TB node, set targets, and shrink them, for example with records per slot of the extent's class, a table that marks empty regions, or a smaller `BlockKey`.
+- 7G Rerun the benchmarks and record before and after in `BENCHMARKS.md`.
+
+Completion gate:
+The rerun shows a node filling past 2.1 GiB/s until the drive, the network or the stand-in limits it, with every admitted byte written; a miss holds at most the window of the fill budget; hits' p99 first byte under concurrent fills improves; a 4 TB node meets 7F's targets for start time and index memory; a 10,000-seed sweep passes; planted bugs are caught; `/code-review` findings are resolved.
+
+Testing plan:
+- Simulator: a property that a gateway's outstanding chunks per response stay within the window; a scenario where a large miss under a small fill budget is admitted in full.
+- Server, with evidence from outside the server: per-thread CPU from `/proc/<pid>/task/*/stat` shows S3's bodies received off the event loop; a restart over a large sparse slab file measures start time.
+- Planted bugs: a gateway that asks for every chunk at once; a window that ignores its bound; a restart that skips part of the slot table.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+
+## Phase 8: Observability
+
+Goal:
+An operator sees what each gateway and node does: traffic by outcome, cache efficiency, fill and store pressure, the health of S3 and peers, membership, and whether zero-copy and kernel TLS are in use.
+
+Scope:
+- 8A Spec section: the metrics with their names, types and labels; the health and readiness endpoints; the log format; and the rule that metrics cost the hit path nothing measurable.
+- 8B Core counters: the core counts what it decides (hits, misses by reason, admissions and doorkeeper rejections, evictions by cause, fill budget in use, leases, ring changes, fallback reads, purges) in its state, and its owner reads them. The server measures latency, so the core still reads no clocks.
+- 8C Server metrics in Prometheus's text format on an admin listener: requests and latency histograms by operation and outcome; bytes by source (cache, S3, previous owner); S3 latency and errors; peer failures; store occupancy by size class; sync latency; relay errors; TLS sessions by kind; event queue lag; membership and ring version. Each thread keeps its own counters and histograms, merged on scrape.
+- 8D `/healthz` and `/readyz` on the admin listener; a node is ready once its store has recovered and it knows the ring.
+- 8E Structured logs with levels set in config, and a request ID that follows a read from the gateway through the nodes to S3.
+
+Out of scope:
+- Distributed tracing.
+
+Completion gate:
+Metrics agree with outside observations in server tests; benchmarks with metrics on stay within 2% of Phase 7's results; a 10,000-seed sweep with the counter property passes; planted bugs are caught; `/code-review` findings are resolved.
+
+Testing plan:
+- Simulator property: the core's hit and miss counts agree with the model's record of which reads reached S3.
+- Server tests: after a scripted workload, `/metrics` matches the S3 stand-in's request log and the clients' byte counts; readiness waits for recovery and the ring.
+- Planted bugs: a miss counted as a hit; S3's bytes counted as cache bytes; a node ready before recovery.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+
+## Phase 9: Metadata Service
+
+Goal:
+An external metadata service holds the authoritative auth state: client credentials and grants, gateway identities and grants, and the nodes' S3 credentials. Gateways and nodes stream that state from it, cache it in memory, and keep serving through the service's outages.
+
+Scope:
+- 9A Spec section for the resources and the protocol, modeled on Envoy's xDS, as netfence's control-plane client uses it, plus the versions and nonces netfence leaves out:
+  - One gRPC bidirectional stream per gateway or node, over mutual TLS, carrying typed resources: credentials, grants, gateway identities and S3 credentials.
+  - State of the world per resource type, each response versioned and carrying a nonce. A client validates a set before applying it, then ACKs its version, or NACKs with the error and keeps its last good set. On reconnect the client names the versions it holds, and the service sends what changed since.
+  - Connection epochs drop stale messages; jittered backoff resets only after a connection stays up; keepalives find dead links.
+  - Gateways receive derived SigV4 signing keys for each credential, per date, region and service, covering presigned URLs' seven days, so no gateway holds a client's secret key.
+  - How long a client serves from its last good set after it loses the service, and that it fails closed after that.
+- 9B The service: a Rust binary in this workspace (tonic), an authoritative store (SQLite first), an admin API that creates, rotates and revokes credentials and grants, and watches that push each change to subscribed streams.
+- 9C Clients in gateways and nodes: the stream, the in-memory cache, ACKs and NACKs, reconnect and resume. The config file remains a static source for single-process development.
+- 9D Per-gateway identity: each gateway presents its own certificate to nodes, and nodes enforce that gateway's grants on every request, in place of the shared secret.
+- 9E S3 credentials for nodes, from the service or from AWS's credential chain (instance role, web identity), with session tokens and refresh before expiry.
+
+Out of scope:
+- A replicated service, and tenants.
+
+Completion gate:
+A revoked credential stops working at every gateway within the bound the spec sets; gateways and nodes keep serving through an outage of the service and fail closed after the bound; a gateway reaches only what its grants allow; conformance passes with credentials from the service; planted bugs are caught; `/code-review` findings are resolved.
+
+Testing plan:
+- Integration tests over loopback, after netfence's: reconnect and resume; a delayed ACK from an older stream; a NACKed set left unapplied; a proxy that blackholes the stream, which keepalives detect; mutual TLS failures.
+- Revocation time, measured from the admin call to the first refused request.
+- Conformance through the accelerator with credentials from the service.
+- Planted bugs: a NACKed set applied; a revoked key accepted after its push; a reconnect that keeps a stale version; nodes that ignore a gateway's identity; an expired session token used for S3.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
