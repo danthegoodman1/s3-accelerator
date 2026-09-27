@@ -33,7 +33,7 @@ pub struct Config {
 pub struct ClusterConfig {
     pub secret: String,
     /// The nodes a process starts with. Nodes gossip, so one missing here
-    /// joins through the others; a gateway reaches only nodes named here.
+    /// joins through the others, and gateways learn nodes from rings.
     pub nodes: Vec<ClusterNode>,
     #[serde(default)]
     pub membership: MembershipConfig,

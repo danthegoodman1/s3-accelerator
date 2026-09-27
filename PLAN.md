@@ -386,6 +386,7 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
+| Complete | Work | 6A: Spec corrections | `spec.md` now says: `versionId`, date conditionals, ETag lists, wildcards and weak ETags, `partNumber` and other query parameters pass through; freshness and admission are per bucket, under the config's keys; `[events]` is one queue over each bucket's TTL; node weights are configured; no replica invalidation; warming replaces metadata after its HEAD; only a timeout stops asking a previous owner; waiters share 404s and 5xx; config-named nodes start down; `SIGUSR1` leaves; the doorkeeper's window counts first reads; extent-size changes; where the store makes room past a busy extent; prefetch within the fill budget; the S3 access key; the streaming 501s; the shared cluster secret. `crates/core/tests/memory.rs` measures the index with a counting allocator: 495 bytes per 1 MiB block and 417 per 4 KiB block, against the 100 the spec stated. `config.rs`'s comment on which nodes gateways reach is corrected. |
 
 ## Phase 7: Bottlenecks
 
