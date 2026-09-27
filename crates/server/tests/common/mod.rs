@@ -5,7 +5,7 @@
 
 use s3_accelerator::config::Config;
 use s3_accelerator::http::{Connection, Response};
-use s3_accelerator::server;
+use s3_accelerator::server::{self, Listeners};
 use s3_accelerator::sigv4::{self, Credentials, Signer, UNSIGNED_PAYLOAD};
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -32,6 +32,8 @@ pub struct Origin {
     pub deleted: Cell<bool>,
     /// Each request's path, as it arrived.
     pub paths: RefCell<Vec<String>>,
+    /// How long it waits before each answer.
+    pub delay: Cell<std::time::Duration>,
 }
 
 /// Serves one object at any path, honoring `Range` and `If-Match`, until a
@@ -61,6 +63,7 @@ async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
                     }
                     _ => (200, Vec::new()),
                 };
+                tokio::time::sleep(origin.delay.get()).await;
                 let response = Response {
                     status,
                     headers,
@@ -150,9 +153,11 @@ impl Server {
     /// Starts a server in front of the S3 at `origin_port`, keeping its
     /// disk in `dir`. `extra` is appended to its config.
     pub async fn start(origin_port: u16, dir: &Path, grants: &str, extra: &str) -> Server {
+        let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_address = node.local_addr().unwrap();
         let config: Config = toml::from_str(&format!(
             r#"
-            listen = "unused"
             {extra}
             [origin]
             endpoint = "http://127.0.0.1:{origin_port}"
@@ -164,18 +169,29 @@ impl Server {
             secret_access_key = "reader-secret"
             grants = [{grants}]
             [cache]
-            data_dir = "{}"
             block_size = 65536
             extent_size = 1048576
             extents = 8
             [cache.default_policy]
             ttl_ms = 60000
+            [cluster]
+            secret = "cluster-secret"
+            nodes = [{{ id = 0, address = "{node_address}" }}]
+            [gateway]
+            listen = "unused"
+            [node]
+            id = 0
+            data_dir = "{}"
             "#,
             dir.display()
         ))
         .unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        config.check().unwrap();
+        let port = gateway.local_addr().unwrap().port();
+        let listeners = Listeners {
+            gateway: Some(gateway),
+            node: Some(node),
+        };
         let (stop, stopped) = oneshot::channel::<()>();
         // A server whose handle is dropped runs until the test ends.
         let stopped = async move {
@@ -183,7 +199,7 @@ impl Server {
                 std::future::pending::<()>().await;
             }
         };
-        let done = tokio::task::spawn_local(server::run(listener, config, stopped));
+        let done = tokio::task::spawn_local(server::run(config, listeners, stopped));
         Server { port, stop, done }
     }
 

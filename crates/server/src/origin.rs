@@ -1,10 +1,10 @@
 //! The S3 origin: signed requests from this node, with the cluster's
 //! credentials.
 
-use crate::http::header;
+use crate::http::{format_range, header, parse_content_range};
 use crate::sigv4::{self, Credentials, Signer, UNSIGNED_PAYLOAD};
 use bytes::Bytes;
-use s3_accelerator_core::s3::{ByteRange, ContentRange, ETag, Method, Request, ResponseHead};
+use s3_accelerator_core::s3::{ETag, Method, Request, ResponseHead};
 use std::time::Duration;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -81,7 +81,7 @@ impl Origin {
         );
         let mut headers = Vec::new();
         if let Some(range) = request.range {
-            headers.push(("range".to_string(), range_header(range)));
+            headers.push(("range".to_string(), format_range(range)));
         }
         if let Some(etag) = &request.if_match {
             headers.push(("if-match".to_string(), etag.0.clone()));
@@ -178,14 +178,6 @@ impl Origin {
     }
 }
 
-fn range_header(range: ByteRange) -> String {
-    match range {
-        ByteRange::Inclusive { first, last } => format!("bytes={first}-{last}"),
-        ByteRange::From { first } => format!("bytes={first}-"),
-        ByteRange::Suffix { length } => format!("bytes=-{length}"),
-    }
-}
-
 /// What the core reads from S3's response.
 fn response_head(response: &Forwarded, method: Method) -> ResponseHead {
     let header = |name: &str| header(&response.headers, name);
@@ -211,7 +203,7 @@ fn response_head(response: &Forwarded, method: Method) -> ResponseHead {
 
 /// Headers that describe the object rather than the response, which the
 /// cache stores and replays.
-fn is_object_header(name: &str) -> bool {
+pub fn is_object_header(name: &str) -> bool {
     const OBJECT_HEADERS: [&str; 19] = [
         "cache-control",
         "content-disposition",
@@ -235,37 +227,4 @@ fn is_object_header(name: &str) -> bool {
     ];
     let name = name.to_ascii_lowercase();
     name.starts_with("x-amz-meta-") || OBJECT_HEADERS.contains(&name.as_str())
-}
-
-/// `bytes first-last/size`.
-fn parse_content_range(value: &str) -> Option<ContentRange> {
-    let (span, size) = value.strip_prefix("bytes ")?.split_once('/')?;
-    let (first, last) = span.split_once('-')?;
-    Some(ContentRange {
-        first: first.parse().ok()?,
-        last: last.parse().ok()?,
-        size: size.parse().ok()?,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_content_range() {
-        let range = parse_content_range("bytes 5-9/100").unwrap();
-        assert_eq!((range.first, range.last, range.size), (5, 9, 100));
-        assert_eq!(parse_content_range("bytes */100"), None);
-    }
-
-    #[test]
-    fn formats_ranges() {
-        assert_eq!(
-            range_header(ByteRange::Inclusive { first: 1, last: 2 }),
-            "bytes=1-2"
-        );
-        assert_eq!(range_header(ByteRange::From { first: 7 }), "bytes=7-");
-        assert_eq!(range_header(ByteRange::Suffix { length: 3 }), "bytes=-3");
-    }
 }

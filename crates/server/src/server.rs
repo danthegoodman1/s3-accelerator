@@ -4,28 +4,29 @@
 
 use crate::config::{Client, Config};
 use crate::disk::Disk;
-use crate::engine::{Answer, Engine, Shared};
-use crate::http::header;
+use crate::gateway_engine::{Answer, GatewayEngine, SharedGateway};
 use crate::http::{Connection, RequestHead, Response};
+use crate::http::{etag_condition, header, parse_range};
+use crate::node_engine::{self, NodeEngine};
 use crate::origin::Origin;
 use crate::sigv4::{self, AuthError, Credentials, Signable};
 use bytes::Bytes;
 use percent_encoding::percent_decode_str;
 use s3_accelerator_core::node::Node;
-use s3_accelerator_core::placement::{Member, NodeId, Ring};
-use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
+use s3_accelerator_core::placement::NodeId;
+use s3_accelerator_core::s3::{Method, ObjectKey, Request, ResponseHead};
 use sha2::{Digest, Sha256};
 use std::io;
-use std::num::NonZeroU32;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
 
 struct Context {
-    engine: Shared,
+    gateway: SharedGateway,
     origin: Rc<Origin>,
     clients: Vec<Client>,
     /// The largest body held in memory, uploaded or fetched.
@@ -33,8 +34,18 @@ struct Context {
 }
 
 pub async fn serve(config: Config) -> io::Result<()> {
-    let listener = TcpListener::bind(&config.listen).await?;
-    eprintln!("s3-accelerator listening on {}", listener.local_addr()?);
+    let mut listeners = Listeners::default();
+    if let Some(gateway) = &config.gateway {
+        let listener = TcpListener::bind(&gateway.listen).await?;
+        eprintln!("gateway listening on {}", listener.local_addr()?);
+        listeners.gateway = Some(listener);
+    }
+    if let Some(node) = &config.node {
+        let address = &config.addresses()[&NodeId(node.id)];
+        let listener = TcpListener::bind(address).await?;
+        eprintln!("node {} listening on {}", node.id, listener.local_addr()?);
+        listeners.node = Some(listener);
+    }
     let mut terminate = signal(SignalKind::terminate())?;
     let stop = async move {
         tokio::select! {
@@ -42,16 +53,23 @@ pub async fn serve(config: Config) -> io::Result<()> {
             _ = tokio::signal::ctrl_c() => {}
         }
     };
-    run(listener, config, stop).await
+    run(config, listeners, stop).await
 }
 
-/// Serves clients on `listener`, ignoring `config.listen`, until `stop`
-/// completes; then waits for work in progress and shuts the node's disk
+/// Where a process's gateway takes S3 clients and its node takes gateways.
+#[derive(Default)]
+pub struct Listeners {
+    pub gateway: Option<TcpListener>,
+    pub node: Option<TcpListener>,
+}
+
+/// Serves the gateway and node the config names on `listeners` until `stop`
+/// completes; the node then waits for work in progress and shuts its disk
 /// down cleanly. Runs on a `LocalSet`.
 pub async fn run(
-    listener: TcpListener,
     config: Config,
-    stop: impl Future<Output = ()>,
+    listeners: Listeners,
+    stop: impl Future<Output = ()> + 'static,
 ) -> io::Result<()> {
     let credentials = Credentials {
         access_key_id: config.origin.access_key_id.clone(),
@@ -63,38 +81,72 @@ pub async fn run(
         credentials,
         config.max_body,
     ));
-    let node_config = config.cache.node_config();
-    let (disk, recovery) = Disk::open(Path::new(&config.cache.data_dir), node_config.store)?;
-    let member = Member {
-        id: NodeId(0),
-        weight: NonZeroU32::MIN,
-    };
-    let ring = Ring::new(1, vec![member]);
-    let node = Node::recover(
-        NodeId(0),
-        ring.clone(),
-        node_config,
-        recovery.records,
-        recovery.metadata,
-    );
-    let context = Rc::new(Context {
-        engine: Engine::new(
-            node,
-            ring,
-            config.cache.gateway_config(),
-            origin.clone(),
-            Arc::new(disk),
-        ),
-        origin,
-        clients: config.clients,
-        max_body: config.max_body,
-    });
-    let ticking = context.engine.clone();
+    let secret: Rc<str> = config.cluster.secret.as_str().into();
+    let (stopping, stopped) = watch::channel(false);
     tokio::task::spawn_local(async move {
+        stop.await;
+        let _ = stopping.send(true);
+    });
+    let node = match (&config.node, listeners.node) {
+        (Some(node), Some(listener)) => {
+            let node_config = config.cache.node_config();
+            let (disk, recovery) = Disk::open(Path::new(&node.data_dir), node_config.store)?;
+            let recovered = Node::recover(
+                NodeId(node.id),
+                config.ring(),
+                node_config,
+                recovery.records,
+                recovery.metadata,
+            );
+            let engine = NodeEngine::new(recovered, origin.clone(), Arc::new(disk));
+            let stop = stopped_signal(stopped.clone());
+            Some(tokio::task::spawn_local(node_engine::serve(
+                listener,
+                engine,
+                secret.clone(),
+                stop,
+            )))
+        }
+        _ => None,
+    };
+    if let (Some(_), Some(listener)) = (&config.gateway, listeners.gateway) {
+        let gateway = GatewayEngine::new(
+            config.ring(),
+            config.cache.gateway_config(),
+            config.addresses(),
+            secret,
+        );
+        let context = Rc::new(Context {
+            gateway,
+            origin,
+            clients: config.clients,
+            max_body: config.max_body,
+        });
+        serve_clients(listener, context, stopped_signal(stopped)).await?;
+    }
+    match node {
+        Some(node) => node.await.map_err(io::Error::other)?,
+        None => Ok(()),
+    }
+}
+
+/// Completes once `run`'s stop has.
+async fn stopped_signal(mut stopped: watch::Receiver<bool>) {
+    let _ = stopped.wait_for(|stopped| *stopped).await;
+}
+
+/// Serves S3 clients on `listener` until `stop` completes.
+async fn serve_clients(
+    listener: TcpListener,
+    context: Rc<Context>,
+    stop: impl Future<Output = ()>,
+) -> io::Result<()> {
+    let ticking = context.gateway.clone();
+    let ticker = tokio::task::spawn_local(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
             interval.tick().await;
-            Engine::tick(&ticking);
+            GatewayEngine::tick(&ticking);
         }
     });
     tokio::pin!(stop);
@@ -111,16 +163,9 @@ pub async fn run(
             }
         });
     }
-    drop(listener);
-    let deadline = tokio::time::Instant::now() + SHUTDOWN_WAIT;
-    while !Engine::is_idle(&context.engine) && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Engine::shut_down(&context.engine)
+    ticker.abort();
+    Ok(())
 }
-
-/// How long a shutdown waits for work in progress.
-const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
 
 async fn connection(stream: TcpStream, context: &Context) -> io::Result<()> {
     let mut connection = Connection::new(stream);
@@ -267,7 +312,7 @@ fn cacheable(head: &RequestHead, bucket: &str, key: &str) -> Option<Request> {
 
 async fn read(request: Request, context: &Context) -> Response {
     let method = request.method;
-    let Ok(Answer { head, body }) = Engine::read(&context.engine, request).await else {
+    let Ok(Answer { head, body }) = GatewayEngine::read(&context.gateway, request).await else {
         return error(500, "InternalError", "the request was dropped");
     };
     let mut headers = vec![("Accept-Ranges".to_string(), "bytes".to_string())];
@@ -332,7 +377,7 @@ async fn forward(
                 bucket: bucket.to_string(),
                 key,
             };
-            Engine::write_succeeded(&context.engine, &key);
+            GatewayEngine::written(&context.gateway, &key);
         }
     }
     let content_length = match head.method.as_str() {
@@ -407,46 +452,6 @@ fn split_path(path: &str) -> (String, String) {
     (decode(bucket), decode(key))
 }
 
-/// A single `Range: bytes=` range. S3 serves the whole object for anything
-/// else, so the rest become no range.
-fn parse_range(value: &str) -> Option<ByteRange> {
-    let spec = value.trim().strip_prefix("bytes=")?;
-    if spec.contains(',') {
-        return None;
-    }
-    let (first, last) = spec.split_once('-')?;
-    let number = |text: &str| text.trim().parse::<u64>().ok();
-    match (first.trim(), last.trim()) {
-        ("", length) => Some(ByteRange::Suffix {
-            length: number(length)?,
-        }),
-        (first, "") => Some(ByteRange::From {
-            first: number(first)?,
-        }),
-        (first, last) => Some(ByteRange::Inclusive {
-            first: number(first)?,
-            last: number(last)?,
-        }),
-    }
-}
-
-/// An `If-Match` or `If-None-Match` the core can evaluate: `Some(None)`
-/// when absent, `None` when it lists several tags or `*`, which pass
-/// through to S3.
-fn etag_condition(value: Option<&str>) -> Option<Option<ETag>> {
-    let Some(value) = value.map(str::trim) else {
-        return Some(None);
-    };
-    if value == "*" || value.contains(',') || value.starts_with("W/") {
-        return None;
-    }
-    let quoted = match value.starts_with('"') {
-        true => value.to_string(),
-        false => format!("\"{value}\""),
-    };
-    Some(Some(ETag(quoted)))
-}
-
 fn auth_error(failure: AuthError) -> Response {
     let code = match failure {
         AuthError::Missing => "AccessDenied",
@@ -513,21 +518,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_ranges_as_s3_does() {
-        assert_eq!(
-            parse_range("bytes=0-9"),
-            Some(ByteRange::Inclusive { first: 0, last: 9 })
-        );
-        assert_eq!(parse_range("bytes=5-"), Some(ByteRange::From { first: 5 }));
-        assert_eq!(
-            parse_range("bytes=-5"),
-            Some(ByteRange::Suffix { length: 5 })
-        );
-        assert_eq!(parse_range("bytes=0-1,4-5"), None);
-        assert_eq!(parse_range("items=0-1"), None);
-    }
-
-    #[test]
     fn reads_copy_sources() {
         assert_eq!(
             copy_source("logs/a%20b?versionId=3"),
@@ -541,17 +531,5 @@ mod tests {
         let xml =
             "<Delete><Object><Key>a&amp;b</Key></Object><Object><Key>c/d</Key></Object></Delete>";
         assert_eq!(listed_keys(xml), ["a&b", "c/d"]);
-    }
-
-    #[test]
-    fn passes_complex_preconditions_to_s3() {
-        assert_eq!(etag_condition(None), Some(None));
-        assert_eq!(
-            etag_condition(Some("\"a\"")),
-            Some(Some(ETag("\"a\"".into())))
-        );
-        assert_eq!(etag_condition(Some("a")), Some(Some(ETag("\"a\"".into()))));
-        assert_eq!(etag_condition(Some("*")), None);
-        assert_eq!(etag_condition(Some("\"a\", \"b\"")), None);
     }
 }

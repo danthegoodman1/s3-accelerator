@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Runs a cluster of separate processes in front of the s3proxy that
+# `scripts/s3proxy` runs: storage nodes on 127.0.0.1:9101 and up, and a
+# gateway on 127.0.0.1:9000 with s3proxy's credentials, so the conformance
+# suite runs unchanged. Configs, disks and logs go in target/cluster.
+#
+#   scripts/cluster start [NODES]   # build, start, and wait until it answers
+#   scripts/cluster stop            # shut every process down cleanly
+set -euo pipefail
+
+dir=target/cluster
+binary=target/debug/s3-accelerator
+
+config() {
+  local nodes=$1 role=$2
+  cat <<TOML
+[origin]
+endpoint = "http://127.0.0.1:${S3PROXY_PORT:-8080}"
+region = "us-east-1"
+access_key_id = "local-identity"
+secret_access_key = "local-credential"
+
+[[clients]]
+access_key_id = "local-identity"
+secret_access_key = "local-credential"
+grants = [{ bucket = "*" }]
+
+[cache]
+block_size = 65536
+chunk_blocks = 4
+extent_size = 1048576
+extents = 16
+
+[cluster]
+secret = "cluster-secret"
+nodes = [$(for id in $(seq 0 $((nodes - 1))); do printf '{ id = %d, address = "127.0.0.1:%d" }, ' "$id" $((9101 + id)); done)]
+
+$role
+TOML
+}
+
+wait_for() {
+  local port=$1
+  for _ in $(seq 120); do
+    if (: <"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+      return
+    fi
+    sleep 0.5
+  done
+  echo "nothing answered on port $port" >&2
+  exit 1
+}
+
+case "${1:-}" in
+  start)
+    nodes=${2:-3}
+    cargo build -q -p s3-accelerator
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    for id in $(seq 0 $((nodes - 1))); do
+      config "$nodes" "[node]
+id = $id
+data_dir = \"$dir/node-$id\"" >"$dir/node-$id.toml"
+      "$binary" "$dir/node-$id.toml" >"$dir/node-$id.log" 2>&1 &
+      echo $! >"$dir/node-$id.pid"
+      wait_for $((9101 + id))
+    done
+    config "$nodes" '[gateway]
+listen = "127.0.0.1:9000"' >"$dir/gateway.toml"
+    "$binary" "$dir/gateway.toml" >"$dir/gateway.log" 2>&1 &
+    echo $! >"$dir/gateway.pid"
+    wait_for 9000
+    echo "a gateway and $nodes nodes are listening; logs are in $dir"
+    ;;
+  stop)
+    for pid in "$dir"/*.pid; do
+      kill -TERM "$(cat "$pid")" 2>/dev/null || true
+      rm -f "$pid"
+    done
+    ;;
+  *)
+    echo "usage: $0 start [NODES]|stop" >&2
+    exit 2
+    ;;
+esac

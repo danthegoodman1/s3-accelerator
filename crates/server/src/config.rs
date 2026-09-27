@@ -1,24 +1,123 @@
-//! The server's TOML configuration.
+//! The server's TOML configuration. A process runs a gateway, a storage
+//! node, or both, in a cluster every process describes alike.
 
 use s3_accelerator_core::gateway;
 use s3_accelerator_core::layout::Layout;
 use s3_accelerator_core::node::{self, BucketPolicy, Freshness};
+use s3_accelerator_core::placement::{Member, NodeId, Ring};
 use s3_accelerator_core::store::StoreConfig;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Where clients connect, such as `127.0.0.1:9000`.
-    pub listen: String,
     pub origin: OriginConfig,
+    #[serde(default)]
     pub clients: Vec<Client>,
     /// The largest body the server holds in memory, uploaded or fetched.
     #[serde(default = "default_max_body")]
     pub max_body: u64,
     #[serde(default)]
     pub cache: CacheConfig,
+    pub cluster: ClusterConfig,
+    pub gateway: Option<GatewayConfig>,
+    pub node: Option<NodeConfig>,
+}
+
+/// The storage nodes, and the secret that gateways and nodes share.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterConfig {
+    pub secret: String,
+    pub nodes: Vec<ClusterNode>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterNode {
+    pub id: u64,
+    /// Where gateways reach the node, such as `10.0.0.1:9100`; the node
+    /// listens there.
+    pub address: String,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+fn default_weight() -> u32 {
+    1
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayConfig {
+    /// Where S3 clients connect, such as `127.0.0.1:9000`.
+    pub listen: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeConfig {
+    /// This node's entry in `cluster.nodes`.
+    pub id: u64,
+    /// Where the node keeps its slab file, slot table and metadata file.
+    pub data_dir: String,
+}
+
+impl Config {
+    /// Settings a process could not run with.
+    pub fn check(&self) -> Result<(), String> {
+        if self.gateway.is_none() && self.node.is_none() {
+            return Err("the config runs neither a gateway nor a node".into());
+        }
+        if self.cluster.secret.is_empty() {
+            return Err("cluster.secret is empty".into());
+        }
+        let mut ids = BTreeSet::new();
+        for node in &self.cluster.nodes {
+            if !ids.insert(node.id) {
+                return Err(format!("node {} appears twice in cluster.nodes", node.id));
+            }
+            if node.weight == 0 {
+                return Err(format!("node {} has weight 0", node.id));
+            }
+        }
+        if let Some(node) = &self.node {
+            if !ids.contains(&node.id) {
+                return Err(format!("node {} is not in cluster.nodes", node.id));
+            }
+            if node.data_dir.is_empty() {
+                return Err("node.data_dir names no directory".into());
+            }
+        }
+        if ids.is_empty() {
+            return Err("cluster.nodes is empty".into());
+        }
+        self.cache.check()
+    }
+
+    pub fn ring(&self) -> Ring {
+        let members = self
+            .cluster
+            .nodes
+            .iter()
+            .map(|node| Member {
+                id: NodeId(node.id),
+                weight: NonZeroU32::new(node.weight).unwrap_or(NonZeroU32::MIN),
+            })
+            .collect();
+        Ring::new(1, members)
+    }
+
+    /// Where gateways reach each node.
+    pub fn addresses(&self) -> BTreeMap<NodeId, String> {
+        self.cluster
+            .nodes
+            .iter()
+            .map(|node| (NodeId(node.id), node.address.clone()))
+            .collect()
+    }
 }
 
 fn default_max_body() -> u64 {
@@ -66,8 +165,6 @@ impl Client {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
-    /// Where the node keeps its slab file, slot table and metadata file.
-    pub data_dir: String,
     pub block_size: u64,
     pub chunk_blocks: u64,
     pub extent_size: u64,
@@ -94,7 +191,6 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> CacheConfig {
         CacheConfig {
-            data_dir: String::new(),
             block_size: 1 << 20,
             chunk_blocks: 16,
             extent_size: 64 << 20,
@@ -149,9 +245,6 @@ impl PolicyConfig {
 impl CacheConfig {
     /// Settings the core would misbehave under.
     pub fn check(&self) -> Result<(), String> {
-        if self.data_dir.is_empty() {
-            return Err("cache.data_dir names no directory".into());
-        }
         if self.node_timeout_ms < 2 * self.origin_timeout_ms {
             return Err(format!(
                 "node_timeout_ms ({}) must be at least twice origin_timeout_ms ({}): a node may wait out one S3 timeout and fetch again",
@@ -205,8 +298,6 @@ mod tests {
     fn parses_a_minimal_config() {
         let config: Config = toml::from_str(
             r#"
-            listen = "127.0.0.1:9000"
-
             [origin]
             endpoint = "http://127.0.0.1:8080"
             region = "us-east-1"
@@ -220,6 +311,17 @@ mod tests {
 
             [cache.buckets.parquet]
             immutable = true
+
+            [cluster]
+            secret = "cluster-secret"
+            nodes = [{ id = 0, address = "127.0.0.1:9100" }]
+
+            [gateway]
+            listen = "127.0.0.1:9000"
+
+            [node]
+            id = 0
+            data_dir = "/tmp/cache"
             "#,
         )
         .unwrap();
@@ -227,6 +329,7 @@ mod tests {
         assert!(client.may_access("logs", "2026/01/a"));
         assert!(!client.may_access("logs", "2025/12/a"));
         assert!(!client.may_access("other", "2026/01/a"));
+        assert_eq!(config.check(), Ok(()));
         let node = config.cache.node_config();
         assert_eq!(node.buckets["parquet"].freshness, Freshness::Immutable);
         assert_eq!(node.default_policy.freshness, Freshness::Ttl(5_000));

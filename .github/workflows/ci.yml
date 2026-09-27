@@ -32,8 +32,16 @@ jobs:
       - name: Conformance through the accelerator
         run: |
           target/debug/s3-accelerator config/local.toml &
+          server=$!
           for _ in $(seq 60); do curl -s -o /dev/null http://127.0.0.1:9000/ && break; sleep 0.5; done
           CONFORMANCE_ENDPOINT=http://127.0.0.1:9000 cargo test -p s3-accelerator-conformance -- --ignored
+          kill -TERM "$server"
+          wait "$server"
+      - name: Conformance through a multi-process cluster
+        run: |
+          scripts/cluster start 3
+          CONFORMANCE_ENDPOINT=http://127.0.0.1:9000 cargo test -p s3-accelerator-conformance -- --ignored
+          scripts/cluster stop
 
   simulate:
     runs-on: ubuntu-latest

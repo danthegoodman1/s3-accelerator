@@ -1,46 +1,44 @@
-//! Runs the core's gateway and storage node on this thread and carries out
-//! their actions: fetches from S3, block reads and writes on the node's
-//! disk, and answers to clients. Block writes and verifications run on
-//! blocking worker threads.
+//! A storage node: runs the core's node on this thread, serves gateways'
+//! reads over the cluster protocol, and carries out the node's actions:
+//! fetches from S3, and block reads and writes on its disk. Block writes and
+//! verifications run on blocking worker threads.
 
 use crate::disk::Disk;
+use crate::http::{Connection, Response, header};
 use crate::origin::Origin;
+use crate::protocol::{self, NodeAnswer, NodeRequest};
 use bytes::Bytes;
 use s3_accelerator_core::Time;
-use s3_accelerator_core::gateway::{self, ClientRequestId, Gateway, NodeRequestId};
-use s3_accelerator_core::node::{self, GatewayRequestId, Node, OriginRequestId, Segment};
-use s3_accelerator_core::placement::Ring;
-use s3_accelerator_core::s3::{ObjectKey, Request, ResponseHead};
+use s3_accelerator_core::node::{self, GatewayRequestId, Node, OriginRequestId, Read, Segment};
+use s3_accelerator_core::s3::{Method, ObjectKey, Request};
 use s3_accelerator_core::store::Location;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
-pub struct Answer {
-    pub head: ResponseHead,
+pub type SharedNode = Rc<RefCell<NodeEngine>>;
+
+/// A node's answer to a gateway, with its body.
+pub struct Reply {
+    pub answer: NodeAnswer,
     pub body: Bytes,
 }
 
-pub type Shared = Rc<RefCell<Engine>>;
-
-pub struct Engine {
+pub struct NodeEngine {
     started: Instant,
     origin: Rc<Origin>,
     disk: Arc<Disk>,
-    gateway: Gateway,
     node: Node,
     /// S3 response bodies the node still reads.
     bodies: BTreeMap<OriginRequestId, Bytes>,
     next_id: u64,
-    clients: BTreeMap<ClientRequestId, oneshot::Sender<Answer>>,
-    node_requests: BTreeMap<GatewayRequestId, NodeRequestId>,
-    relayed: BTreeMap<NodeRequestId, Bytes>,
-    /// Client responses the gateway started, and their bodies so far.
-    responses: BTreeMap<ClientRequestId, (ResponseHead, Vec<Bytes>)>,
+    /// Gateways' reads waiting for the node's answer.
+    replies: BTreeMap<GatewayRequestId, oneshot::Sender<Reply>>,
     work: Work,
     /// S3 requests in flight, which a cancellation aborts.
     tasks: BTreeMap<OriginRequestId, tokio::task::AbortHandle>,
@@ -48,7 +46,7 @@ pub struct Engine {
     unsynced_metadata: bool,
 }
 
-/// What the core's actions left to start off this thread.
+/// What the node's actions left to start off this thread.
 #[derive(Default)]
 struct Work {
     fetches: Vec<(OriginRequestId, Request)>,
@@ -57,26 +55,16 @@ struct Work {
     verifies: Vec<(Location, u64, u64)>,
 }
 
-impl Engine {
-    pub fn new(
-        node: Node,
-        ring: Ring,
-        gateway: gateway::Config,
-        origin: Rc<Origin>,
-        disk: Arc<Disk>,
-    ) -> Shared {
-        let engine = Rc::new(RefCell::new(Engine {
+impl NodeEngine {
+    pub fn new(node: Node, origin: Rc<Origin>, disk: Arc<Disk>) -> SharedNode {
+        let engine = Rc::new(RefCell::new(NodeEngine {
             started: Instant::now(),
             origin,
             disk,
-            gateway: Gateway::new(ring, gateway),
             node,
             bodies: BTreeMap::new(),
             next_id: 0,
-            clients: BTreeMap::new(),
-            node_requests: BTreeMap::new(),
-            relayed: BTreeMap::new(),
-            responses: BTreeMap::new(),
+            replies: BTreeMap::new(),
             work: Work::default(),
             tasks: BTreeMap::new(),
             unsynced_metadata: false,
@@ -87,29 +75,38 @@ impl Engine {
         engine
     }
 
-    /// Serves a `GetObject` or `HeadObject`; the answer arrives on the
-    /// receiver.
-    pub fn read(engine: &Shared, request: Request) -> oneshot::Receiver<Answer> {
+    /// Serves a gateway's read; the answer arrives on the receiver.
+    pub fn read(engine: &SharedNode, read: Read) -> oneshot::Receiver<Reply> {
         let (sender, receiver) = oneshot::channel();
         let work = {
             let mut this = engine.borrow_mut();
-            let id = ClientRequestId(this.next_id());
-            this.clients.insert(id, sender);
+            this.next_id += 1;
+            let id = GatewayRequestId(this.next_id);
+            this.replies.insert(id, sender);
             let now = this.now();
-            this.gateway.on_request(now, id, request);
+            this.node.on_request(now, id, read);
             this.pump()
         };
         start(engine, work);
         receiver
     }
 
-    /// Lets the core's timeouts run: nodes give up on S3 requests, and
-    /// gateways fail over from nodes.
-    pub fn tick(engine: &Shared) {
+    /// A write to `key` passed through a gateway and succeeded.
+    pub fn written(engine: &SharedNode, key: &ObjectKey) {
         let work = {
             let mut this = engine.borrow_mut();
             let now = this.now();
-            this.gateway.on_tick(now);
+            this.node.on_write(now, key);
+            this.pump()
+        };
+        start(engine, work);
+    }
+
+    /// Lets the node's timeouts run, and syncs the metadata file.
+    pub fn tick(engine: &SharedNode) {
+        let work = {
+            let mut this = engine.borrow_mut();
+            let now = this.now();
             this.node.on_tick(now);
             if std::mem::take(&mut this.unsynced_metadata) {
                 let disk = this.disk.clone();
@@ -124,95 +121,30 @@ impl Engine {
         start(engine, work);
     }
 
-    /// A write to `key` passed through to S3 and succeeded.
-    pub fn write_succeeded(engine: &Shared, key: &ObjectKey) {
-        let work = {
-            let mut this = engine.borrow_mut();
-            let now = this.now();
-            this.node.on_write(now, key);
-            this.gateway.on_write(now, key);
-            this.pump()
-        };
-        start(engine, work);
-    }
-
-    /// True when neither the gateway nor the node has work in progress.
-    pub fn is_idle(engine: &Shared) -> bool {
-        let this = engine.borrow();
-        this.gateway.is_idle() && this.node.is_idle()
+    pub fn is_idle(engine: &SharedNode) -> bool {
+        engine.borrow().node.is_idle()
     }
 
     /// Syncs the disk and marks its slot table clean. Call once idle.
-    pub fn shut_down(engine: &Shared) -> io::Result<()> {
+    pub fn shut_down(engine: &SharedNode) -> io::Result<()> {
         engine.borrow().disk.shut_down()
     }
 
-    /// Carries out every action until the core has none left, and returns
+    /// Carries out every action until the node has none left, and returns
     /// the work to start off this thread.
     fn pump(&mut self) -> Work {
         loop {
-            let gateway_actions = self.gateway.drain();
-            let node_actions = self.node.drain();
-            if gateway_actions.is_empty() && node_actions.is_empty() {
+            let actions = self.node.drain();
+            if actions.is_empty() {
                 return std::mem::take(&mut self.work);
             }
-            for action in gateway_actions {
-                self.gateway_action(action);
-            }
-            for action in node_actions {
-                self.node_action(action);
+            for action in actions {
+                self.act(action);
             }
         }
     }
 
-    fn gateway_action(&mut self, action: gateway::Action) {
-        match action {
-            gateway::Action::Send { id, read, .. } => {
-                let local = GatewayRequestId(self.next_id());
-                self.node_requests.insert(local, id);
-                let now = self.now();
-                self.node.on_request(now, local, read);
-            }
-            gateway::Action::Start { request, head } => {
-                self.responses.insert(request, (head, Vec::new()));
-            }
-            gateway::Action::Forward { request, from, len } => {
-                let now = self.now();
-                // Every node's body is here before the gateway forwards it;
-                // a missing one is a bug, and the client gets an error, not
-                // a body from elsewhere.
-                let Some(bytes) = self.relayed.remove(&from) else {
-                    self.responses.remove(&request);
-                    self.answer(request, ResponseHead::status(500), Bytes::new());
-                    return self.gateway.on_forwarded(now, from, len);
-                };
-                let bytes = bytes.slice(..bytes.len().min(len as usize));
-                let copied = bytes.len() as u64;
-                if let Some((head, parts)) = self.responses.get_mut(&request) {
-                    parts.push(bytes);
-                    let sent: usize = parts.iter().map(Bytes::len).sum();
-                    if sent as u64 == head.content_length {
-                        let (head, parts) = self.responses.remove(&request).expect("started");
-                        self.answer(request, head, concat(parts));
-                    }
-                }
-                self.gateway.on_forwarded(now, from, copied);
-            }
-            // The client gets the body so far, and the connection closes.
-            gateway::Action::Abort { request } => {
-                if let Some((head, parts)) = self.responses.remove(&request) {
-                    self.answer(request, head, concat(parts));
-                }
-            }
-            gateway::Action::Respond { request, head } => self.answer(request, head, Bytes::new()),
-            gateway::Action::Discard { id } => {
-                self.relayed.remove(&id);
-            }
-        }
-    }
-
-    fn node_action(&mut self, action: node::Action) {
-        let now = self.now();
+    fn act(&mut self, action: node::Action) {
         match action {
             node::Action::Fetch {
                 origin, request, ..
@@ -223,28 +155,15 @@ impl Engine {
                 body,
                 meta,
             } => {
-                let bytes = self.assemble(&body);
-                let id = self
-                    .node_requests
-                    .remove(&request)
-                    .expect("a gateway asked");
-                self.relayed.insert(id, bytes);
-                self.gateway.on_node_response(now, id, head, meta);
+                let body = self.assemble(&body);
+                self.reply(request, NodeAnswer::Respond { head, meta }, body);
                 self.node.on_sent(request);
             }
             node::Action::Metadata { request, meta } => {
-                let id = self
-                    .node_requests
-                    .remove(&request)
-                    .expect("a gateway asked");
-                self.gateway.on_node_metadata(now, id, meta);
+                self.reply(request, NodeAnswer::Metadata(meta), Bytes::new());
             }
             node::Action::Stale { request } => {
-                let id = self
-                    .node_requests
-                    .remove(&request)
-                    .expect("a gateway asked");
-                self.gateway.on_node_stale(now, id);
+                self.reply(request, NodeAnswer::Stale, Bytes::new());
             }
             node::Action::Write {
                 location,
@@ -284,6 +203,13 @@ impl Engine {
                     task.abort();
                 }
             }
+        }
+    }
+
+    fn reply(&mut self, request: GatewayRequestId, answer: NodeAnswer, body: Bytes) {
+        if let Some(reply) = self.replies.remove(&request) {
+            // The gateway may have hung up.
+            let _ = reply.send(Reply { answer, body });
         }
     }
 
@@ -334,26 +260,14 @@ impl Engine {
         }
     }
 
-    fn answer(&mut self, request: ClientRequestId, head: ResponseHead, body: Bytes) {
-        if let Some(client) = self.clients.remove(&request) {
-            // The client may have disconnected.
-            let _ = client.send(Answer { head, body });
-        }
-    }
-
     fn now(&self) -> Time {
         Time(self.started.elapsed().as_millis() as u64)
-    }
-
-    fn next_id(&mut self) -> u64 {
-        self.next_id += 1;
-        self.next_id
     }
 }
 
 /// Starts S3 requests on this thread, and block writes and verifications
 /// on worker threads, each feeding its result back to the node.
-fn start(engine: &Shared, work: Work) {
+fn start(engine: &SharedNode, work: Work) {
     for (origin, request) in work.fetches {
         let handle = engine.clone();
         let task = tokio::task::spawn_local(async move {
@@ -382,12 +296,11 @@ fn start(engine: &Shared, work: Work) {
             let written = tokio::task::spawn_blocking(move || disk.write(location, &bytes)).await;
             let work = {
                 let mut this = engine.borrow_mut();
-                match written {
-                    Ok(Ok(())) => this.node.on_written(location),
-                    Ok(Err(error)) => {
-                        eprintln!("writing {location:?}: {error}");
-                        this.node.on_write_failed(location);
-                    }
+                match written
+                    .map_err(io::Error::other)
+                    .and_then(|written| written)
+                {
+                    Ok(()) => this.node.on_written(location),
                     Err(error) => {
                         eprintln!("writing {location:?}: {error}");
                         this.node.on_write_failed(location);
@@ -417,10 +330,100 @@ fn start(engine: &Shared, work: Work) {
     }
 }
 
-/// One body from its pieces, copying only when there are several.
-fn concat(mut parts: Vec<Bytes>) -> Bytes {
-    match parts.len() {
-        1 => parts.pop().expect("one part"),
-        _ => Bytes::from(parts.concat()),
+/// Serves gateways on `listener` until `stop` completes, then waits for work
+/// in progress and shuts the disk down cleanly.
+pub async fn serve(
+    listener: TcpListener,
+    engine: SharedNode,
+    secret: Rc<str>,
+    stop: impl Future<Output = ()>,
+) -> io::Result<()> {
+    let ticking = engine.clone();
+    let ticker = tokio::task::spawn_local(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            NodeEngine::tick(&ticking);
+        }
+    });
+    tokio::pin!(stop);
+    loop {
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            () = &mut stop => break,
+        };
+        stream.set_nodelay(true)?;
+        let (engine, secret) = (engine.clone(), secret.clone());
+        tokio::task::spawn_local(async move {
+            if let Err(error) = connection(stream, &engine, &secret).await {
+                eprintln!("gateway connection closed: {error}");
+            }
+        });
     }
+    drop(listener);
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_WAIT;
+    while !NodeEngine::is_idle(&engine) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    ticker.abort();
+    NodeEngine::shut_down(&engine)
+}
+
+/// How long a shutdown waits for work in progress.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
+
+async fn connection(stream: TcpStream, engine: &SharedNode, secret: &str) -> io::Result<()> {
+    let mut connection = Connection::new(stream);
+    while let Some(head) = connection.read_head().await? {
+        let len = head.content_length().map_err(io::Error::other)?;
+        connection.read_body(len).await?;
+        if header(&head.headers, protocol::SECRET) != Some(secret) {
+            let response = Response {
+                status: 403,
+                headers: Vec::new(),
+                content_length: 0,
+                body: Bytes::new(),
+            };
+            return connection.write_response(&response, false).await;
+        }
+        let (answer, body) = match protocol::decode_request(&head.path, &head.headers) {
+            Err(error) => {
+                let response = Response {
+                    status: 400,
+                    headers: Vec::new(),
+                    content_length: 0,
+                    body: Bytes::new(),
+                };
+                eprintln!("a gateway's request: {error}");
+                return connection.write_response(&response, false).await;
+            }
+            Ok(NodeRequest::Written(key)) => {
+                NodeEngine::written(engine, &key);
+                (NodeAnswer::Written, Bytes::new())
+            }
+            Ok(NodeRequest::Read(read)) => {
+                let head_only =
+                    matches!(&read, Read::Object { request, .. } if request.method == Method::Head);
+                let Ok(reply) = NodeEngine::read(engine, read).await else {
+                    return Err(io::Error::other("the node dropped a read"));
+                };
+                let body = if head_only { Bytes::new() } else { reply.body };
+                (reply.answer, body)
+            }
+        };
+        let (status, headers) = protocol::encode_answer(&answer);
+        let response = Response {
+            status,
+            headers,
+            content_length: body.len() as u64,
+            body,
+        };
+        connection
+            .write_response(&response, head.keep_alive)
+            .await?;
+        if !head.keep_alive {
+            return Ok(());
+        }
+    }
+    Ok(())
 }

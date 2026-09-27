@@ -1,10 +1,13 @@
-//! The storage node and gateway: serves S3 over plaintext HTTP/1.1, with the
-//! gateway and a storage node in one process.
+//! The gateway and storage node: a gateway serves S3 over plaintext
+//! HTTP/1.1, and nodes serve gateways over the cluster protocol. A process
+//! runs either or both.
 
 pub mod config;
 pub mod disk;
-pub mod engine;
+pub mod gateway_engine;
 pub mod http;
+pub mod node_engine;
 pub mod origin;
+pub mod protocol;
 pub mod server;
 pub mod sigv4;

@@ -1,6 +1,6 @@
-# Serves the s3proxy that `scripts/s3proxy start` runs, on 127.0.0.1:9000,
-# with the same credentials, so the conformance suite runs unchanged.
-listen = "127.0.0.1:9000"
+# One process runs the gateway and a storage node against the s3proxy that
+# `scripts/s3proxy start` runs. The gateway serves 127.0.0.1:9000 with
+# s3proxy's credentials, so the conformance suite runs unchanged.
 
 [origin]
 endpoint = "http://127.0.0.1:8080"
@@ -14,10 +14,20 @@ secret_access_key = "local-credential"
 grants = [{ bucket = "*" }]
 
 [cache]
-data_dir = "target/local-cache"
 block_size = 65536
 chunk_blocks = 16
 extent_size = 1048576
 extents = 16
 min_slot = 4096
 fill_budget = 4194304
+
+[cluster]
+secret = "local-cluster-secret"
+nodes = [{ id = 0, address = "127.0.0.1:9100" }]
+
+[gateway]
+listen = "127.0.0.1:9000"
+
+[node]
+id = 0
+data_dir = "target/local-cache"

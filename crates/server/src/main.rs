@@ -1,6 +1,5 @@
-//! The storage node and gateway binary. `s3-accelerator CONFIG` serves S3
-//! over plaintext HTTP/1.1 with the gateway and a storage node in one
-//! process.
+//! The gateway and storage node binary. `s3-accelerator CONFIG` runs the
+//! gateway, the storage node, or both, as the config says.
 
 use s3_accelerator::{config, server};
 use std::process::ExitCode;
@@ -13,7 +12,7 @@ fn main() -> ExitCode {
     let config = match std::fs::read_to_string(&path)
         .map_err(|error| error.to_string())
         .and_then(|text| toml::from_str::<config::Config>(&text).map_err(|error| error.to_string()))
-        .and_then(|config| config.cache.check().map(|()| config))
+        .and_then(|config| config.check().map(|()| config))
     {
         Ok(config) => config,
         Err(error) => {
