@@ -806,6 +806,14 @@ MUTANTS = [
         [(SERVER, "if !(self.checksums && status == 200) {", "if false {")],
     ),
     (
+        "signed streaming uploads pass through",
+        [(SERVER, 'if payload_hash.starts_with("STREAMING-AWS4-HMAC-SHA256") {', "if false {")],
+    ),
+    (
+        "reads with a customer key are cached",
+        [(SERVER, '"x-amz-server-side-encryption-customer-key",\n    ];', "];")],
+    ),
+    (
         "reads waiting on a newly down node wait out the timeout",
         [(GATEWAY, "for id in waiting {\n            self.fail_over(now, id, None, false);\n        }", "")],
     ),

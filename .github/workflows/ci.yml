@@ -19,6 +19,7 @@ jobs:
         image: andrewgaul/s3proxy:4.1.1@sha256:87662b2a5afcdfa5f478a1c61650bae4c87bbd15f6ff2823236bcfd66ef7fe04
         env:
           JCLOUDS_PROVIDER: transient
+          S3PROXY_VIRTUALHOST: localhost
         ports:
           - 8080:80
     steps:

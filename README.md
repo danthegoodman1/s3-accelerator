@@ -31,7 +31,7 @@ To remove an object from the cache, as a retention rule may require after it is 
 
 ```console
 cargo test --workspace                        # unit, server and simulator tests
-scripts/s3proxy start                         # in-memory s3proxy in Docker, on 127.0.0.1:8080
+scripts/s3proxy start                         # in-memory s3proxy in Docker, on localhost:8080
 sudo modprobe tls                             # kernel TLS, for the kTLS tests
 cargo test --workspace -- --include-ignored   # adds the conformance suite and the kTLS tests
 scripts/s3proxy stop

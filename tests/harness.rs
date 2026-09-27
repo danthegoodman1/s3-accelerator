@@ -5,7 +5,7 @@
 //! the endpoint; they default to the s3proxy that `scripts/s3proxy start`
 //! runs:
 //!
-//! - `CONFORMANCE_ENDPOINT` (`http://127.0.0.1:8080`)
+//! - `CONFORMANCE_ENDPOINT` (`http://localhost:8080`)
 //! - `CONFORMANCE_ACCESS_KEY_ID` (`local-identity`)
 //! - `CONFORMANCE_SECRET_ACCESS_KEY` (`local-credential`)
 
@@ -14,6 +14,9 @@ use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_smithy_http_client::tls;
+use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns, ResolveDnsError};
+use std::net::{IpAddr, Ipv4Addr};
 
 pub fn client() -> Client {
     let credentials = Credentials::new(
@@ -25,12 +28,63 @@ pub fn client() -> Client {
     );
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
-        .endpoint_url(var("CONFORMANCE_ENDPOINT", "http://127.0.0.1:8080"))
+        .endpoint_url(var("CONFORMANCE_ENDPOINT", "http://localhost:8080"))
         .region(Region::new("us-east-1"))
         .credentials_provider(credentials)
+        .http_client(loopback_http())
         .force_path_style(true)
         .build();
     Client::from_conf(config)
+}
+
+/// An HTTP client whose `localhost` names resolve to 127.0.0.1.
+fn loopback_http() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    aws_smithy_http_client::Builder::new()
+        .tls_provider(tls::Provider::Rustls(
+            tls::rustls_provider::CryptoMode::AwsLc,
+        ))
+        .build_with_resolver(Loopback)
+}
+
+/// A client that names buckets in the host, virtual-hosted-style: at the
+/// endpoint's port on `localhost`, whose subdomains resolve to loopback.
+pub fn virtual_hosted_client() -> Client {
+    let credentials = Credentials::new(
+        var("CONFORMANCE_ACCESS_KEY_ID", "local-identity"),
+        var("CONFORMANCE_SECRET_ACCESS_KEY", "local-credential"),
+        None,
+        None,
+        "conformance",
+    );
+    let endpoint =
+        var("CONFORMANCE_ENDPOINT", "http://localhost:8080").replace("127.0.0.1", "localhost");
+    let config = aws_sdk_s3::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .endpoint_url(endpoint)
+        .region(Region::new("us-east-1"))
+        .credentials_provider(credentials)
+        .http_client(loopback_http())
+        .build();
+    Client::from_conf(config)
+}
+
+/// Resolves `localhost` and its subdomains to 127.0.0.1, where the
+/// endpoint under test listens, and other names as the system does.
+#[derive(Clone, Debug)]
+struct Loopback;
+
+impl ResolveDns for Loopback {
+    fn resolve_dns<'a>(&'a self, name: &'a str) -> DnsFuture<'a> {
+        if name == "localhost" || name.ends_with(".localhost") {
+            return DnsFuture::ready(Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]));
+        }
+        DnsFuture::new(async move {
+            let addresses = tokio::net::lookup_host((name, 0))
+                .await
+                .map_err(ResolveDnsError::new)?;
+            Ok(addresses.map(|address| address.ip()).collect())
+        })
+    }
 }
 
 fn var(name: &str, default: &str) -> String {

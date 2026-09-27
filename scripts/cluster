@@ -18,7 +18,7 @@ dir=target/cluster
 binary=target/debug/s3-accelerator
 
 origin='[origin]
-endpoint = "http://127.0.0.1:'"${S3PROXY_PORT:-8080}"'"
+endpoint = "http://localhost:'"${S3PROXY_PORT:-8080}"'"
 region = "us-east-1"
 access_key_id = "local-identity"
 secret_access_key = "local-credential"'
@@ -100,10 +100,13 @@ $members" >"$dir/node-$id.toml"
       wait_for $((9101 + id))
     done
     gateway='[gateway]
-listen = "127.0.0.1:9000"'
+listen = "127.0.0.1:9000"
+domains = ["localhost"]'
     if [ "$tls" = --tls ]; then
+      # Rustls matches no wildcard over a single label, so the certificate
+      # names the bucket the conformance suite reaches virtual-hosted-style.
       openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-        -days 1 -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1,DNS:localhost \
+        -days 1 -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1,DNS:localhost,DNS:virtual-hosted.localhost \
         -addext basicConstraints=critical,CA:FALSE \
         -keyout "$dir/tls/key.pem" -out "$dir/tls/cert.pem" 2>/dev/null
       gateway="$gateway

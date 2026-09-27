@@ -3,7 +3,7 @@
 # s3proxy's credentials, so the conformance suite runs unchanged.
 
 [origin]
-endpoint = "http://127.0.0.1:8080"
+endpoint = "http://localhost:8080"
 region = "us-east-1"
 access_key_id = "local-identity"
 secret_access_key = "local-credential"
@@ -27,6 +27,8 @@ nodes = [{ id = 0, address = "127.0.0.1:9100" }]
 
 [gateway]
 listen = "127.0.0.1:9000"
+# Requests to bucket.localhost name their bucket in the host.
+domains = ["localhost"]
 
 [node]
 id = 0

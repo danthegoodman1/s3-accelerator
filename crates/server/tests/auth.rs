@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{object, presigned, send, signed, start};
+use common::{object, presigned, send, send_payload, signed, start};
 use s3_accelerator::sigv4::{self, Credentials, Signer, UNSIGNED_PAYLOAD};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -295,6 +295,53 @@ async fn grants_give_each_level_of_access_to_their_prefix() {
                 let policy = send(port, "PUT", "/bucket", "policy", &[], b"{}".to_vec()).await;
                 assert_eq!(policy.0, allowed, "{access}");
             }
+        })
+        .await;
+}
+
+/// A body signed chunk by chunk gets 501 from its head, with or without a
+/// trailer, since re-signing would break its chunk signatures; an
+/// unsigned body with trailing checksums passes through.
+#[tokio::test(flavor = "current_thread")]
+async fn signed_streaming_uploads_get_501() {
+    LocalSet::new()
+        .run_until(async {
+            let (port, origin) = start(r#"{ bucket = "bucket" }"#, "").await;
+            for payload in [
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            ] {
+                let body = b"0;chunk-signature=0\r\n\r\n".to_vec();
+                let sent = send_payload(port, "PUT", "/bucket/k", "", &[], body, payload).await;
+                assert_eq!(sent.0, 501, "{payload}");
+            }
+            assert_eq!(origin.requests.get(), 0);
+            let trailer = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+            let headers = [("x-amz-decoded-content-length", "0")];
+            let body = b"0\r\n\r\n".to_vec();
+            let sent = send_payload(port, "PUT", "/bucket/k", "", &headers, body, trailer).await;
+            assert_eq!(sent.0, 200);
+            assert_eq!(origin.requests.get(), 1);
+        })
+        .await;
+}
+
+/// Reads with a customer-provided encryption key pass through to S3, even
+/// of a bucket whose blocks go to disk on their first read.
+#[tokio::test(flavor = "current_thread")]
+async fn reads_with_a_customer_key_bypass_the_cache() {
+    LocalSet::new()
+        .run_until(async {
+            let (port, origin) = start(r#"{ bucket = "bucket" }"#, FIRST_READ).await;
+            let key = [
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                ("x-amz-server-side-encryption-customer-key", "a2V5"),
+            ];
+            for _ in 0..2 {
+                let read = send(port, "GET", "/bucket/k", "", &key, Vec::new()).await;
+                assert_eq!(read.0, 200);
+            }
+            assert_eq!(origin.requests.get(), 2);
         })
         .await;
 }

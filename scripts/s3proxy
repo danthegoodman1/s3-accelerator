@@ -28,7 +28,7 @@ case "${1:-}" in
     # A fresh, empty s3proxy each time.
     docker rm -f "$name" >/dev/null 2>&1 || true
     docker run -d --rm --name "$name" -p "127.0.0.1:$port:80" \
-      -e JCLOUDS_PROVIDER=transient "$image" >/dev/null
+      -e JCLOUDS_PROVIDER=transient -e S3PROXY_VIRTUALHOST=localhost "$image" >/dev/null
     wait_for_s3proxy
     ;;
   wait) wait_for_s3proxy ;;
