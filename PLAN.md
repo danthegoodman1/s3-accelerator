@@ -331,14 +331,14 @@ TLS conformance passes; kTLS and zero-copy under TLS are verified from outside t
 
 Testing plan:
 - Conformance over TLS; benchmark harness with recorded results.
-- kTLS verification: after a TLS handshake, the socket reports the `tls` ULP (`ss -tie` shows it), `/proc/net/tls_stat` transmit counters (`TlsTxSw` or `TlsTxDevice`) rise for each connection, `strace` shows hit bodies leaving through `sendfile` on the TLS socket, and the TLS client decrypts every body byte correctly. A run forced onto userspace TLS must fail the kTLS assertions. CI loads the `tls` kernel module and runs it.
+- kTLS verification: after a TLS handshake, the socket reports the `tls` ULP (`ss -tie` shows it), `/proc/net/tls_stat` transmit counters (`TlsTxSw` or `TlsTxDevice`) rise for each connection, `strace` shows hit bodies spliced into the TLS socket, and the TLS client decrypts every body byte correctly. A run forced onto userspace TLS must fail the kTLS assertions. CI loads the `tls` kernel module and runs it.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | S3A: rustls and kTLS listeners | Missing: implementation. |
-| Incomplete | Test | S3D: kTLS verified through kernel state and `strace` | Missing: integration test, forced userspace-TLS control, CI job. |
+| Incomplete | Work | S3A: rustls and kTLS listeners | Client listeners done: `[gateway.tls]` runs rustls's handshake with no session tickets, then moves the session into the kernel with the `ktls` crate (`crates/server/src/tls.rs`); without the `tls` module, or with `kernel = false`, a task relays through a loopback socket. Sessions end with a `close_notify` (`a_kernel_tls_session_ends_with_close_notify`, `a_userspace_tls_session_ends_with_close_notify`); any other record ends the connection. Conformance passes 11 of 11 over kernel TLS through a three-node cluster (`scripts/cluster start 3 --tls`; `TlsTxSw` rose by 11), and CI runs it. Missing: peer listeners (mTLS over kTLS). |
+| Complete | Test | S3D: kTLS verified through kernel state and `strace` | `hits_reach_kernel_tls_sessions_through_splice` (`crates/server/tests/tls.rs`) reads three 192 KiB objects twice through a node and a traced gateway. With kernel TLS: `ss -tie` shows `tcp-ulp-tls` on the client socket, `/proc/net/tls_stat` counts one sending and one receiving session, `strace` shows the gateway setting the `tls` ULP and splicing 589,824 of 589,824 hit bytes into the TLS socket while writing 273 bytes of heads with no body bytes, and every body decrypts correctly. The same run forced onto userspace TLS shows no ULP, no kernel sessions, nothing spliced into the client socket, and 591,747 bytes written from userspace. CI loads the `tls` module and runs it. `scripts/mutants` runs the kernel TLS tests as a layer, and they catch both planted bugs: sessions kept in userspace, and a kernel session ending without `close_notify`. |
 | Incomplete | Test | S3B: NVMe benchmarks | Missing: harness and results. |
 | Incomplete | Doc | S3C: Storage-layout decision | Missing: spec update. |
 | Incomplete | Gate | Code review | Missing: `/code-review` run and resolved findings. |

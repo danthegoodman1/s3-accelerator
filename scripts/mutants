@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Plants known bugs, one at a time, in a scratch copy of the workspace and
-reports whether the core's unit tests, the server's tests, the simulator's
-tests (scenarios and regression seeds) or a seed sweep catch each one.
+reports whether the core's unit tests, the server's tests, its kernel TLS
+tests, the simulator's tests (scenarios and regression seeds) or a seed
+sweep catch each one.
 
     scripts/mutants [--seeds N] [--only NAME] [--check]
+
+The kernel TLS tests need the tls module (`sudo modprobe tls`).
 
 A mutant is a list of replacements; each must match exactly once, ignoring
 whitespace, so formatting changes leave the mutants intact. The copy lives
@@ -36,6 +39,7 @@ MEMBERSHIP_ENGINE = "crates/server/src/membership_engine.rs"
 GATEWAY_ENGINE = "crates/server/src/gateway_engine.rs"
 PASSTHROUGH = "crates/server/src/passthrough.rs"
 SQS = "crates/server/src/sqs.rs"
+TLS = "crates/server/src/tls.rs"
 STEP_TIMEOUT = 600
 
 MUTANTS = [
@@ -601,6 +605,14 @@ MUTANTS = [
         "a purge tells nodes out of every ring",
         [(NODE, ".filter(|&node| self.in_rings(node))", ".filter(|&node| node.0 < u64::MAX)")],
     ),
+    (
+        "TLS sessions stay in userspace",
+        [(TLS, "let kernel = config.kernel && kernel_takes_sessions().await;", "let kernel = false;")],
+    ),
+    (
+        "a kernel TLS session ends without close_notify",
+        [(HTTP, "crate::tls::send_close_notify(&self.stream);", "")],
+    ),
 ]
 
 
@@ -629,6 +641,8 @@ def main():
                     print(f"{name}: {count} matches in {path}")
                     broken += 1
         sys.exit(1 if broken else 0)
+    if not Path("/proc/net/tls_stat").exists():
+        sys.exit("the kernel TLS tests need the tls module: sudo modprobe tls")
     for name, replacements in MUTANTS:
         if args.only and args.only != name:
             continue
@@ -672,6 +686,8 @@ def catch(copy, target, seeds):
     layers = [
         ("core unit tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator-core"]),
         ("server tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator"]),
+        ("kernel TLS tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator", "--test", "tls",
+                              "--", "--ignored"]),
         ("sim tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator-sim"]),
         ("seeds", ["cargo", "run", "-q", "--release", "-p", "s3-accelerator-sim", "--", "0",
                    "--seeds", str(seeds)]),

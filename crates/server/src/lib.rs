@@ -15,4 +15,5 @@ pub mod protocol;
 pub mod server;
 pub mod sigv4;
 pub mod sqs;
+pub mod tls;
 pub mod zero_copy;

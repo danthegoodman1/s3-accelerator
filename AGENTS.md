@@ -24,9 +24,9 @@
 ```console
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-scripts/s3proxy start && cargo test --workspace -- --include-ignored
+scripts/s3proxy start && sudo modprobe tls && cargo test --workspace -- --include-ignored
 cargo run -p s3-accelerator -- config/local.toml &   # then CONFORMANCE_ENDPOINT=http://127.0.0.1:9000
-scripts/cluster start 3 && scripts/cluster stop     # the same, as separate processes
+scripts/cluster start 3 [--tls] && scripts/cluster stop   # the same, as separate processes
 cargo run --release -p s3-accelerator-sim [-- SEED] [--seeds N]
 scripts/mutants
 ```

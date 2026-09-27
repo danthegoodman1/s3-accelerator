@@ -32,11 +32,14 @@ To remove an object from the cache, as a retention rule may require after it is 
 ```console
 cargo test --workspace                        # unit, server and simulator tests
 scripts/s3proxy start                         # in-memory s3proxy in Docker, on 127.0.0.1:8080
-cargo test --workspace -- --include-ignored   # adds the conformance suite
+sudo modprobe tls                             # kernel TLS, for the kTLS tests
+cargo test --workspace -- --include-ignored   # adds the conformance suite and the kTLS tests
 scripts/s3proxy stop
 ```
 
 The server's tests need Linux and `strace`: `crates/server/tests/zero_copy.rs` traces a node and a gateway to show that hits leave through `sendfile` and `splice`, and that the node syncs each block before its record and each cleared record before the slot is rewritten. The data directory must be on a disk-backed filesystem, and the tests keep theirs under `target/`.
+
+`crates/server/tests/tls.rs` checks kernel TLS from outside the gateway: `ss` shows the `tls` ULP on each client socket (it runs under `sudo -n`, since only CAP_NET_ADMIN sees a socket's ULP), `/proc/net/tls_stat` counts a sending and a receiving session per connection, and `strace` shows hits spliced into the TLS socket with no write carrying their bytes. The same run on userspace TLS must show none of this.
 
 The conformance suite reads `CONFORMANCE_ENDPOINT`, `CONFORMANCE_ACCESS_KEY_ID` and `CONFORMANCE_SECRET_ACCESS_KEY`, which default to the local s3proxy. To run it through the accelerator, which `config/local.toml` points at that s3proxy with a gateway and a node in one process:
 
@@ -45,7 +48,13 @@ cargo run -p s3-accelerator -- config/local.toml &
 CONFORMANCE_ENDPOINT=http://127.0.0.1:9000 cargo test -p s3-accelerator-conformance -- --ignored
 ```
 
-`scripts/cluster start [NODES]` runs a gateway and nodes as separate processes in front of the same s3proxy, with the gateway on the same port; `scripts/cluster stop` shuts them down.
+`scripts/cluster start [NODES]` runs a gateway and nodes as separate processes in front of the same s3proxy, with the gateway on the same port; `scripts/cluster stop` shuts them down. With `--tls`, the gateway serves HTTPS with a self-signed certificate:
+
+```console
+scripts/cluster start 3 --tls
+CONFORMANCE_ENDPOINT=https://127.0.0.1:9000 SSL_CERT_FILE=$PWD/target/cluster/tls/cert.pem \
+  cargo test -p s3-accelerator-conformance -- --ignored
+```
 
 ### Simulator
 

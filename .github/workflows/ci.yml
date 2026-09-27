@@ -27,6 +27,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install strace, which the zero-copy tests trace the server with
         run: sudo apt-get update && sudo apt-get install -y strace
+      - name: Load the kernel TLS module, which the kTLS tests check
+        run: sudo modprobe tls && test -e /proc/net/tls_stat
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: scripts/s3proxy wait
@@ -44,6 +46,16 @@ jobs:
           scripts/cluster start 3
           CONFORMANCE_ENDPOINT=http://127.0.0.1:9000 cargo test -p s3-accelerator-conformance -- --ignored
           scripts/cluster stop
+      - name: Conformance over kernel TLS through a multi-process cluster
+        run: |
+          scripts/cluster start 3 --tls
+          before=$(awk '/^TlsTxSw/ { print $2 }' /proc/net/tls_stat)
+          CONFORMANCE_ENDPOINT=https://127.0.0.1:9000 SSL_CERT_FILE=$PWD/target/cluster/tls/cert.pem \
+            cargo test -p s3-accelerator-conformance -- --ignored
+          after=$(awk '/^TlsTxSw/ { print $2 }' /proc/net/tls_stat)
+          scripts/cluster stop
+          echo "the kernel set up $((after - before)) TLS sessions"
+          test "$after" -gt "$before"
 
   simulate:
     runs-on: ubuntu-latest

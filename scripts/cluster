@@ -5,8 +5,11 @@
 # s3proxy's credentials from clients, so the conformance suite runs
 # unchanged. Configs, disks and logs go in target/cluster.
 #
-#   scripts/cluster start [NODES]   # build, start, and wait until it answers
-#   scripts/cluster stop            # shut every process down cleanly
+#   scripts/cluster start [NODES] [--tls]   # build, start, and wait until it answers
+#   scripts/cluster stop                    # shut every process down cleanly
+#
+# With --tls, the gateway serves HTTPS with a self-signed certificate in
+# target/cluster/tls, which clients trust through SSL_CERT_FILE.
 set -euo pipefail
 
 dir=target/cluster
@@ -55,6 +58,7 @@ wait_for() {
 case "${1:-}" in
   start)
     nodes=${2:-3}
+    tls=${3:-}
     cargo build -q -p s3-accelerator
     rm -rf "$dir"
     mkdir -p "$dir"
@@ -68,12 +72,28 @@ data_dir = \"$dir/node-$id\"" >"$dir/node-$id.toml"
       echo $! >"$dir/node-$id.pid"
       wait_for $((9101 + id))
     done
-    config "$nodes" '[gateway]
-listen = "127.0.0.1:9000"' >"$dir/gateway.toml"
+    gateway='[gateway]
+listen = "127.0.0.1:9000"'
+    if [ "$tls" = --tls ]; then
+      mkdir -p "$dir/tls"
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+        -days 1 -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1,DNS:localhost \
+        -addext basicConstraints=critical,CA:FALSE \
+        -keyout "$dir/tls/key.pem" -out "$dir/tls/cert.pem" 2>/dev/null
+      gateway="$gateway
+
+[gateway.tls]
+cert = \"$dir/tls/cert.pem\"
+key = \"$dir/tls/key.pem\""
+    fi
+    config "$nodes" "$gateway" >"$dir/gateway.toml"
     "$binary" "$dir/gateway.toml" >"$dir/gateway.log" 2>&1 &
     echo $! >"$dir/gateway.pid"
     wait_for 9000
     echo "a gateway and $nodes nodes are listening; logs are in $dir"
+    if [ "$tls" = --tls ]; then
+      echo "clients trust the gateway with SSL_CERT_FILE=$PWD/$dir/tls/cert.pem"
+    fi
     ;;
   stop)
     for pid in "$dir"/*.pid; do
@@ -82,7 +102,7 @@ listen = "127.0.0.1:9000"' >"$dir/gateway.toml"
     done
     ;;
   *)
-    echo "usage: $0 start [NODES]|stop" >&2
+    echo "usage: $0 start [NODES] [--tls]|stop" >&2
     exit 2
     ;;
 esac

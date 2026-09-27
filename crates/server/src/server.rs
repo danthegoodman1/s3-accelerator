@@ -15,6 +15,7 @@ use crate::peers::{Exchanged, Peers};
 use crate::protocol::{self, NodeAnswer, NodeRequest};
 use crate::sigv4::{self, AuthError, Credentials, Signable};
 use crate::sqs::Queue;
+use crate::tls::Tls;
 use crate::zero_copy::{self, Short};
 use bytes::Bytes;
 use s3_accelerator_core::Time;
@@ -28,7 +29,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 
@@ -200,13 +201,17 @@ pub async fn run_with(
         }
         _ => None,
     };
-    if let (Some(_), Some(listener)) = (&config.gateway, listeners.gateway) {
+    if let (Some(gateway), Some(listener)) = (&config.gateway, listeners.gateway) {
+        let tls = match &gateway.tls {
+            Some(tls) => Some(Rc::new(Tls::new(tls).await?)),
+            None => None,
+        };
         let gateway = GatewayEngine::new(config.ring(), config.cache.gateway_config(), peers);
         let context = Rc::new(Context {
             gateway,
             clients: config.clients,
         });
-        serve_clients(listener, context, stopped_signal(stopped)).await?;
+        serve_clients(listener, context, tls, stopped_signal(stopped)).await?;
     }
     match node {
         Some(node) => node.await.map_err(io::Error::other)?,
@@ -231,6 +236,7 @@ async fn stopped_signal(mut stopped: watch::Receiver<bool>) {
 async fn serve_clients(
     listener: TcpListener,
     context: Rc<Context>,
+    tls: Option<Rc<Tls>>,
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
     let ticking = context.gateway.clone();
@@ -248,9 +254,21 @@ async fn serve_clients(
             () = &mut stop => break,
         };
         stream.set_nodelay(true)?;
-        let context = context.clone();
+        let (context, tls) = (context.clone(), tls.clone());
         tokio::task::spawn_local(async move {
-            if let Err(error) = connection(stream, &context).await {
+            let connection = match tls {
+                None => Connection::new(stream),
+                Some(tls) => match tls.accept(stream).await {
+                    Ok(accepted) => {
+                        Connection::tls(accepted.stream, accepted.read_ahead, accepted.kernel)
+                    }
+                    // A client that closes before its handshake, such as
+                    // a TCP health check, is no failure.
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return,
+                    Err(error) => return eprintln!("a TLS handshake failed: {error}"),
+                },
+            };
+            if let Err(error) = serve_connection(connection, &context).await {
                 eprintln!("connection closed: {error}");
             }
         });
@@ -259,8 +277,7 @@ async fn serve_clients(
     Ok(())
 }
 
-async fn connection(stream: TcpStream, context: &Context) -> io::Result<()> {
-    let mut connection = Connection::new(stream);
+async fn serve_connection(mut connection: Connection, context: &Context) -> io::Result<()> {
     while let Some(head) = connection.read_head().await? {
         let len = match head.content_length() {
             Ok(len) => len,

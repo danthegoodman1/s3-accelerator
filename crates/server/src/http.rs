@@ -76,6 +76,10 @@ pub struct Connection {
     stream: TcpStream,
     /// Bytes read from the stream and not yet consumed.
     buffer: Vec<u8>,
+    /// The kernel holds the connection's TLS session.
+    kernel_tls: bool,
+    /// The session still owes the client a `close_notify`.
+    owes_close_notify: bool,
 }
 
 impl Connection {
@@ -83,6 +87,19 @@ impl Connection {
         Connection {
             stream,
             buffer: Vec::new(),
+            kernel_tls: false,
+            owes_close_notify: false,
+        }
+    }
+
+    /// A client's connection after its TLS handshake: `read_ahead` holds
+    /// plaintext the handshake read past its end.
+    pub fn tls(stream: TcpStream, read_ahead: Vec<u8>, kernel: bool) -> Connection {
+        Connection {
+            stream,
+            buffer: read_ahead,
+            kernel_tls: kernel,
+            owes_close_notify: kernel,
         }
     }
 
@@ -104,7 +121,7 @@ impl Connection {
                 return Err(invalid("request head too large"));
             }
             let mut chunk = [0; 8 * 1024];
-            let read = self.stream.read(&mut chunk).await?;
+            let read = self.read_stream(&mut chunk).await?;
             if read == 0 {
                 return match self.buffer.is_empty() {
                     true => Ok(None),
@@ -123,7 +140,7 @@ impl Connection {
             return Ok(self.buffer.drain(..take).collect::<Vec<u8>>().into());
         }
         let mut chunk = vec![0; max.min(READ_CHUNK)];
-        let read = self.stream.read(&mut chunk).await?;
+        let read = self.read_stream(&mut chunk).await?;
         if read == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
@@ -216,7 +233,7 @@ impl Connection {
                 return Err(invalid("line too long"));
             }
             let mut chunk = [0; 8 * 1024];
-            let read = self.stream.read(&mut chunk).await?;
+            let read = self.read_stream(&mut chunk).await?;
             if read == 0 {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
@@ -334,11 +351,22 @@ impl Connection {
         self.write_all(&chunk).await
     }
 
+    /// Reads from the socket. A kernel TLS session fails the read with EIO
+    /// on any record but application data: the client's `close_notify`, or
+    /// a KeyUpdate. Either ends the connection.
+    async fn read_stream(&mut self, chunk: &mut [u8]) -> io::Result<usize> {
+        match self.stream.read(chunk).await {
+            Err(error) if self.kernel_tls && error.raw_os_error() == Some(libc::EIO) => Ok(0),
+            read => read,
+        }
+    }
+
     /// Stops writing, then reads and drops what the peer still sends,
     /// for up to `LINGER`. A server that answers before reading a request's
     /// body closes this way: closing with unread bytes would reset the
     /// connection, and the client could lose the answer.
     pub async fn linger(&mut self) {
+        self.close_notify();
         let _ = self.stream.shutdown().await;
         let deadline = tokio::time::Instant::now() + LINGER;
         let mut sink = vec![0; READ_CHUNK];
@@ -348,9 +376,23 @@ impl Connection {
         {}
     }
 
+    /// Ends a kernel TLS session with a `close_notify` alert, so the client
+    /// knows the connection closed cleanly rather than was cut off.
+    fn close_notify(&mut self) {
+        if std::mem::take(&mut self.owes_close_notify) {
+            crate::tls::send_close_notify(&self.stream);
+        }
+    }
+
     /// Ends a chunked body.
     pub async fn finish_chunks(&mut self) -> io::Result<()> {
         self.write_all(b"0\r\n\r\n").await
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.close_notify();
     }
 }
 

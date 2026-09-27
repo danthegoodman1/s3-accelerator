@@ -100,6 +100,24 @@ fn default_weight() -> u32 {
 pub struct GatewayConfig {
     /// Where S3 clients connect, such as `127.0.0.1:9000`.
     pub listen: String,
+    /// Clients connect over TLS when set, and over plaintext otherwise.
+    pub tls: Option<TlsConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM files: the certificate chain, leaf first, and its private key.
+    pub cert: String,
+    pub key: String,
+    /// Sessions move into the kernel when it takes them, so zero-copy works
+    /// under TLS; false keeps them in userspace.
+    #[serde(default = "default_kernel")]
+    pub kernel: bool,
+}
+
+fn default_kernel() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]

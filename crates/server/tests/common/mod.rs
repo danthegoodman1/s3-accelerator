@@ -3,6 +3,8 @@
 
 #![allow(dead_code, reason = "each test crate uses its own part of the harness")]
 
+pub mod trace;
+
 use s3_accelerator::config::Config;
 use s3_accelerator::http::{Connection, Framing, Response};
 use s3_accelerator::server::{self, Listeners};
@@ -12,10 +14,12 @@ use s3_accelerator_core::formats::fixtures::frame;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::io;
-use std::net::TcpListener as StdListener;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -666,13 +670,43 @@ impl Drop for Process {
     }
 }
 
-/// A free port on the loopback interface.
+/// A free port on the loopback interface for a server to bind later. It
+/// lies below the kernel's ephemeral range, where no connection takes it as
+/// its local port, and this process reserves it for as long as it runs.
 pub fn port() -> u16 {
-    StdListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    const LOW: u64 = 10_000;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    static RESERVED: Mutex<Vec<OwnedFd>> = Mutex::new(Vec::new());
+    let ephemeral = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|range| range.split_whitespace().next()?.parse().ok())
+        .unwrap_or(32_768);
+    let span = ephemeral.max(LOW + 1_000) - LOW;
+    // Each process starts at its own offset, so test binaries running at
+    // once seldom try the same ports.
+    let start = u64::from(std::process::id()) * 7_919;
+    loop {
+        let next = NEXT.fetch_add(1, Ordering::Relaxed);
+        let port = (LOW + (start + next) % span) as u16;
+        if let Some(reservation) = reserve(port) {
+            RESERVED.lock().unwrap().push(reservation);
+            return port;
+        }
+    }
+}
+
+/// Reserves `port`: a socket bound to it that never listens. It binds as
+/// no other socket holds the port, then takes `SO_REUSEADDR`, which lets a
+/// server share the port while other processes' reservations fail.
+fn reserve(port: u16) -> Option<OwnedFd> {
+    use rustix::net::{AddressFamily, SocketType, bind, socket, sockopt};
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+    let reservation = socket(AddressFamily::INET, SocketType::STREAM, None).ok()?;
+    bind(&reservation, &address).ok()?;
+    sockopt::set_socket_reuseaddr(&reservation, true).ok()?;
+    // Nodes gossip over UDP on their TCP port.
+    std::net::UdpSocket::bind(address).ok()?;
+    Some(reservation)
 }
 
 pub async fn listening(port: u16) {
