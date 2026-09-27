@@ -41,6 +41,8 @@ The server's tests need Linux and `strace`: `crates/server/tests/zero_copy.rs` t
 
 `crates/server/tests/tls.rs` checks kernel TLS from outside the server, on clients' connections to the gateway and the gateway's mutual-TLS connections to the node: `ss` shows the `tls` ULP on each socket (it runs under `sudo -n`, since only CAP_NET_ADMIN sees a socket's ULP), `/proc/net/tls_stat` counts the kernel's sessions, and `strace` shows hits leaving the node through `sendfile` and the gateway through `splice` into TLS sockets, with no write carrying their bytes. The same run on userspace TLS must show none of this.
 
+Kernel TLS needs Linux 7.0 or later (see Kernel in `spec.md`). Linux 6.17 stalls kernel TLS links over loopback, so CI's test job runs on Ubuntu 26.04.
+
 The conformance suite reads `CONFORMANCE_ENDPOINT`, `CONFORMANCE_ACCESS_KEY_ID` and `CONFORMANCE_SECRET_ACCESS_KEY`, which default to the local s3proxy. To run it through the accelerator, which `config/local.toml` points at that s3proxy with a gateway and a node in one process:
 
 ```console

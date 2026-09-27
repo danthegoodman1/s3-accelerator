@@ -10,7 +10,9 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Kernel TLS needs Linux 7.0 or later: 6.17's receive-buffer checks
+    # stall kernel TLS links over loopback (see Kernel in spec.md).
+    runs-on: ubuntu-26.04
     services:
       s3proxy:
         # Keep in step with scripts/s3proxy.
@@ -56,6 +58,12 @@ jobs:
           scripts/cluster stop
           echo "the kernel set up $((after - before)) TLS sessions"
           test "$after" -gt "$before"
+      - name: Keep the cluster's logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-logs
+          path: target/cluster/*.log
 
   simulate:
     runs-on: ubuntu-latest
