@@ -209,17 +209,26 @@ fn cleared_slots(
     cleared
 }
 
-/// No call that writes, to a socket, pipe or file, carries 32 bytes in a
-/// row of any body, and together they write far less than the bodies.
+/// No call that writes to a socket or pipe carries 32 bytes in a row of
+/// any body, and together they write far less than the bodies. Writes to
+/// files are the node storing blocks, which a slow disk may still be doing
+/// as the hits begin.
 fn check_writes_carry_no_body(
     process: &str,
     calls: &[Call],
     windows: &HashSet<u64>,
     total: i64,
 ) -> i64 {
+    let to_file = |call: &Call| {
+        call.fds()
+            .first()
+            .and_then(|fd| fd.split_once('<'))
+            .is_some_and(|(_, name)| name.starts_with('/'))
+    };
     let writes: Vec<&Call> = calls
         .iter()
         .filter(|call| WRITES.split(',').any(|name| name == call.name))
+        .filter(|call| !to_file(call))
         .collect();
     for call in &writes {
         let data = call.data();
