@@ -109,3 +109,33 @@ fn a_misroute_goes_only_to_a_node_that_is_up() {
         panic!("{failure}");
     }
 }
+
+/// Seed 9998: a part S3 refused started its read with S3's answer, but the
+/// runs the read-ahead window had yet to ask for stayed pending, and the
+/// gateway asked for them after the answer ended.
+#[test]
+fn a_refused_part_drops_the_runs_still_to_ask_for() {
+    if let Err(failure) = Simulator::from_seed(9998).run() {
+        panic!("{failure}");
+    }
+}
+
+/// Seed 566: a read planned again after a node found its version stale
+/// kept the runs its first plan had yet to ask for, and forwarded them
+/// after the home's whole answer.
+#[test]
+fn a_replanned_read_drops_its_earlier_runs() {
+    if let Err(failure) = Simulator::from_seed(566).run() {
+        panic!("{failure}");
+    }
+}
+
+/// Seed 447: a write landed while a response streamed, and the part the
+/// window asked for next found S3 without the version, so the response
+/// ended early, as the spec allows.
+#[test]
+fn a_write_during_a_response_can_end_it_early() {
+    if let Err(failure) = Simulator::from_seed(447).run() {
+        panic!("{failure}");
+    }
+}

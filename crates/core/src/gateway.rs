@@ -46,6 +46,10 @@ pub struct Config {
     /// How long the gateway keeps metadata of immutable objects, in
     /// milliseconds, so a purge reaches it within that time.
     pub purge_window: u64,
+    /// Bytes of a response's body the gateway asks nodes for ahead of the
+    /// part it forwards, so a miss holds at most this much of each owner's
+    /// fill budget.
+    pub read_ahead: u64,
     /// Milliseconds a node has to answer before the gateway asks the next
     /// rendezvous candidate.
     pub node_timeout: u64,
@@ -130,6 +134,21 @@ struct ClientRead {
     stage: Stage,
     /// Times a node found the object changed during this read.
     retries: u32,
+    /// Runs of the body not yet asked for, of the version the read serves,
+    /// asked for as the parts before them are forwarded.
+    ahead: Option<Ahead>,
+}
+
+struct Ahead {
+    key: ObjectKey,
+    etag: ETag,
+    size: u64,
+    runs: VecDeque<Run>,
+}
+
+/// Bytes a run holds.
+fn run_len(&(_, first, last): &Run) -> u64 {
+    last - first + 1
 }
 
 enum Stage {
@@ -377,6 +396,7 @@ impl Gateway {
             arrived: now,
             stage: Stage::Planning,
             retries: 0,
+            ahead: None,
         };
         self.reads.insert(id, read);
         self.plan(now, id);
@@ -465,7 +485,9 @@ impl Gateway {
                 self.start(id, head, VecDeque::from([from]));
             }
             Stage::Parts { .. } if head.status != 206 => {
-                // S3 refused the part: the client gets its answer.
+                // S3 refused the part: the client gets its answer, and
+                // none of the rest.
+                read.ahead = None;
                 self.abandon_parts_except(id, from);
                 self.start(id, head, VecDeque::from([from]));
             }
@@ -516,7 +538,10 @@ impl Gateway {
         if copied < expected {
             return self.resume(id, part, copied);
         }
-        self.forward_next(id);
+        self.ask_ahead(id);
+        if self.reads.contains_key(&id) {
+            self.forward_next(id);
+        }
     }
     /// The home answered with the object's metadata; the read goes to the
     /// blocks' owners.
@@ -563,6 +588,11 @@ impl Gateway {
     }
 
     fn plan(&mut self, now: Time, id: ClientRequestId) {
+        // Runs pending from an earlier plan belong to it.
+        self.reads
+            .get_mut(&id)
+            .expect("a planned read exists")
+            .ahead = None;
         let read = &self.reads[&id];
         let key = read.request.key.clone();
         let (arrived, policy) = (read.arrived, self.policy(&key.bucket));
@@ -616,8 +646,9 @@ impl Gateway {
             Answer::Head(head) => return self.respond(id, head),
             Answer::Body { head, first, last } => (head, first, last),
         };
-        let runs = self.runs(&request.key, meta.size, first, last);
-        let Some(parts) = self.dispatch_runs(id, &request.key, &meta.etag, meta.size, runs, &[])
+        let mut runs: VecDeque<Run> = self.runs(&request.key, meta.size, first, last).into();
+        let now = self.window(&mut runs, 0);
+        let Some(parts) = self.dispatch_runs(id, &request.key, &meta.etag, meta.size, now, &[])
         else {
             let now = self.now;
             self.find_ring(now);
@@ -625,6 +656,68 @@ impl Gateway {
         };
         let read = self.reads.get_mut(&id).expect("planned read exists");
         read.stage = Stage::Parts { head, parts };
+        read.ahead = Some(Ahead {
+            key: request.key,
+            etag: meta.etag.clone(),
+            size: meta.size,
+            runs,
+        });
+    }
+
+    /// The runs to ask for next, from the front of `runs`, when `asked`
+    /// bytes are already asked for and not yet forwarded: up to the
+    /// read-ahead window, and at least one run when none is asked for.
+    fn window(&self, runs: &mut VecDeque<Run>, asked: u64) -> Vec<Run> {
+        let mut taken = Vec::new();
+        let mut total = asked;
+        while let Some(run) = runs.front() {
+            let len = run_len(run);
+            if total > 0 && total + len > self.config.read_ahead {
+                break;
+            }
+            total += len;
+            taken.push(runs.pop_front().expect("a run"));
+        }
+        taken
+    }
+
+    /// Asks for more of a streaming read's body as its window allows.
+    fn ask_ahead(&mut self, id: ClientRequestId) {
+        let read = &self.reads[&id];
+        let Stage::Streaming {
+            parts, remaining, ..
+        } = &read.stage
+        else {
+            return;
+        };
+        if *remaining == 0 {
+            return;
+        }
+        let asked: u64 = parts
+            .iter()
+            .filter_map(|part| match &self.parts.get(part)?.what {
+                What::Range { runs, .. } => Some(runs.iter().map(run_len).sum::<u64>()),
+                What::Object(..) => None,
+            })
+            .sum();
+        let Some(mut ahead) = self.reads.get_mut(&id).and_then(|read| read.ahead.take()) else {
+            return;
+        };
+        let runs = self.window(&mut ahead.runs, asked);
+        let dispatched = match runs.is_empty() {
+            true => Some(VecDeque::new()),
+            false => self.dispatch_runs(id, &ahead.key, &ahead.etag, ahead.size, runs, &[]),
+        };
+        let Some(dispatched) = dispatched else {
+            return self.abort(id);
+        };
+        let read = self.reads.get_mut(&id).expect("a streaming read exists");
+        if let Stage::Streaming { parts, .. } = &mut read.stage {
+            parts.extend(dispatched);
+        }
+        if !ahead.runs.is_empty() {
+            read.ahead = Some(ahead);
+        }
     }
 
     /// Bytes `first..=last` of an object of `size` bytes, as runs that
@@ -847,11 +940,14 @@ impl Gateway {
             return;
         }
         let Some(&next) = parts.front() else {
-            if *remaining > 0 {
-                return self.abort(id);
+            if *remaining == 0 {
+                self.reads.remove(&id);
+                return;
             }
-            self.reads.remove(&id);
-            return;
+            if read.ahead.is_some() {
+                return self.ask_ahead(id);
+            }
+            return self.abort(id);
         };
         let Some(answer) = &self.parts[&next].answer else {
             return;
@@ -1162,6 +1258,7 @@ mod tests {
             metadata_capacity: capacity,
             metadata_ttl: 1_000,
             purge_window: 10_000,
+            read_ahead: u64::MAX,
             node_timeout: 1_000,
             suspect_ttl: 100,
         };

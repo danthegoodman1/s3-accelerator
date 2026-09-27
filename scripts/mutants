@@ -853,6 +853,22 @@ MUTANTS = [
         [(GATEWAY, ".is_some_and(|at| now.0 < at.0 + self.config.suspect_ttl);", ".is_some_and(|_| false);")],
     ),
     (
+        "a gateway asks for every chunk at once",
+        [(GATEWAY, "let now = self.window(&mut runs, 0);", "let now: Vec<Run> = runs.drain(..).collect();")],
+    ),
+    (
+        "the read-ahead window never moves",
+        [(GATEWAY, "self.ask_ahead(id);\n        if self.reads.contains_key(&id) {", "if self.reads.contains_key(&id) {")],
+    ),
+    (
+        "runs pending from an earlier plan survive replanning",
+        [(GATEWAY, 'self.reads.get_mut(&id).expect("a planned read exists").ahead = None;', "")],
+    ),
+    (
+        "a refused part keeps the runs still to ask for",
+        [(GATEWAY, "read.ahead = None;\n                self.abandon_parts_except(id, from);", "self.abandon_parts_except(id, from);")],
+    ),
+    (
         "reads waiting on a newly down node wait out the timeout",
         [(GATEWAY, "for id in waiting {\n            self.fail_over(now, id, None, false);\n        }", "")],
     ),

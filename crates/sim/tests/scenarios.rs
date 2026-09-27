@@ -785,6 +785,33 @@ fn a_node_down_past_its_grace_period_leaves_every_ring() {
     assert_eq!(sim.summary().ring_fetches, 1);
 }
 
+/// A gateway asks for a response's chunks a window ahead of the one it
+/// forwards, so a miss of a large object holds at most the window of its
+/// owner's fill budget: with a budget of one chunk, every chunk is stored,
+/// and a reread costs S3 nothing.
+#[test]
+fn a_miss_within_the_read_ahead_window_stores_every_chunk() {
+    let mut options = Options::scenario();
+    options.nodes = 1;
+    options.chunk_blocks = 2;
+    options.fill_budget_blocks = 2;
+    options.read_ahead_chunks = 1;
+    options.immutable_admit_on_first_read = true;
+    let mut sim = Simulator::new(1, options);
+    let key = key(IMMUTABLE_BUCKET, "large");
+    // Eight chunks of 64-byte blocks.
+    sim.put(&key, 1_024);
+    // The gateway learns the object's size, so its GET goes to the
+    // chunks' owner.
+    sim.read(Request::head(key.clone())).unwrap();
+    let (head, body) = sim.read(Request::get(key.clone())).unwrap();
+    assert_eq!((head.status, body.len()), (200, 1_024));
+    let before = sim.summary().origin_requests;
+    let (head, _) = sim.read(Request::get(key.clone())).unwrap();
+    assert_eq!(head.status, 200);
+    assert_eq!(sim.summary().origin_requests, before);
+}
+
 /// A home rewrites its metadata file, least recently used first, once the
 /// file holds twice the metadata capacity and at a clean shutdown: the
 /// file stays bounded, and a restart keeps the most recently used entries,

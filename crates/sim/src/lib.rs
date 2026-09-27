@@ -89,6 +89,9 @@ pub struct Options {
     pub gateway_metadata_ttl: u64,
     /// Ticks a gateway keeps metadata of immutable objects.
     pub purge_window: u64,
+    /// Chunks of a response's body a gateway asks for ahead of the part
+    /// it forwards.
+    pub read_ahead_chunks: u64,
     /// Chance that a gateway's range read reaches a node that does not own
     /// its blocks, as when gateways and nodes disagree about the ring.
     pub misroute_percent: u64,
@@ -229,6 +232,7 @@ impl Options {
             gateway_metadata_capacity: prng.range(1..=32) as usize,
             gateway_metadata_ttl: prng.range(0..=200),
             purge_window: 5_000,
+            read_ahead_chunks: 2,
             misroute_percent: prng.range(0..=20),
             origin_timeout: 0,
             node_timeout: 0,
@@ -359,6 +363,7 @@ impl Options {
             gateway_metadata_capacity: 1_024,
             gateway_metadata_ttl: 1_000,
             purge_window: 5_000,
+            read_ahead_chunks: 2,
             misroute_percent: 0,
             origin_timeout: 1_000,
             node_timeout: 1_000,
@@ -423,6 +428,7 @@ impl Options {
             metadata_capacity: self.gateway_metadata_capacity,
             metadata_ttl: self.gateway_metadata_ttl,
             purge_window: self.purge_window,
+            read_ahead: self.block_size * self.chunk_blocks * self.read_ahead_chunks,
             node_timeout: self.node_timeout,
             suspect_ttl: self.suspect_ttl,
         }
@@ -2994,6 +3000,12 @@ impl Simulator {
                     self.send(Address::Gateway(gateway), Address::Node(node), message);
                 }
                 gateway::Action::Start { request, head } => {
+                    if self.trace {
+                        eprintln!(
+                            "{} gateway {gateway} starts {request:?}: {} of {} bytes",
+                            self.now, head.status, head.content_length
+                        );
+                    }
                     let started = (head, Vec::new());
                     if self
                         .client_responses
@@ -3006,6 +3018,12 @@ impl Simulator {
                     }
                 }
                 gateway::Action::Forward { request, from, len } => {
+                    if self.trace {
+                        eprintln!(
+                            "{} gateway {gateway} forwards {from:?} into {request:?}: {len} bytes",
+                            self.now
+                        );
+                    }
                     let Some(body) = self.gateway_bodies.remove(&(gateway, from)) else {
                         return Err(self.failure(format!(
                             "gateway {gateway} forwarded {from:?}, which it no longer holds"
@@ -3034,6 +3052,9 @@ impl Simulator {
                     }
                 }
                 gateway::Action::Abort { request } => {
+                    if self.trace {
+                        eprintln!("{} gateway {gateway} ends {request:?} early", self.now);
+                    }
                     let Some((head, body)) = self.client_responses.remove(&(gateway, request))
                     else {
                         return Err(self
@@ -3634,7 +3655,14 @@ impl Simulator {
                 .saturating_sub(self.options.staleness(&pending.read.key));
             properties::check_early_end(&self.origin, &pending.read, from, self.now, &head, &body)
                 .map_err(|message| self.failure(message))?;
-            if unexplained {
+            // A response asks for the rest of its body as it goes, so a
+            // write after it was sent can leave S3 without its version.
+            let changed = self
+                .origin
+                .states_during(&pending.read.key, sent, self.now)
+                .len()
+                > 1;
+            if unexplained && !changed {
                 return Err(self.failure(format!(
                     "{request:?} ended early with no fault to explain it"
                 )));
