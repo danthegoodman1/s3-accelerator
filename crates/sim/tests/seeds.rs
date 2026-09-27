@@ -177,3 +177,25 @@ fn an_event_under_way_reaches_a_new_rings_home() {
         panic!("{failure}");
     }
 }
+
+/// Seed 45747: a warm check sent before a write through the home answered
+/// after the node had forgotten the write, which it kept only for a
+/// fallback window shorter than S3's timeout, so the home knew the
+/// replaced version. The client's back-off moved this seed's run off the
+/// bug; `a_warm_check_older_than_a_write_keeps_no_metadata` pins it.
+#[test]
+fn a_change_outlasts_the_s3_requests_sent_before_it() {
+    if let Err(failure) = Simulator::from_seed(45747).run() {
+        panic!("{failure}");
+    }
+}
+
+/// Seed 68495: a fill's body from S3 ended short, and with no network
+/// delay a client retried each response that ended early within the same
+/// tick, forever.
+#[test]
+fn clients_back_off_from_a_body_that_ends_early() {
+    if let Err(failure) = Simulator::from_seed(68495).run() {
+        panic!("{failure}");
+    }
+}

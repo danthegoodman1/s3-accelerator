@@ -444,9 +444,9 @@ pub struct Node {
     previous: Option<(Ring, Time)>,
     /// Previous owners that failed to answer since the last ring change.
     unreachable: BTreeSet<NodeId>,
-    /// Changes this node learned of within the last fallback window, from
-    /// a gateway's write, S3's answer or S3's event: a previous home's
-    /// metadata validated before one is stale.
+    /// Changes this node learned of lately, from a gateway's write, S3's
+    /// answer or S3's event: metadata validated before one, a previous
+    /// home's or S3's, is stale.
     written: BTreeMap<ObjectKey, Time>,
     /// Events passed to other homes, until each hears.
     events: BTreeMap<EventId, PassedEvent>,
@@ -1721,9 +1721,12 @@ impl Node {
     }
 
     /// Notes that `key` changed now, so metadata validated earlier, such as
-    /// a previous home's, is stale.
+    /// a previous home's or an S3 answer to a request sent before, is
+    /// stale. A change is kept while either may still arrive: through the
+    /// fallback window, and while an S3 request sent before it may answer.
     fn changed(&mut self, key: &ObjectKey) {
-        let horizon = self.now.0.saturating_sub(self.config.fallback_window);
+        let kept = self.config.fallback_window.max(self.config.origin_timeout);
+        let horizon = self.now.0.saturating_sub(kept);
         self.written.retain(|_, written| written.0 >= horizon);
         self.written.insert(key.clone(), self.now);
     }
@@ -3457,6 +3460,64 @@ mod tests {
             size: 10,
             headers: Vec::new(),
         }
+    }
+
+    /// A warm check that went out before a write through the home, and
+    /// that S3 answered with the version the write replaced, leaves the
+    /// home without that version's metadata, however long S3 took and
+    /// however short the fallback window.
+    #[test]
+    fn a_warm_check_older_than_a_write_keeps_no_metadata() {
+        let policy = BucketPolicy {
+            freshness: Freshness::Ttl(1_000_000),
+            admit_on_first_read: false,
+            warm_on_write: true,
+        };
+        let config = Config {
+            fallback_window: 1,
+            default_policy: policy,
+            ..config(16)
+        };
+        let member = Member {
+            id: NodeId(0),
+            weight: NonZeroU32::MIN,
+        };
+        let mut node = Node::new(NodeId(0), Ring::new(1, vec![member]), config);
+        let etag = ETag("\"v1\"".into());
+        node.on_uploaded(Time(0), key("k"), etag.clone(), 100)
+            .expect("warmed");
+        let check = node
+            .drain()
+            .into_iter()
+            .find_map(|action| match action {
+                Action::Fetch { origin, .. } => Some(origin),
+                _ => None,
+            })
+            .expect("a check");
+        // Another write through the home, then a change to another key
+        // long after the fallback window.
+        node.on_write(Time(10), &key("k"));
+        node.on_write(Time(500), &key("other"));
+        node.drain();
+        let head = ResponseHead {
+            status: 200,
+            etag: Some(etag),
+            content_range: None,
+            content_length: 100,
+            headers: Vec::new(),
+        };
+        node.on_origin_response(Time(600), check, head);
+        node.drain();
+        let read = Read::Object {
+            request: Request::get(key("k")),
+            stale: None,
+            direct: false,
+        };
+        node.on_request(Time(700), GatewayRequestId(1), read);
+        let fetches = node.drain().into_iter().any(
+            |action| matches!(action, Action::Fetch { request, .. } if request.key == key("k")),
+        );
+        assert!(fetches, "the home kept the replaced version's metadata");
     }
 
     /// A coordinator tells the nodes of its rings of a purge again until

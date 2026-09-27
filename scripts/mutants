@@ -1003,6 +1003,11 @@ MUTANTS = [
                "let fraction = format!(\"{fraction:0<3}\")[..3].to_string();")],
     ),
     (
+        "a change is forgotten before S3 requests sent earlier answer",
+        [(NODE, "let kept = self.config.fallback_window.max(self.config.origin_timeout);",
+                "let kept = self.config.fallback_window;")],
+    ),
+    (
         "request IDs never reach nodes",
         [(PEERS, "headers.push((protocol::REQUEST_ID.to_string(), id.to_string()));", "let _ = id;")],
     ),

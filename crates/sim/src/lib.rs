@@ -2407,6 +2407,15 @@ impl Simulator {
         request
     }
 
+    /// Sends a request again next tick. Clients back off before retrying a
+    /// 5xx or a body that ended early, as S3's SDKs do, so a cluster that
+    /// fails at once never answers within one tick.
+    fn retry_later(&mut self, request: u64) {
+        let pending = self.requests.get_mut(&request).expect("a pending request");
+        pending.sent = self.now;
+        self.queue.push(self.now + 1, Event::Retry { request });
+    }
+
     /// Sends a request again, through any gateway.
     fn attempt(&mut self, request: u64) {
         let gateway = self.retries.index(self.options.gateways);
@@ -3726,11 +3735,7 @@ impl Simulator {
             }
             self.summary.server_errors += 1;
             self.summary.client_retries += 1;
-            // Clients back off before retrying a 5xx, as S3's SDKs do, so a
-            // cluster that fails at once never answers within one tick.
-            let pending = self.requests.get_mut(&request).expect("a pending request");
-            pending.sent = self.now;
-            self.queue.push(self.now + 1, Event::Retry { request });
+            self.retry_later(request);
             return Ok(());
         }
         let pending = &self.requests[&request];
@@ -3755,7 +3760,7 @@ impl Simulator {
             }
             self.summary.early_ends += 1;
             self.summary.client_retries += 1;
-            self.attempt(request);
+            self.retry_later(request);
             return Ok(());
         }
         let Pending {
