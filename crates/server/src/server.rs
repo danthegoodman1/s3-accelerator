@@ -14,6 +14,7 @@ use crate::passthrough::{self, ToNode};
 use crate::peers::Peers;
 use crate::protocol::{self, NodeAnswer, NodeRequest};
 use crate::sigv4::{self, AuthError, Credentials, Signable};
+use crate::sqs::Queue;
 use crate::zero_copy::{self, Short};
 use bytes::Bytes;
 use s3_accelerator_core::Time;
@@ -109,11 +110,20 @@ pub async fn run_with(
                 .origin
                 .as_ref()
                 .expect("checked: a node has an origin");
-            let credentials = Credentials {
+            let credentials = || Credentials {
                 access_key_id: origin.access_key_id.clone(),
                 secret_access_key: origin.secret_access_key.clone(),
             };
-            let origin = Rc::new(Origin::new(&origin.endpoint, &origin.region, credentials));
+            let queue = match &config.events {
+                Some(events) => {
+                    let region = events.region.as_ref().unwrap_or(&origin.region);
+                    let queue = Queue::new(&events.queue_url, region, credentials())?;
+                    let visibility = Duration::from_secs(events.visibility_timeout_s);
+                    Some((Rc::new(queue), visibility))
+                }
+                None => None,
+            };
+            let origin = Rc::new(Origin::new(&origin.endpoint, &origin.region, credentials()));
             let node_config = config.cache.node_config();
             let (disk, recovery) = Disk::open(Path::new(&node.data_dir), node_config.store)?;
             let id = NodeId(node.id);
@@ -175,6 +185,10 @@ pub async fn run_with(
                 membership_engine::leave(&membership);
                 let _ = stopper.send(true);
             });
+            if let Some((queue, visibility)) = queue {
+                let engine = engine.clone();
+                tokio::task::spawn_local(node_engine::take_events(engine, queue, visibility));
+            }
             let stop = stopped_signal(stopped.clone());
             Some(tokio::task::spawn_local(node_engine::serve(
                 listener,

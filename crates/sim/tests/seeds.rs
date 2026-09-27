@@ -68,3 +68,13 @@ fn a_write_around_a_suspected_home_is_read_from_s3() {
         panic!("{failure}");
     }
 }
+
+/// Seed 426: two nodes split, each alone in its own ring. A gateway routed
+/// around one of them to the other, which read its own ring as naming it
+/// the home and served metadata an event had made stale.
+#[test]
+fn a_read_sent_around_the_home_reads_s3() {
+    if let Err(failure) = Simulator::from_seed(426).run() {
+        panic!("{failure}");
+    }
+}

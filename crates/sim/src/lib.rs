@@ -25,8 +25,8 @@ use s3_accelerator_core::gateway::{self, ClientRequestId, Gateway, NodeRequestId
 use s3_accelerator_core::layout::Layout;
 use s3_accelerator_core::membership::{self, Membership, MembershipTimer, Peer};
 use s3_accelerator_core::node::{
-    self, BucketPolicy, Freshness, GatewayRequestId, Node, ObjectMeta, OriginRequestId, Read,
-    Segment, StoredBlock,
+    self, BucketPolicy, EventId, Freshness, GatewayRequestId, Node, ObjectMeta, OriginRequestId,
+    Read, Segment, StoredBlock,
 };
 use s3_accelerator_core::placement::{Member, NodeId, Placement, Ring};
 use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
@@ -135,6 +135,15 @@ pub struct Options {
     /// Share of writes, while clients issue requests, that pass through a
     /// gateway and a node to S3; the rest reach S3 from elsewhere.
     pub gateway_write_percent: u64,
+    /// S3 notifies the cluster of every change to the TTL bucket through a
+    /// queue, whose bucket TTL is then a long backstop. The queue offers
+    /// each event after up to `event_delay_max` ticks, repeats
+    /// `event_repeat_percent` of them, and offers an event again once
+    /// `visibility_timeout` ticks pass without a node deleting it.
+    pub events: bool,
+    pub event_delay_max: u64,
+    pub event_repeat_percent: u64,
+    pub visibility_timeout: u64,
     /// One-way network delay, in ticks.
     pub delay_min: u64,
     pub delay_max: u64,
@@ -223,6 +232,10 @@ impl Options {
             peer_timeout: 0,
             resize_per_10k: 0,
             gateway_write_percent: 0,
+            events: false,
+            event_delay_max: 0,
+            event_repeat_percent: 0,
+            visibility_timeout: 0,
         };
         // Timeouts outlast every exchange of a fault-free run, so only
         // faults make them fire: S3 answers within two hops, and a node
@@ -269,6 +282,13 @@ impl Options {
             true => 0,
             false => prng.range(1..=100),
         };
+        options.events = prng.percent(40);
+        options.event_delay_max = prng.range(0..=300);
+        options.event_repeat_percent = prng.range(0..=20);
+        options.visibility_timeout = options.peer_timeout + hop * prng.range(2..=10);
+        if options.events {
+            options.ttl = prng.range(2_000..=20_000);
+        }
         options
     }
 
@@ -328,6 +348,10 @@ impl Options {
             peer_timeout: 50,
             resize_per_10k: 0,
             gateway_write_percent: 0,
+            events: false,
+            event_delay_max: 0,
+            event_repeat_percent: 0,
+            visibility_timeout: 1_000,
         }
     }
 
@@ -472,6 +496,31 @@ enum Message {
     /// A node write that found its node down, as a refused connection.
     NodeWriteRefused {
         change: u64,
+    },
+    /// S3's event queue offers a node message `message`, which says `key`
+    /// changed to `etag`; the node passes it to other homes, and deletes it
+    /// once they have it.
+    QueueEvent {
+        message: u64,
+        key: ObjectKey,
+        etag: Option<ETag>,
+    },
+    EventNotice {
+        node: usize,
+        run: u64,
+        event: EventId,
+        key: ObjectKey,
+        etag: Option<ETag>,
+    },
+    EventHeard {
+        run: u64,
+        event: EventId,
+        from: usize,
+    },
+    /// A node deletes a message it finished, under its ring `ring`.
+    DeleteEvent {
+        message: u64,
+        ring: u64,
     },
     OriginWrite {
         node: usize,
@@ -623,12 +672,11 @@ struct Pending {
 }
 
 /// An attempt at a client's read: the request, its client, the gateway
-/// it went through and that gateway's ring version, and when it went out.
+/// it went through, and when it went out.
 struct Attempt {
     request: u64,
     client: usize,
     gateway: usize,
-    ring: u64,
     sent: u64,
 }
 
@@ -652,6 +700,15 @@ struct Acknowledged {
     applied: u64,
     heard: u64,
     ring: u64,
+}
+
+/// A message in S3's event queue: its change to `key`, when S3 applied the
+/// change, and when the queue next offers the message.
+struct Notification {
+    key: ObjectKey,
+    etag: Option<ETag>,
+    applied: u64,
+    visible_at: u64,
 }
 
 /// A response body as it arrived: `len` bytes long, unless it ended early.
@@ -702,6 +759,16 @@ pub struct Simulator {
     resizes: Prng,
     gateway_writes: Prng,
     write_errors: Prng,
+    events: Prng,
+    /// S3's event queue, and for each key, when S3 applied each change a
+    /// node finished the event of, when, and under what ring.
+    notifications: BTreeMap<u64, Notification>,
+    next_notification: u64,
+    /// Scripted: the node the queue offers every event to, and whether it
+    /// holds them back.
+    events_to: Option<usize>,
+    events_held: bool,
+    finished_events: BTreeMap<ObjectKey, Vec<(u64, u64, u64)>>,
     /// Whether faults happen: while clients are still issuing requests.
     faulty: bool,
     /// Nodes cut off from everyone, until the tick given.
@@ -740,6 +807,8 @@ pub struct Simulator {
     requests: BTreeMap<u64, Pending>,
     issued: u64,
     attempts: BTreeMap<u64, Attempt>,
+    /// Each gateway's ring version, and when it took that ring up.
+    gateway_rings: Vec<(u64, u64)>,
     /// Writes through gateways in progress, and the latest each gateway
     /// saw succeed for each key.
     changes: BTreeMap<u64, Change>,
@@ -855,6 +924,12 @@ impl Simulator {
             resizes: Prng::stream(seed, "resizes"),
             gateway_writes: Prng::stream(seed, "gateway writes"),
             write_errors: Prng::stream(seed, "write errors"),
+            events: Prng::stream(seed, "events"),
+            notifications: BTreeMap::new(),
+            next_notification: 0,
+            events_to: None,
+            events_held: false,
+            finished_events: BTreeMap::new(),
             faulty: true,
             partitioned: BTreeMap::new(),
             down: BTreeMap::new(),
@@ -892,6 +967,7 @@ impl Simulator {
             in_flight: vec![0; options.clients],
             requests: BTreeMap::new(),
             attempts: BTreeMap::new(),
+            gateway_rings: vec![(ring.version(), 0); options.gateways],
             changes: BTreeMap::new(),
             next_change: 0,
             acknowledged: BTreeMap::new(),
@@ -997,10 +1073,97 @@ impl Simulator {
     /// Writes an object to the model of S3 now.
     pub fn put(&mut self, key: &ObjectKey, size: u64) {
         self.origin.put(self.now, key, size, &mut self.writers);
+        self.notify(key);
     }
 
     pub fn delete(&mut self, key: &ObjectKey) {
         self.origin.delete(self.now, key);
+        self.notify(key);
+    }
+
+    /// Runs until S3's event queue is empty and the cluster is idle.
+    pub fn deliver_events(&mut self) -> Result<(), Failure> {
+        let deadline = self.now + 100_000;
+        while !self.notifications.is_empty() {
+            if self.now > deadline {
+                return Err(self.failure("events stayed in the queue".into()));
+            }
+            self.tick()?;
+        }
+        self.settle()
+    }
+
+    /// Makes the queue offer every event to `node`, whether or not it is up.
+    pub fn offer_events_to(&mut self, node: usize) {
+        self.events_to = Some(node);
+    }
+
+    /// Makes the queue hold its events until `release_events`.
+    pub fn hold_events(&mut self) {
+        self.events_held = true;
+    }
+
+    pub fn release_events(&mut self) {
+        self.events_held = false;
+    }
+
+    /// S3 queues an event for a change it just applied to `key`, and
+    /// sometimes a repeat of it.
+    fn notify(&mut self, key: &ObjectKey) {
+        if !self.options.events || key.bucket != TTL_BUCKET {
+            return;
+        }
+        let etag = self.origin.current(key).map(|object| object.etag.clone());
+        let copies = 1 + u64::from(self.events.percent(self.options.event_repeat_percent));
+        for _ in 0..copies {
+            let delay = self.events.range(0..=self.options.event_delay_max);
+            let message = self.next_notification;
+            self.next_notification += 1;
+            let notification = Notification {
+                key: key.clone(),
+                etag: etag.clone(),
+                applied: self.now,
+                visible_at: self.now + delay,
+            };
+            self.notifications.insert(message, notification);
+        }
+    }
+
+    /// The queue offers each visible event to a node that is up, and hides
+    /// it until the visibility timeout passes.
+    fn offer_events(&mut self) {
+        if self.events_held {
+            return;
+        }
+        let visible: Vec<u64> = self
+            .notifications
+            .iter()
+            .filter(|(_, notification)| notification.visible_at <= self.now)
+            .map(|(&message, _)| message)
+            .collect();
+        let up: Vec<usize> = match self.events_to {
+            Some(node) => vec![node],
+            None => (0..self.nodes.len())
+                .filter(|&node| self.nodes[node].is_some())
+                .collect(),
+        };
+        if up.is_empty() {
+            return;
+        }
+        for message in visible {
+            let node = up[self.events.index(up.len())];
+            let notification = self.notifications.get_mut(&message).expect("visible");
+            notification.visible_at = self.now + self.options.visibility_timeout;
+            let (key, etag) = (notification.key.clone(), notification.etag.clone());
+            if self.trace {
+                eprintln!(
+                    "{} queue offers node {node} event {message}: {key:?} {etag:?}",
+                    self.now
+                );
+            }
+            let offer = Message::QueueEvent { message, key, etag };
+            self.send(Address::Origin, Address::Node(node), offer);
+        }
     }
 
     /// Writes an object through gateway 0, which passes it to the key's
@@ -1043,6 +1206,7 @@ impl Simulator {
         size: u64,
     ) -> Result<(), Failure> {
         self.origin.put(self.now, key, size, &mut self.writers);
+        self.notify(key);
         let home = self.gateways[gateway]
             .ring()
             .owner(Placement::Home(key).hash())
@@ -1476,6 +1640,7 @@ impl Simulator {
         self.tick_faults()?;
         self.apply_origin_writes();
         self.tick_writes();
+        self.offer_events();
         self.tick_clients();
         let mut events = 0;
         while let Some(event) = self.queue.pop_due(self.now) {
@@ -1745,9 +1910,12 @@ impl Simulator {
             (false, true) => self.origin.delete(self.now, &key),
             (false, false) => self.origin.put(self.now, &key, size, &mut self.writers),
         }
-        if self.trace && !through_gateway {
-            let etag = self.origin.current(&key).map(|object| &object.etag);
-            eprintln!("{} S3 write of {key:?}: {etag:?}", self.now);
+        if !through_gateway {
+            self.notify(&key);
+            if self.trace {
+                let etag = self.origin.current(&key).map(|object| &object.etag);
+                eprintln!("{} S3 write of {key:?}: {etag:?}", self.now);
+            }
         }
         self.summary.writes += 1;
     }
@@ -1781,6 +1949,9 @@ impl Simulator {
                     204
                 }
             };
+            if status < 300 {
+                self.notify(&key);
+            }
             if self.trace {
                 eprintln!(
                     "{} write {change} reached S3 via node {node}: {status}",
@@ -1918,13 +2089,11 @@ impl Simulator {
         let (client, read) = (pending.client, pending.read.clone());
         let attempt = self.next_attempt;
         self.next_attempt += 1;
-        let ring = self.gateways[gateway].ring().version();
         let sent = self.now;
         let entry = Attempt {
             request,
             client,
             gateway,
-            ring,
             sent,
         };
         self.attempts.insert(attempt, entry);
@@ -2056,6 +2225,7 @@ impl Simulator {
             let stale = match &message {
                 Message::OriginResponse { run, .. }
                 | Message::OriginWriteResponse { run, .. }
+                | Message::EventHeard { run, .. }
                 | Message::PeerResponse { run, .. }
                 | Message::PeerMetadata { run, .. } => *run != self.runs[node],
                 _ => false,
@@ -2143,6 +2313,55 @@ impl Simulator {
                     (entry.candidates, entry.ring) = (candidates, ring);
                 }
                 self.pass_change(gateway, change);
+                Ok(())
+            }
+            (Address::Node(node), Message::QueueEvent { message, key, etag }) => {
+                self.node(node).on_event(now, EventId(message), key, etag);
+                self.drain_node(node)
+            }
+            (
+                Address::Node(to),
+                Message::EventNotice {
+                    node,
+                    run,
+                    event,
+                    key,
+                    etag,
+                },
+            ) => {
+                if self.trace {
+                    eprintln!(
+                        "{} node {to} hears {event:?} from node {node}: {key:?} {etag:?}",
+                        self.now
+                    );
+                }
+                self.node(to).on_event_notice(now, &key, etag.as_ref());
+                self.drain_node(to)?;
+                let heard = Message::EventHeard {
+                    run,
+                    event,
+                    from: to,
+                };
+                self.send(Address::Node(to), Address::Node(node), heard);
+                Ok(())
+            }
+            (Address::Node(node), Message::EventHeard { event, from, .. }) => {
+                self.node(node)
+                    .on_event_passed(now, event, NodeId(from as u64), true);
+                self.drain_node(node)
+            }
+            (Address::Origin, Message::DeleteEvent { message, ring }) => {
+                if let Some(notification) = self.notifications.remove(&message) {
+                    self.summary.events += 1;
+                    if self.trace {
+                        eprintln!("{} event {message} finished under ring {ring:x}", self.now);
+                    }
+                    let finished = (notification.applied, self.now, ring);
+                    self.finished_events
+                        .entry(notification.key)
+                        .or_default()
+                        .push(finished);
+                }
                 Ok(())
             }
             (Address::Gateway(gateway), Message::NodeWriteRefused { change }) => {
@@ -2402,6 +2621,10 @@ impl Simulator {
     }
 
     fn drain_gateway(&mut self, gateway: usize) -> Result<(), Failure> {
+        let version = self.gateways[gateway].ring().version();
+        if self.gateway_rings[gateway].0 != version {
+            self.gateway_rings[gateway] = (version, self.now);
+        }
         for action in self.gateways[gateway].drain() {
             match action {
                 gateway::Action::Send { node, id, read } => {
@@ -2613,6 +2836,13 @@ impl Simulator {
                     body,
                     meta,
                 } => {
+                    if self.trace {
+                        let etag = meta.as_ref().map(|meta| &meta.etag);
+                        eprintln!(
+                            "{} node {node} answers {request:?} {} {:?} with metadata {etag:?}",
+                            self.now, head.status, head.etag
+                        );
+                    }
                     for segment in &body {
                         if let Segment::Origin { origin, .. } = segment {
                             self.check_streaming(node, *origin)?;
@@ -2643,6 +2873,29 @@ impl Simulator {
                 node::Action::PassWrite { node: to, key } => {
                     let message = Message::WriteNotice { key };
                     self.send(Address::Node(node), Address::Node(to.0 as usize), message);
+                }
+                node::Action::PassEvent {
+                    event,
+                    node: to,
+                    key,
+                    etag,
+                } => {
+                    let message = Message::EventNotice {
+                        node,
+                        run,
+                        event,
+                        key,
+                        etag,
+                    };
+                    self.send(Address::Node(node), Address::Node(to.0 as usize), message);
+                }
+                node::Action::EventDone { event } => {
+                    let ring = self.node(node).ring().version();
+                    let message = Message::DeleteEvent {
+                        message: event.0,
+                        ring,
+                    };
+                    self.send(Address::Node(node), Address::Origin, message);
                 }
                 node::Action::PeerFetch { origin, peer, read } => {
                     let asks_metadata = matches!(read, Read::Known(_));
@@ -2880,7 +3133,6 @@ impl Simulator {
         let Attempt {
             request,
             gateway,
-            ring,
             sent,
             ..
         } = self
@@ -2952,16 +3204,36 @@ impl Simulator {
         } = self.requests.remove(&request).expect("pending");
         self.in_flight[client] -= 1;
         let mut from = issued.saturating_sub(self.options.staleness(&read.key));
+        // The gateway's ring, and when it last changed.
+        let (current, since) = self.gateway_rings[gateway];
         // A read through the gateway that passed a write, sent once the
         // write succeeded, sees it while the gateway's ring stays the same.
         // Clients send before a tick's messages arrive, so a read sent in
         // the tick its client heard came first.
         if let Some(write) = self.acknowledged.get(&(gateway, read.key.clone()))
             && write.heard < sent
-            && write.ring == ring
-            && self.gateways[gateway].ring().version() == ring
+            && write.ring == current
+            && since <= write.applied
         {
             from = from.max(write.applied);
+        }
+        // Once a node finished a change's event, a read sent after the
+        // gateways' entries from before it expired sees the change, while
+        // the gateway has routed by the ring that node told the homes under
+        // since then.
+        if let Some(changes) = self.finished_events.get(&read.key) {
+            let settled =
+                self.options.gateway_metadata_ttl + 2 * (10 * self.options.delay_max + 10);
+            let seen = changes
+                .iter()
+                .filter(|(_, finished, by)| {
+                    finished + settled < sent && *by == current && since <= *finished
+                })
+                .map(|(applied, _, _)| *applied)
+                .max();
+            if let Some(applied) = seen {
+                from = from.max(applied);
+            }
         }
         properties::check_response(&self.origin, &read, from, self.now, &head, &body)
             .map_err(|message| self.failure(message))?;
@@ -3125,6 +3397,8 @@ pub struct Summary {
     pub writes: u64,
     pub gateway_writes: u64,
     pub detoured_writes: u64,
+    /// Messages from S3's event queue that nodes finished.
+    pub events: u64,
     /// Requests a node sent back because their object changed.
     pub retries: u64,
     pub origin_requests: u64,
@@ -3181,7 +3455,7 @@ impl fmt::Display for Summary {
             .collect();
         write!(
             f,
-            "seed {} passed: {} ticks, {} writes ({} through gateways, {} around homes), {} retries, responses {}, \
+            "seed {} passed: {} ticks, {} writes ({} through gateways, {} around homes), {} events, {} retries, responses {}, \
              {}% of body bytes from disk, {} S3 requests, {} bytes written, \
              {} blocks evicted, node reads {:?}, {} messages lost, {} server errors, \
              {} client retries, {} crashes, {} clean shutdowns, {} blocks verified, \
@@ -3192,6 +3466,7 @@ impl fmt::Display for Summary {
             self.writes,
             self.gateway_writes,
             self.detoured_writes,
+            self.events,
             self.retries,
             statuses.join(" "),
             self.hit_percent(),

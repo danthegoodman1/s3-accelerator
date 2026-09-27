@@ -15,12 +15,15 @@ use crate::origin::{self, Origin, OriginBody};
 use crate::passthrough;
 use crate::peers::{Exchanged, Peers};
 use crate::protocol::{self, Forward, NodeAnswer, NodeRequest};
+use crate::sqs::{self, Queue};
 use bytes::Bytes;
 use hyper::body::Incoming;
 use s3_accelerator_core::Time;
-use s3_accelerator_core::node::{self, GatewayRequestId, Node, OriginRequestId, Read, Segment};
+use s3_accelerator_core::node::{
+    self, EventId, GatewayRequestId, Node, OriginRequestId, Read, Segment,
+};
 use s3_accelerator_core::placement::{NodeId, Ring};
-use s3_accelerator_core::s3::{ByteRange, Method, ObjectKey, Request, ResponseHead};
+use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
 use s3_accelerator_core::store::Location;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -109,6 +112,23 @@ pub struct NodeEngine {
     unsynced_metadata: bool,
     /// Where each node in the ring is reached, for answering ring requests.
     addresses: BTreeMap<NodeId, String>,
+    events: Events,
+}
+
+/// Messages from S3's event queue while the core works through their
+/// events.
+#[derive(Default)]
+struct Events {
+    queue: Option<Rc<Queue>>,
+    /// How long a message stays hidden once taken; the queue offers it
+    /// again after that, so the node forgets it.
+    visibility: Duration,
+    next_event: u64,
+    next_message: u64,
+    /// Each event's message.
+    events: BTreeMap<EventId, u64>,
+    /// Each message's receipt, its events left, and when the node took it.
+    messages: BTreeMap<u64, (String, usize, Instant)>,
 }
 
 /// What the node's actions left to start off this thread.
@@ -119,6 +139,9 @@ struct Work {
     /// Reads of previous owners, and writes to pass on.
     peer_fetches: Vec<(OriginRequestId, NodeId, Read)>,
     passed_writes: Vec<(NodeId, ObjectKey)>,
+    /// Events to pass on, and receipts of messages to delete.
+    passed_events: Vec<(EventId, NodeId, ObjectKey, Option<ETag>)>,
+    deletes: Vec<String>,
     writes: Vec<(Location, Bytes)>,
     /// Slots to verify: location, length and checksum.
     verifies: Vec<(Location, u64, u64)>,
@@ -147,6 +170,7 @@ impl NodeEngine {
             work: Work::default(),
             tasks: BTreeMap::new(),
             unsynced_metadata: false,
+            events: Events::default(),
         }));
         // A recovering node's first actions clear records it cannot use.
         let work = engine.borrow_mut().pump();
@@ -217,12 +241,82 @@ impl NodeEngine {
         start(engine, work);
     }
 
+    /// The node takes S3's events from `queue`, whose messages stay hidden
+    /// for `visibility` once taken.
+    pub fn take_events_from(engine: &SharedNode, queue: Rc<Queue>, visibility: Duration) {
+        let mut this = engine.borrow_mut();
+        this.events.queue = Some(queue);
+        this.events.visibility = visibility;
+    }
+
+    /// The node took a message from the queue, whose receipt deletes it,
+    /// naming `changes`: each object and its new ETag, or `None` once gone.
+    pub fn take_message(
+        engine: &SharedNode,
+        receipt: String,
+        changes: Vec<(ObjectKey, Option<ETag>)>,
+    ) {
+        let work = {
+            let mut this = engine.borrow_mut();
+            let now = this.now();
+            let events = &mut this.events;
+            let message = events.next_message;
+            events.next_message += 1;
+            let left = changes.len();
+            events
+                .messages
+                .insert(message, (receipt, left, Instant::now()));
+            let mut taken = Vec::new();
+            for (key, etag) in changes {
+                let event = EventId(events.next_event);
+                events.next_event += 1;
+                events.events.insert(event, message);
+                taken.push((event, key, etag));
+            }
+            for (event, key, etag) in taken {
+                this.node.on_event(now, event, key, etag);
+            }
+            this.pump()
+        };
+        start(engine, work);
+    }
+
+    /// Another node passed on S3's event that `key` changed to `etag`.
+    pub fn event_notice(engine: &SharedNode, key: &ObjectKey, etag: Option<&ETag>) {
+        let work = {
+            let mut this = engine.borrow_mut();
+            let now = this.now();
+            this.node.on_event_notice(now, key, etag);
+            this.pump()
+        };
+        start(engine, work);
+    }
+
+    fn event_passed(engine: &SharedNode, event: EventId, node: NodeId, heard: bool) {
+        let work = {
+            let mut this = engine.borrow_mut();
+            let now = this.now();
+            this.node.on_event_passed(now, event, node, heard);
+            this.pump()
+        };
+        start(engine, work);
+    }
+
     /// Lets the node's timeouts run, and syncs the metadata file.
     pub fn tick(engine: &SharedNode) {
         let work = {
             let mut this = engine.borrow_mut();
             let now = this.now();
             this.node.on_tick(now);
+            let visibility = this.events.visibility;
+            let events = &mut this.events;
+            events
+                .messages
+                .retain(|_, (_, _, taken)| taken.elapsed() < visibility);
+            let messages = &events.messages;
+            events
+                .events
+                .retain(|_, message| messages.contains_key(message));
             if std::mem::take(&mut this.unsynced_metadata) {
                 let disk = this.disk.clone();
                 tokio::task::spawn_blocking(move || {
@@ -327,6 +421,25 @@ impl NodeEngine {
                 self.work.peer_fetches.push((origin, peer, read));
             }
             node::Action::PassWrite { node, key } => self.work.passed_writes.push((node, key)),
+            node::Action::PassEvent {
+                event,
+                node,
+                key,
+                etag,
+            } => self.work.passed_events.push((event, node, key, etag)),
+            node::Action::EventDone { event } => {
+                let events = &mut self.events;
+                let Some(message) = events.events.remove(&event) else {
+                    return;
+                };
+                if let Some((_, left, _)) = events.messages.get_mut(&message) {
+                    *left -= 1;
+                    if *left == 0 {
+                        let (receipt, _, _) = events.messages.remove(&message).expect("present");
+                        self.work.deletes.push(receipt);
+                    }
+                }
+            }
             node::Action::Cancel { origin } => {
                 if let Some(task) = self.tasks.remove(&origin) {
                     task.abort();
@@ -458,6 +571,38 @@ fn start(engine: &SharedNode, work: Work) {
                 Err(error) => eprintln!("passing a write to node {}: {error}", node.0),
             }
         });
+    }
+    for (event, node, key, etag) in work.passed_events {
+        let engine = engine.clone();
+        let peers = engine.borrow().peers.clone();
+        tokio::task::spawn_local(async move {
+            let request = NodeRequest::Event { key, etag };
+            let told = tokio::time::timeout(PASS_WAIT, peers.exchange(node, &request)).await;
+            let heard = match told {
+                Ok(Ok(exchanged)) => {
+                    peers.idle(exchanged.body);
+                    true
+                }
+                Ok(Err(error)) => {
+                    eprintln!("passing an event to node {}: {error}", node.0);
+                    false
+                }
+                Err(_) => false,
+            };
+            NodeEngine::event_passed(&engine, event, node, heard);
+        });
+    }
+    if !work.deletes.is_empty()
+        && let Some(queue) = engine.borrow().events.queue.clone()
+    {
+        for receipt in work.deletes {
+            let queue = queue.clone();
+            tokio::task::spawn_local(async move {
+                if let Err(error) = queue.delete(&receipt).await {
+                    eprintln!("deleting an event message: {error}");
+                }
+            });
+        }
     }
     for (location, bytes) in work.writes {
         write(engine, location, bytes);
@@ -711,6 +856,42 @@ fn write(engine: &SharedNode, location: Location, bytes: Bytes) {
     });
 }
 
+/// How long each poll of the event queue waits for messages.
+const EVENTS_WAIT: Duration = Duration::from_secs(20);
+
+/// Takes S3's events from `queue` into the node for as long as the node
+/// runs. A message the node cannot read leaves the queue, since it would
+/// fail again; one whose events the node fails to finish returns to the
+/// queue once `visibility` passes.
+pub async fn take_events(engine: SharedNode, queue: Rc<Queue>, visibility: Duration) {
+    NodeEngine::take_events_from(&engine, queue.clone(), visibility);
+    loop {
+        let offered = match queue.receive(EVENTS_WAIT, visibility).await {
+            Ok(offered) => offered,
+            Err(error) => {
+                eprintln!("polling the event queue: {error}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        for message in offered {
+            match sqs::changes(&message.body) {
+                Ok(changes) if !changes.is_empty() => {
+                    NodeEngine::take_message(&engine, message.receipt, changes);
+                }
+                read => {
+                    if let Err(error) = read {
+                        eprintln!("an event message: {error}");
+                    }
+                    if let Err(error) = queue.delete(&message.receipt).await {
+                        eprintln!("deleting an event message: {error}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Serves gateways on `listener` until `stop` completes, then waits for work
 /// in progress and shuts the disk down cleanly.
 pub async fn serve(
@@ -752,6 +933,8 @@ pub async fn serve(
 
 /// How long a shutdown waits for work in progress.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
+/// How long a node waits for another to take an event it passes on.
+const PASS_WAIT: Duration = Duration::from_secs(10);
 
 async fn connection(stream: TcpStream, engine: &SharedNode, secret: &str) -> io::Result<()> {
     let mut connection = Connection::new(stream);
@@ -778,6 +961,15 @@ async fn connection(stream: TcpStream, engine: &SharedNode, secret: &str) -> io:
         connection.read_body(len).await?;
         let reply = match request {
             NodeRequest::Forward(_) => unreachable!("forwarded above"),
+            NodeRequest::Event { key, etag } => {
+                NodeEngine::event_notice(engine, &key, etag.as_ref());
+                Reply {
+                    answer: NodeAnswer::Written,
+                    body: Vec::new(),
+                    len: 0,
+                    sending: None,
+                }
+            }
             NodeRequest::Written { key, passed_on } => {
                 NodeEngine::written(engine, &key, passed_on);
                 Reply {

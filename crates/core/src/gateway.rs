@@ -615,7 +615,14 @@ impl Gateway {
     ) -> NodeRequestId {
         let node_request = NodeRequestId(self.next_node_request);
         self.next_node_request += 1;
-        let read = what.read();
+        let mut read = what.read();
+        // A node other than the home under this gateway's ring stands in
+        // for the home, and reads S3 directly whatever its own ring says.
+        if let (What::Object(_, placement), Read::Object { direct, .. }) = (&what, &mut read)
+            && self.ring.owner(*placement) != Some(node)
+        {
+            *direct = true;
+        }
         let part = Part {
             read: id,
             what,
@@ -1133,6 +1140,39 @@ mod tests {
         gateway.drain();
         gateway.on_request(Time(5), ClientRequestId(3), Request::head(key("k")));
         assert!(home_read(gateway.drain()).is_some());
+    }
+
+    /// A read the home failed to answer goes to the next candidate marked
+    /// direct, so that node reads S3 whatever its own ring says.
+    #[test]
+    fn a_read_sent_around_the_home_goes_direct() {
+        let mut gateway = gateway();
+        let key = ObjectKey {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        gateway.on_request(Time(0), ClientRequestId(1), Request::get(key.clone()));
+        let reads = |actions: Vec<Action>| -> Vec<(NodeId, bool)> {
+            actions
+                .into_iter()
+                .filter_map(|action| match action {
+                    Action::Send {
+                        node,
+                        read: Read::Object { direct, .. },
+                        ..
+                    } => Some((node, direct)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let home = gateway.ring().owner(Placement::Home(&key).hash()).unwrap();
+        assert_eq!(reads(gateway.drain()), [(home, false)]);
+        gateway.on_tick(Time(1_000));
+        let [(stand_in, direct)] = reads(gateway.drain())[..] else {
+            panic!("one read goes to the next candidate");
+        };
+        assert_ne!(stand_in, home);
+        assert!(direct);
     }
 
     /// A node answers the same request twice while the gateway forwards

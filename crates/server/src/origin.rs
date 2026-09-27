@@ -69,23 +69,14 @@ impl Origin {
             .split_once("://")
             .map_or(endpoint.as_str(), |(_, rest)| rest)
             .to_string();
-        let mut http = HttpConnector::new();
-        http.enforce_http(false);
-        http.set_nodelay(true);
-        http.set_connect_timeout(Some(CONNECT_TIMEOUT));
-        let https = HttpsConnectorBuilder::new()
-            .with_platform_verifier()
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(http);
-        let client = Client::builder(TokioExecutor::new()).build(https);
         Origin {
-            client,
+            client: client(),
             endpoint,
             authority,
             signer: Signer {
                 credentials,
                 region: region.to_string(),
+                service: "s3",
             },
         }
     }
@@ -190,6 +181,21 @@ impl Origin {
     }
 }
 
+/// An HTTP/1.1 client for AWS, over TLS or plaintext, that keeps idle
+/// connections for reuse.
+pub fn client() -> Client<HttpsConnector<HttpConnector>, RequestBody> {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_nodelay(true);
+    http.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    let https = HttpsConnectorBuilder::new()
+        .with_platform_verifier()
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http);
+    Client::builder(TokioExecutor::new()).build(https)
+}
+
 /// `/bucket/key`, each segment percent-encoded.
 fn object_path(key: &ObjectKey) -> String {
     let segments: Vec<String> = key.key.split('/').map(sigv4::encode).collect();
@@ -211,7 +217,7 @@ pub fn header_pairs(headers: &http::HeaderMap) -> Vec<(String, String)> {
 }
 
 /// Reads a whole body of at most `limit` bytes.
-async fn collect(mut body: Incoming, limit: u64) -> io::Result<Bytes> {
+pub async fn collect(mut body: Incoming, limit: u64) -> io::Result<Bytes> {
     let mut bytes = Vec::new();
     while let Some(frame) = next_frame(&mut body).await? {
         if (bytes.len() + frame.len()) as u64 > limit {

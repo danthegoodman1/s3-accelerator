@@ -3,7 +3,12 @@
 
 mod common;
 
-use common::{CLUSTER_CACHE, Cluster, LISTING, data_dir, object, send, start_origin, try_get};
+use common::{
+    CLUSTER_CACHE, Cluster, LISTING, data_dir, object, send, start_origin, start_queue, try_get,
+};
+use s3_accelerator_core::placement::{Member, NodeId, Placement, Ring};
+use s3_accelerator_core::s3::ObjectKey;
+use std::num::NonZeroU32;
 use std::time::Duration;
 use tokio::task::LocalSet;
 
@@ -279,6 +284,74 @@ async fn a_read_after_a_write_through_the_gateway_sees_the_write() {
             assert_eq!(status, 200);
             let read = send(port, "GET", path, "", &[], Vec::new()).await;
             assert_eq!(read, (200, written));
+        })
+        .await;
+}
+
+/// S3 tells the cluster of a change made elsewhere through its event
+/// queue. Only node 0 polls the queue, and the key's home is node 1, so
+/// node 0 passes the event on; the home drops the old version, and the
+/// next read returns the new one. An event for the version the cache
+/// holds changes nothing, so the read after it costs no S3 request.
+#[tokio::test(flavor = "current_thread")]
+async fn an_event_from_the_queue_reaches_the_home() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            let (queue_port, queue) = start_queue().await;
+            let cluster =
+                Cluster::with_nodes(&data_dir(), origin_port, CLUSTER_CACHE, 2, "", &[]);
+            let events = format!(
+                "[events]\nqueue_url = \"http://127.0.0.1:{queue_port}/000000000000/events\"\nvisibility_timeout_s = 2\n"
+            );
+            let config = &cluster.nodes[0].1;
+            let text = std::fs::read_to_string(config).unwrap();
+            std::fs::write(config, format!("{events}{text}")).unwrap();
+            let _nodes = [cluster.start(0).await, cluster.start(1).await];
+            let _gateway = cluster.start_gateway().await;
+            let homed_on_1 = |name: &String| {
+                let members = [0, 1].map(|id| Member {
+                    id: NodeId(id),
+                    weight: NonZeroU32::MIN,
+                });
+                let key = ObjectKey {
+                    bucket: "changing".into(),
+                    key: name.clone(),
+                };
+                Ring::new(0, members.to_vec()).owner(Placement::Home(&key).hash()) == Some(NodeId(1))
+            };
+            let name = (0..).map(|index| format!("k{index}")).find(homed_on_1).unwrap();
+            let path = format!("/changing/{name}");
+            let port = cluster.gateway_port;
+            let first = origin.object(&path);
+            for _ in 0..2 {
+                let read = send(port, "GET", &path, "", &[], Vec::new()).await;
+                assert!(read == (200, first.clone()), "{}", read.0);
+            }
+            let drained = || async {
+                while queue.len() > 0 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                // The gateway's entries expire after a second.
+                tokio::time::sleep(Duration::from_millis(1_100)).await;
+            };
+            let changed = b"changed elsewhere".to_vec();
+            let version = ("\"elsewhere\"".to_string(), changed.clone());
+            origin.written.borrow_mut().insert(path.clone(), version);
+            queue.send("changing", &name, Some("elsewhere"));
+            tokio::time::timeout(Duration::from_secs(10), drained())
+                .await
+                .expect("a node deletes the message once the home has the event");
+            let read = send(port, "GET", &path, "", &[], Vec::new()).await;
+            assert_eq!(read, (200, changed.clone()));
+            let before = origin.requests.get();
+            queue.send("changing", &name, Some("elsewhere"));
+            tokio::time::timeout(Duration::from_secs(10), drained())
+                .await
+                .expect("a node deletes the message");
+            let read = send(port, "GET", &path, "", &[], Vec::new()).await;
+            assert_eq!(read, (200, changed));
+            assert_eq!(origin.requests.get(), before);
         })
         .await;
 }

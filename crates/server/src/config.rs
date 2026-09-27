@@ -15,6 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct Config {
     /// S3, which only storage nodes reach.
     pub origin: Option<OriginConfig>,
+    /// The SQS queue S3 sends its event notifications to, which storage
+    /// nodes poll with the origin's credentials.
+    pub events: Option<EventsConfig>,
     #[serde(default)]
     pub clients: Vec<Client>,
     #[serde(default)]
@@ -126,6 +129,9 @@ impl Config {
                 return Err(format!("node {} has weight 0", node.id));
             }
         }
+        if self.events.is_some() && self.origin.is_none() {
+            return Err("[events] needs [origin]'s credentials".into());
+        }
         if let Some(node) = &self.node {
             if self.origin.is_none() {
                 return Err("a node needs [origin]".into());
@@ -172,6 +178,22 @@ impl Config {
             .map(|node| (NodeId(node.id), node.address.clone()))
             .collect()
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventsConfig {
+    /// Such as `https://sqs.us-east-1.amazonaws.com/123456789012/events`.
+    pub queue_url: String,
+    /// The queue's region, if other than the origin's.
+    pub region: Option<String>,
+    /// How long a message stays hidden from other nodes once one takes it.
+    #[serde(default = "default_visibility_timeout")]
+    pub visibility_timeout_s: u64,
+}
+
+fn default_visibility_timeout() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize)]

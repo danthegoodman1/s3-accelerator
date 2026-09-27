@@ -35,6 +35,7 @@ ZERO_COPY = "crates/server/src/zero_copy.rs"
 MEMBERSHIP_ENGINE = "crates/server/src/membership_engine.rs"
 GATEWAY_ENGINE = "crates/server/src/gateway_engine.rs"
 PASSTHROUGH = "crates/server/src/passthrough.rs"
+SQS = "crates/server/src/sqs.rs"
 STEP_TIMEOUT = 600
 
 MUTANTS = [
@@ -487,7 +488,7 @@ MUTANTS = [
     ),
     (
         "a node other than the home keeps a write to itself",
-        [(NODE, "let homes = [\n                self.ring.owner(placement),", "let homes = [\n                None,")],
+        [(NODE, "let homes = [\n            self.ring.owner(placement),", "let homes = [\n            None,")],
     ),
     (
         "a gateway keeps its entry after a write it passed to a node",
@@ -500,6 +501,45 @@ MUTANTS = [
     (
         "a chunked answer reaches the client unframed",
         [(SERVER, "Ok(Some(piece)) => to.write_chunk(&piece).await?,", "Ok(Some(piece)) => to.write_all(&piece).await?,")],
+    ),
+    (
+        "a node keeps an event from the key's home",
+        [(NODE, "let homes = self.other_homes(&key);\n        if homes.is_empty() {",
+          "let homes = BTreeSet::<NodeId>::new();\n        if homes.is_empty() {")],
+    ),
+    (
+        "an event no home heard of leaves the queue",
+        [(NODE, "self.events.retain(|_, (_, until)| *until > now);",
+          "let expired: Vec<EventId> = self.events.iter().filter(|(_, (_, until))| *until <= now).map(|(event, _)| *event).collect();\n"
+          "        for event in expired { self.events.remove(&event); self.actions.push(Action::EventDone { event }); }")],
+    ),
+    (
+        "an event for the version the home holds drops it",
+        [(NODE, "&& meta.etag == *etag\n        {\n            return;\n        }", "&& meta.etag == *etag && false\n        {\n            return;\n        }")],
+    ),
+    (
+        "a home ignores an event another node passed on",
+        [(NODE, "self.now = self.now.max(now);\n        self.change_to(now, key, etag);\n    }", "self.now = self.now.max(now);\n        let _ = (key, etag);\n    }")],
+    ),
+    (
+        "a home ignores an event notice from another node",
+        [(NODE_ENGINE, "NodeEngine::event_notice(engine, &key, etag.as_ref());", "let _ = (&key, &etag);")],
+    ),
+    (
+        "a finished event's message stays in the queue",
+        [(NODE_ENGINE, "self.work.deletes.push(receipt);", "let _ = receipt;")],
+    ),
+    (
+        "event queue requests are signed for S3",
+        [(SQS, 'service: "sqs",', 'service: "s3",')],
+    ),
+    (
+        "an event's key keeps its + for a space",
+        [(SQS, "percent_decode_str(&key.replace('+', \" \"))", "percent_decode_str(key)")],
+    ),
+    (
+        "a stand-in for the home trusts its own ring",
+        [(GATEWAY, "&& self.ring.owner(*placement) != Some(node)\n        {\n            *direct = true;", "&& self.ring.owner(*placement) != Some(node)\n        {\n            let _ = direct;")],
     ),
 ]
 

@@ -14,4 +14,5 @@ pub mod peers;
 pub mod protocol;
 pub mod server;
 pub mod sigv4;
+pub mod sqs;
 pub mod zero_copy;

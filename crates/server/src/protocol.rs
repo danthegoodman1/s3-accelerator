@@ -54,6 +54,12 @@ pub enum NodeRequest {
         key: ObjectKey,
         passed_on: bool,
     },
+    /// S3's event that `key` changed to `etag`, or went away for `None`,
+    /// which another node took from the queue.
+    Event {
+        key: ObjectKey,
+        etag: Option<ETag>,
+    },
     /// The node's ring.
     Ring,
     /// A client's request the node passes to S3 under the cluster's
@@ -84,6 +90,7 @@ pub enum NodeAnswer {
     },
     Metadata(ObjectMeta),
     Stale,
+    /// The node took a write or event notice.
     Written,
     /// The node's ring, and where each of its nodes is reached.
     Ring {
@@ -129,6 +136,13 @@ pub fn encode_request(
             add(KIND, "written".into());
             if *passed_on {
                 add(PASSED_ON, "1".into());
+            }
+            key
+        }
+        NodeRequest::Event { key, etag } => {
+            add(KIND, "event".into());
+            if let Some(etag) = etag {
+                add(ETAG, etag.0.clone());
             }
             key
         }
@@ -178,7 +192,7 @@ pub fn encode_request(
         }
     };
     let method = match request {
-        NodeRequest::Written { .. } => "POST",
+        NodeRequest::Written { .. } | NodeRequest::Event { .. } => "POST",
         NodeRequest::Read(_) | NodeRequest::Ring | NodeRequest::Forward(_) => "GET",
     };
     (method, path(key), headers)
@@ -229,6 +243,10 @@ pub fn decode_request(
         "written" => Ok(NodeRequest::Written {
             key,
             passed_on: header(headers, PASSED_ON).is_some(),
+        }),
+        "event" => Ok(NodeRequest::Event {
+            key,
+            etag: header(headers, ETAG).map(|etag| ETag(etag.to_string())),
         }),
         "range" => Ok(NodeRequest::Read(Read::Range(range(key)?))),
         "stored" => Ok(NodeRequest::Read(Read::Stored(range(key)?))),
@@ -527,6 +545,14 @@ mod tests {
         round_trip(NodeRequest::Written {
             key: key(),
             passed_on: true,
+        });
+        round_trip(NodeRequest::Event {
+            key: key(),
+            etag: Some(ETag("\"v2\"".into())),
+        });
+        round_trip(NodeRequest::Event {
+            key: key(),
+            etag: None,
         });
         round_trip(NodeRequest::Ring);
         round_trip(NodeRequest::Forward(Forward {

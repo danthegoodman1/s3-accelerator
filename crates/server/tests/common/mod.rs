@@ -244,6 +244,132 @@ pub async fn start_origin() -> (u16, Rc<Origin>) {
     (port, origin)
 }
 
+/// A fake SQS queue of S3's event notifications. It offers each message to
+/// one poller at a time, and offers it again once its visibility timeout
+/// passes without a delete.
+#[derive(Default)]
+pub struct Queue {
+    /// Each message's receipt, body, and when it becomes visible again.
+    messages: RefCell<Vec<(String, String, Option<std::time::Instant>)>>,
+    sent: Cell<u64>,
+}
+
+impl Queue {
+    /// Queues S3's event that `bucket`'s `key` now has `etag`, or is gone.
+    pub fn send(&self, bucket: &str, key: &str, etag: Option<&str>) {
+        let (name, object) = match etag {
+            Some(etag) => (
+                "ObjectCreated:Put",
+                serde_json::json!({ "key": key, "eTag": etag }),
+            ),
+            None => ("ObjectRemoved:Delete", serde_json::json!({ "key": key })),
+        };
+        let event = serde_json::json!({ "Records": [{
+            "eventName": name,
+            "s3": { "bucket": { "name": bucket }, "object": object },
+        }]});
+        self.sent.set(self.sent.get() + 1);
+        let receipt = format!("receipt-{}", self.sent.get());
+        self.messages
+            .borrow_mut()
+            .push((receipt, event.to_string(), None));
+    }
+
+    /// Messages not yet deleted.
+    pub fn len(&self) -> usize {
+        self.messages.borrow().len()
+    }
+
+    /// Up to ten visible messages, hidden for `visibility` from now on.
+    fn offer(&self, visibility: Duration) -> Vec<(String, String)> {
+        let now = std::time::Instant::now();
+        let mut messages = self.messages.borrow_mut();
+        messages
+            .iter_mut()
+            .filter(|(_, _, hidden)| hidden.is_none_or(|until| until <= now))
+            .take(10)
+            .map(|(receipt, body, hidden)| {
+                *hidden = Some(now + visibility);
+                (receipt.clone(), body.clone())
+            })
+            .collect()
+    }
+}
+
+/// Starts the fake SQS on this `LocalSet`, and returns its port. It takes
+/// only requests signed for SQS.
+pub async fn start_queue() -> (u16, Rc<Queue>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let queue = Rc::new(Queue::default());
+    tokio::task::spawn_local(fake_queue(listener, queue.clone()));
+    (port, queue)
+}
+
+async fn fake_queue(listener: TcpListener, queue: Rc<Queue>) {
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let queue = queue.clone();
+        tokio::task::spawn_local(async move {
+            let mut connection = Connection::new(stream);
+            while let Ok(Some(head)) = connection.read_head().await {
+                let len = head.content_length().unwrap();
+                let Ok(body) = connection.read_body(len).await else {
+                    return;
+                };
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let signed_for_sqs = head
+                    .header("authorization")
+                    .is_some_and(|value| value.contains("/sqs/aws4_request"));
+                let answer = match (signed_for_sqs, head.header("x-amz-target")) {
+                    (false, _) => None,
+                    (true, Some("AmazonSQS.ReceiveMessage")) => {
+                        let wait =
+                            Duration::from_secs(request["WaitTimeSeconds"].as_u64().unwrap());
+                        let visibility =
+                            Duration::from_secs(request["VisibilityTimeout"].as_u64().unwrap());
+                        let deadline = tokio::time::Instant::now() + wait;
+                        let mut offered = queue.offer(visibility);
+                        while offered.is_empty() && tokio::time::Instant::now() < deadline {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            offered = queue.offer(visibility);
+                        }
+                        let messages: Vec<serde_json::Value> = offered
+                            .into_iter()
+                            .map(|(receipt, body)| {
+                                serde_json::json!({ "ReceiptHandle": receipt, "Body": body })
+                            })
+                            .collect();
+                        Some(serde_json::json!({ "Messages": messages }))
+                    }
+                    (true, Some("AmazonSQS.DeleteMessage")) => {
+                        let receipt = request["ReceiptHandle"].as_str().unwrap();
+                        queue
+                            .messages
+                            .borrow_mut()
+                            .retain(|(held, _, _)| held != receipt);
+                        Some(serde_json::json!({}))
+                    }
+                    (true, _) => None,
+                };
+                let (status, body) = match answer {
+                    Some(answer) => (200, answer.to_string()),
+                    None => (403, String::new()),
+                };
+                let response = Response {
+                    status,
+                    headers: vec![("content-type".into(), "application/x-amz-json-1.0".into())],
+                    content_length: body.len() as u64,
+                    body: body.into(),
+                };
+                if connection.write_response(&response, true).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+}
+
 /// A fresh directory for a server's disk.
 pub fn data_dir() -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -366,6 +492,7 @@ pub fn signed_payload(
             secret_access_key: "reader-secret".into(),
         },
         region: "us-east-1".into(),
+        service: "s3",
     };
     let mut headers = vec![("host".to_string(), format!("127.0.0.1:{port}"))];
     for (name, value) in extra {

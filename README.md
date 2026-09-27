@@ -8,6 +8,16 @@ The core serves reads from each object's home node, which keeps the object's met
 
 A config's `[cluster]` table names the storage nodes a process starts with, their addresses and weights, and the secret they share; `[cluster.membership]` sets gossip's timings. Nodes gossip over UDP on their cluster addresses, so a node that no other config names joins through the ones its own config names, and gateways learn its address from the ring. To grow the cluster, start a node whose config names at least one running node. To shrink it, send a node `SIGUSR1`: it leaves every ring at once, serves its blocks to their new owners for `cache.fallback_window_ms`, and then exits. `SIGTERM` stops a node for a restart; back within `cluster.membership.down_grace_ms`, it keeps its place in the ring.
 
+To have S3 tell the cache of changes made elsewhere, send the bucket's event notifications to an SQS queue, directly or through SNS, and name the queue in each node's `[events]` table:
+
+```toml
+[events]
+queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/bucket-events"
+visibility_timeout_s = 30
+```
+
+Nodes poll the queue with `[origin]`'s credentials. Set the bucket's `ttl_ms` long, such as an hour: events keep its metadata fresh, and the TTL covers an event that goes missing.
+
 ## Layout
 
 - `crates/core`: gateway and storage-node logic as deterministic state machines that do no I/O.

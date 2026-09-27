@@ -31,6 +31,10 @@ pub struct GatewayRequestId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OriginRequestId(pub u64);
 
+/// A message from S3's event queue, numbered by the node's owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventId(pub u64);
+
 /// What a gateway asks a storage node to read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Read {
@@ -231,6 +235,18 @@ pub enum Action {
     /// Tell `node` of a write to `key` that passed through a gateway, with
     /// `on_write_from` and `passed_on` set.
     PassWrite { node: NodeId, key: ObjectKey },
+    /// Tell `node` of S3's event that `key` changed to `etag`, or went
+    /// away for `None`, with `on_event_notice`; then call
+    /// `on_event_passed` with whether it heard.
+    PassEvent {
+        event: EventId,
+        node: NodeId,
+        key: ObjectKey,
+        etag: Option<ETag>,
+    },
+    /// Every home of the event's key has it: delete its message from the
+    /// queue.
+    EventDone { event: EventId },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -293,9 +309,12 @@ pub struct Node {
     /// Previous owners that failed to answer since the last ring change.
     unreachable: BTreeSet<NodeId>,
     /// Changes this node learned of within the last fallback window, from
-    /// a gateway's write or S3's answer: a previous home's metadata
-    /// validated before one is stale.
+    /// a gateway's write, S3's answer or S3's event: a previous home's
+    /// metadata validated before one is stale.
     written: BTreeMap<ObjectKey, Time>,
+    /// Events passed to other homes: the homes yet to hear, and when the
+    /// node stops waiting, leaving the queue to offer the event again.
+    events: BTreeMap<EventId, (BTreeSet<NodeId>, Time)>,
     config: Config,
     objects: BTreeMap<ObjectKey, Object>,
     /// Known objects by when they were last used, oldest first.
@@ -463,6 +482,7 @@ impl Node {
             previous: None,
             unreachable: BTreeSet::new(),
             written: BTreeMap::new(),
+            events: BTreeMap::new(),
             store: Store::new(config.store),
             doorkeeper: Doorkeeper::new(config.doorkeeper_window),
             config,
@@ -855,22 +875,93 @@ impl Node {
     /// previous ring too, which may hold or ask for the metadata.
     pub fn on_write_from(&mut self, now: Time, key: &ObjectKey, passed_on: bool) {
         self.now = self.now.max(now);
-        self.changed(key);
         if !passed_on {
-            let placement = Placement::Home(key).hash();
-            let previous = self.previous.as_ref();
-            let homes = [
-                self.ring.owner(placement),
-                previous.and_then(|(previous, _)| previous.owner(placement)),
-            ];
-            let mut told = BTreeSet::new();
-            for home in homes.into_iter().flatten() {
-                if home != self.id && told.insert(home) {
-                    let key = key.clone();
-                    self.actions.push(Action::PassWrite { node: home, key });
-                }
+            for home in self.other_homes(key) {
+                let key = key.clone();
+                self.actions.push(Action::PassWrite { node: home, key });
             }
         }
+        self.invalidate(now, key);
+    }
+
+    /// S3's event queue delivered `event`: `key` changed to `etag`, or went
+    /// away for `None`. The node applies the event, passes it to the key's
+    /// other homes, and says once every home has it. A late or repeated
+    /// event does no harm: at worst it drops current metadata.
+    pub fn on_event(&mut self, now: Time, event: EventId, key: ObjectKey, etag: Option<ETag>) {
+        self.now = self.now.max(now);
+        self.change_to(now, &key, etag.as_ref());
+        let homes = self.other_homes(&key);
+        if homes.is_empty() {
+            return self.actions.push(Action::EventDone { event });
+        }
+        for &node in &homes {
+            let (key, etag) = (key.clone(), etag.clone());
+            self.actions.push(Action::PassEvent {
+                event,
+                node,
+                key,
+                etag,
+            });
+        }
+        let until = Time(now.0 + self.config.peer_timeout);
+        self.events.insert(event, (homes, until));
+    }
+
+    /// Another node passed on S3's event that `key` changed to `etag`, or
+    /// went away for `None`.
+    pub fn on_event_notice(&mut self, now: Time, key: &ObjectKey, etag: Option<&ETag>) {
+        self.now = self.now.max(now);
+        self.change_to(now, key, etag);
+    }
+
+    /// `node` heard of `event`, or failed to, which leaves the event to
+    /// the queue.
+    pub fn on_event_passed(&mut self, now: Time, event: EventId, node: NodeId, heard: bool) {
+        self.now = self.now.max(now);
+        let Some((waiting, _)) = self.events.get_mut(&event) else {
+            return;
+        };
+        waiting.remove(&node);
+        if !heard {
+            self.events.remove(&event);
+        } else if waiting.is_empty() {
+            self.events.remove(&event);
+            self.actions.push(Action::EventDone { event });
+        }
+    }
+
+    /// The key's home and, while the fallback window lasts, its home under
+    /// the previous ring, other than this node.
+    fn other_homes(&self, key: &ObjectKey) -> BTreeSet<NodeId> {
+        let placement = Placement::Home(key).hash();
+        let previous = self.previous.as_ref();
+        let homes = [
+            self.ring.owner(placement),
+            previous.and_then(|(previous, _)| previous.owner(placement)),
+        ];
+        homes
+            .into_iter()
+            .flatten()
+            .filter(|home| *home != self.id)
+            .collect()
+    }
+
+    /// S3 says `key` holds `etag`, or nothing for `None`. Metadata of that
+    /// version stands; any other goes, as after a write.
+    fn change_to(&mut self, now: Time, key: &ObjectKey, etag: Option<&ETag>) {
+        if let (Some(etag), Some(Object::Known { meta, .. })) = (etag, self.objects.get(key))
+            && meta.etag == *etag
+        {
+            return;
+        }
+        self.invalidate(now, key);
+    }
+
+    /// `key` changed: its metadata no longer holds, and a first fetch in
+    /// flight may predate the change.
+    fn invalidate(&mut self, now: Time, key: &ObjectKey) {
+        self.changed(key);
         if self.policy(&key.bucket).freshness == Freshness::Immutable {
             let key = key.clone();
             self.actions.push(Action::Forget { key });
@@ -952,9 +1043,12 @@ impl Node {
 
     /// Time passed: S3 requests unanswered past the timeout are abandoned,
     /// and whatever waited on them proceeds as if S3 failed with 503. The
-    /// previous ring goes once the fallback window ends.
+    /// previous ring goes once the fallback window ends. An event the
+    /// other homes have not all heard of within the peer timeout is left
+    /// to the queue, which offers it again.
     pub fn on_tick(&mut self, now: Time) {
         self.now = self.now.max(now);
+        self.events.retain(|_, (_, until)| *until > now);
         if self
             .previous
             .as_ref()

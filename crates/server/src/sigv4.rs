@@ -152,7 +152,7 @@ pub fn verify<'c, C: ?Sized>(
         request,
         &signed_headers,
         amz_date,
-        &authorization.region,
+        (&authorization.region, "s3"),
         secret,
     );
     if !constant_time_eq(expected.as_bytes(), authorization.signature.as_bytes()) {
@@ -161,10 +161,12 @@ pub fn verify<'c, C: ?Sized>(
     Ok(client)
 }
 
-/// Signs requests to S3 in one region with one credential.
+/// Signs requests to one AWS service, such as `s3`, in one region with one
+/// credential.
 pub struct Signer {
     pub credentials: Credentials,
     pub region: String,
+    pub service: &'static str,
 }
 
 impl Signer {
@@ -193,6 +195,7 @@ fn sign(
     now: i64,
 ) {
     let (credentials, region) = (&signer.credentials, signer.region.as_str());
+    let service = signer.service;
     headers.retain(|(name, _)| {
         !["authorization", "x-amz-date", "x-amz-content-sha256"]
             .contains(&name.to_ascii_lowercase().as_str())
@@ -218,11 +221,11 @@ fn sign(
         &request,
         &signed,
         &amz_date,
-        region,
+        (region, service),
         &credentials.secret_access_key,
     );
     let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={}/{}/{region}/s3/aws4_request, SignedHeaders={}, Signature={signature}",
+        "AWS4-HMAC-SHA256 Credential={}/{}/{region}/{service}/aws4_request, SignedHeaders={}, Signature={signature}",
         credentials.access_key_id,
         &amz_date[..8],
         signed.join(";"),
@@ -230,22 +233,23 @@ fn sign(
     headers.push(("authorization".into(), authorization));
 }
 
+/// The signature of `request` in the scope of a region and a service.
 fn signature(
     request: &Signable,
     signed_headers: &[&str],
     amz_date: &str,
-    region: &str,
+    (region, service): (&str, &str),
     secret: &str,
 ) -> String {
     let canonical = canonical_request(request, signed_headers);
     let date = &amz_date[..amz_date.len().min(8)];
-    let scope = format!("{date}/{region}/s3/aws4_request");
+    let scope = format!("{date}/{region}/{service}/aws4_request");
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         hex::encode(Sha256::digest(canonical.as_bytes()))
     );
     let mut key = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
-    for part in [region, "s3", "aws4_request"] {
+    for part in [region, service, "aws4_request"] {
         key = hmac(&key, part.as_bytes());
     }
     hex::encode(hmac(&key, string_to_sign.as_bytes()))
@@ -404,7 +408,13 @@ mod tests {
         };
         let signed = ["host", "range", "x-amz-content-sha256", "x-amz-date"];
         assert_eq!(
-            signature(&request, &signed, "20130524T000000Z", "us-east-1", SECRET),
+            signature(
+                &request,
+                &signed,
+                "20130524T000000Z",
+                ("us-east-1", "s3"),
+                SECRET
+            ),
             "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
         );
     }
@@ -426,7 +436,13 @@ mod tests {
         };
         let signed = ["host", "x-amz-content-sha256", "x-amz-date"];
         assert_eq!(
-            signature(&request, &signed, "20130524T000000Z", "us-east-1", SECRET),
+            signature(
+                &request,
+                &signed,
+                "20130524T000000Z",
+                ("us-east-1", "s3"),
+                SECRET
+            ),
             "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7"
         );
     }
@@ -442,6 +458,7 @@ mod tests {
         let signer = Signer {
             credentials,
             region: "us-east-1".into(),
+            service: "s3",
         };
         signer.sign(
             "GET",
