@@ -8,7 +8,8 @@ tests (scenarios and regression seeds) or a seed sweep catch each one.
 A mutant is a list of replacements; each must match exactly once, ignoring
 whitespace, so formatting changes leave the mutants intact. The copy lives
 in target/mutants/src and shares one target directory: dependencies build
-once, and every workspace crate rebuilds for each mutant. A step that hangs counts as a catch. Exits
+once, and every workspace crate rebuilds for each mutant. A step that hangs counts as a catch,
+and is killed with every process it started. Exits
 non-zero if any mutant goes uncaught or fails to build.
 """
 
@@ -16,6 +17,7 @@ import argparse
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -291,6 +293,8 @@ MUTANTS = [
 
 
 def main():
+    # SIGTERM unwinds like Ctrl-C, so each step's cleanup runs.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--seeds", type=int, default=300)
     parser.add_argument("--only")
@@ -373,12 +377,23 @@ def catch(copy, target, seeds):
 
 
 def run(cwd, env, command):
-    """The finished process, or None if it ran past the step timeout."""
+    """The finished process, or None if it ran past the step timeout. The
+    step runs in its own process group, which is killed however the step
+    ends, so a hung test binary never outlives it."""
+    process = subprocess.Popen(command, cwd=cwd, env={**os.environ, **env},
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                               start_new_session=True)
     try:
-        return subprocess.run(command, cwd=cwd, env={**os.environ, **env}, capture_output=True,
-                              text=True, timeout=STEP_TIMEOUT)
+        stdout, stderr = process.communicate(timeout=STEP_TIMEOUT)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     except subprocess.TimeoutExpired:
         return None
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
 
 
 if __name__ == "__main__":
