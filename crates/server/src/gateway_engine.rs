@@ -5,6 +5,7 @@
 //! Every answer names the version of its node's ring, and the gateway
 //! fetches a ring whose version differs from its own.
 
+use crate::metrics::{Metrics, NodeFailure};
 use crate::peers::{Exchanged, NodeBody, Peers};
 use crate::protocol::{Hint, NodeAnswer, NodeRequest, Versions};
 use s3_accelerator_core::Time;
@@ -44,6 +45,7 @@ pub type SharedGateway = Rc<RefCell<GatewayEngine>>;
 
 pub struct GatewayEngine {
     started: Instant,
+    metrics: Rc<Metrics>,
     gateway: Gateway,
     peers: Rc<Peers>,
     next_id: u64,
@@ -57,9 +59,15 @@ pub struct GatewayEngine {
 }
 
 impl GatewayEngine {
-    pub fn new(ring: Ring, config: gateway::Config, peers: Rc<Peers>) -> SharedGateway {
+    pub fn new(
+        ring: Ring,
+        config: gateway::Config,
+        peers: Rc<Peers>,
+        metrics: Rc<Metrics>,
+    ) -> SharedGateway {
         Rc::new(RefCell::new(GatewayEngine {
             started: Instant::now(),
+            metrics,
             gateway: Gateway::new(ring, config),
             peers,
             next_id: 0,
@@ -180,6 +188,21 @@ impl GatewayEngine {
 
     pub fn peers(engine: &SharedGateway) -> Rc<Peers> {
         engine.borrow().peers.clone()
+    }
+
+    /// The ring's version with its nodes up and down, and whether a node
+    /// has answered the gateway.
+    pub fn observe(engine: &SharedGateway) -> ((u64, usize, usize), bool) {
+        let this = engine.borrow();
+        let ring = this.gateway.ring();
+        let members = ring.members();
+        let down = this.gateway.down();
+        let held = members
+            .iter()
+            .filter(|member| down.contains(&member.id))
+            .count();
+        let view = (ring.version(), members.len() - held, held);
+        (view, this.gateway.has_heard())
     }
 
     /// `node` answered stamped with `versions`.
@@ -336,10 +359,12 @@ fn start(engine: &SharedGateway, work: Work) {
                     }
                     // The node was reached, but answered out of protocol.
                     Ok(_) => {
+                        this.metrics.node_failure(NodeFailure::Error);
                         this.gateway
                             .on_node_response(now, id, ResponseHead::status(503), None);
                     }
                     Err(error) => {
+                        this.metrics.node_failure(NodeFailure::of(&error));
                         eprintln!("reading from node {}: {error}", node.0);
                         this.gateway.on_node_unreachable(now, id);
                     }
@@ -379,14 +404,27 @@ fn start(engine: &SharedGateway, work: Work) {
                         peers.learn(&addresses);
                         let mut this = engine.borrow_mut();
                         let now = this.now();
+                        if ring.version() != this.gateway.ring().version() {
+                            this.metrics.ring_changed(true);
+                        }
                         this.gateway.on_ring(now, ring, down);
                         return;
                     }
                     Ok(Ok(_)) => {
+                        engine.borrow().metrics.node_failure(NodeFailure::Error);
                         eprintln!("node {} answered a ring request out of protocol", node.0)
                     }
-                    Ok(Err(error)) => eprintln!("fetching node {}'s ring: {error}", node.0),
-                    Err(_) => eprintln!("fetching node {}'s ring: timed out", node.0),
+                    Ok(Err(error)) => {
+                        engine
+                            .borrow()
+                            .metrics
+                            .node_failure(NodeFailure::of(&error));
+                        eprintln!("fetching node {}'s ring: {error}", node.0)
+                    }
+                    Err(_) => {
+                        engine.borrow().metrics.node_failure(NodeFailure::Timeout);
+                        eprintln!("fetching node {}'s ring: timed out", node.0)
+                    }
                 }
             }
             // The next answer with another version, or the next read no

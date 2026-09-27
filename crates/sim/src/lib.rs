@@ -743,6 +743,10 @@ enum Event {
         node: usize,
         run: u64,
     },
+    /// A client retries a request S3 or the cluster failed.
+    Retry {
+        request: u64,
+    },
 }
 
 /// Who sent a node a request, and where the answer goes.
@@ -861,6 +865,17 @@ struct Sending {
     hot: Vec<HotHint>,
 }
 
+/// What a node's actions sent: blocks and bytes from its slots, bytes of
+/// S3's responses and of previous owners', and requests to S3.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Sent {
+    slots: u64,
+    slot_bytes: u64,
+    s3_bytes: u64,
+    peer_bytes: u64,
+    fetches: u64,
+}
+
 pub struct Simulator {
     seed: u64,
     options: Options,
@@ -913,6 +928,10 @@ pub struct Simulator {
     runs: Vec<u64>,
     /// Stats of each node's runs that ended.
     retired: Vec<node::Stats>,
+    /// What each node's actions sent, which its counters must match.
+    sent: Vec<Sent>,
+    /// Fetches nodes sent to previous owners, by node, run and fetch.
+    peer_fetches: BTreeSet<(usize, u64, OriginRequestId)>,
     disk_delays: Prng,
     send_delays: Prng,
     now: u64,
@@ -1075,6 +1094,8 @@ impl Simulator {
             ring_seeds: 0,
             runs: vec![0; options.nodes],
             retired: vec![node::Stats::default(); options.nodes],
+            sent: vec![Sent::default(); options.nodes],
+            peer_fetches: BTreeSet::new(),
             disk_delays: Prng::stream(seed, "disk delays"),
             send_delays: Prng::stream(seed, "send delays"),
             now: 0,
@@ -1184,7 +1205,32 @@ impl Simulator {
             self.tick()?;
         }
         self.settle()?;
+        self.check_counters()?;
         Ok(self.summary())
+    }
+
+    /// Each node's counters agree with what its actions sent: blocks and
+    /// bytes from its slots, bytes of S3's responses and of previous
+    /// owners', and requests to S3.
+    fn check_counters(&self) -> Result<(), Failure> {
+        for (node, (up, &retired)) in self.nodes.iter().zip(&self.retired).enumerate() {
+            let mut stats = up.as_ref().map(Node::stats).unwrap_or_default();
+            stats += retired;
+            let sent = self.sent[node];
+            let counted = Sent {
+                slots: stats.block_hits,
+                slot_bytes: stats.hit_bytes,
+                s3_bytes: stats.miss_bytes,
+                peer_bytes: stats.peer_bytes,
+                fetches: stats.origin_requests,
+            };
+            if counted != sent {
+                return Err(
+                    self.failure(format!("node {node} counted {counted:?} but sent {sent:?}"))
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Ends the faulty phase: partitions heal and stopped nodes restart.
@@ -1510,6 +1556,7 @@ impl Simulator {
             .push(Disk::new(config.store.extents, config.store.extent_size));
         self.runs.push(0);
         self.retired.push(node::Stats::default());
+        self.sent.push(Sent::default());
         if self.trace {
             eprintln!("{} node {node} joins", self.now);
         }
@@ -1842,6 +1889,21 @@ impl Simulator {
         self.tick()
     }
 
+    /// Whether a node has answered `gateway`.
+    pub fn gateway_heard(&self, gateway: usize) -> bool {
+        self.gateways[gateway].has_heard()
+    }
+
+    /// The counters of every run of `node`.
+    pub fn node_stats(&self, node: usize) -> node::Stats {
+        let mut stats = self.nodes[node]
+            .as_ref()
+            .map(Node::stats)
+            .unwrap_or_default();
+        stats += self.retired[node];
+        stats
+    }
+
     pub fn summary(&self) -> Summary {
         let mut summary = self.summary.clone();
         summary.ticks = self.now;
@@ -1969,10 +2031,9 @@ impl Simulator {
     /// a crash tears the writes in progress, and if `damage` allows, may
     /// also damage recorded slots.
     fn stop(&mut self, node: usize, clean: bool, damage: bool, until: u64) -> Result<(), Failure> {
-        let Some(stopped) = self.nodes[node].as_ref() else {
+        if self.nodes[node].is_none() {
             return Err(self.failure(format!("node {node} stopped while down")));
-        };
-        let stats = stopped.stats();
+        }
         // Responses in progress finish on a clean shutdown. A crash cuts
         // them short or loses them, and they read the disk as it was.
         let sending: Vec<GatewayRequestId> = self
@@ -2052,6 +2113,8 @@ impl Simulator {
             }
             self.summary.crashes += 1;
         }
+        // Writes a clean shutdown finishes may answer requests, which count.
+        let stats = self.node(node).stats();
         self.retired[node] += stats;
         self.nodes[node] = None;
         self.memberships[node] = None;
@@ -2441,6 +2504,12 @@ impl Simulator {
                 Ok(())
             }
             Event::JoinTimeout { node, .. } => self.finish_joining(node, None),
+            Event::Retry { request } => {
+                if self.requests.contains_key(&request) {
+                    self.attempt(request);
+                }
+                Ok(())
+            }
             Event::MembershipTimer { node, timer, .. } => {
                 if let Some(membership) = self.memberships[node].as_mut() {
                     membership.on_timer(Time(self.now), timer);
@@ -3190,6 +3259,7 @@ impl Simulator {
                     request,
                     streams,
                 } => {
+                    self.sent[node].fetches += 1;
                     let chunk = self.options.block_size * self.options.chunk_blocks;
                     match (streams, request.range) {
                         (true, _) => {
@@ -3226,8 +3296,19 @@ impl Simulator {
                         );
                     }
                     for segment in &body {
-                        if let Segment::Origin { origin, .. } = segment {
-                            self.check_streaming(node, *origin)?;
+                        let sent = &mut self.sent[node];
+                        match *segment {
+                            Segment::Slot { len, .. } => {
+                                sent.slots += 1;
+                                sent.slot_bytes += len;
+                            }
+                            Segment::Origin { origin, len, .. } => {
+                                match self.peer_fetches.contains(&(node, run, origin)) {
+                                    true => sent.peer_bytes += len,
+                                    false => sent.s3_bytes += len,
+                                }
+                                self.check_streaming(node, origin)?;
+                            }
                         }
                     }
                     let delay = self.send_delays.range(0..=self.options.send_delay_max);
@@ -3305,6 +3386,7 @@ impl Simulator {
                     self.send(Address::Node(node), Address::Origin, message);
                 }
                 node::Action::PeerFetch { origin, peer, read } => {
+                    self.peer_fetches.insert((node, run, origin));
                     let asks_metadata = matches!(read, Read::Known(_));
                     self.peer_reads.insert((node, origin), asks_metadata);
                     let message = Message::PeerRequest {
@@ -3644,7 +3726,11 @@ impl Simulator {
             }
             self.summary.server_errors += 1;
             self.summary.client_retries += 1;
-            self.attempt(request);
+            // Clients back off before retrying a 5xx, as S3's SDKs do, so a
+            // cluster that fails at once never answers within one tick.
+            let pending = self.requests.get_mut(&request).expect("a pending request");
+            pending.sent = self.now;
+            self.queue.push(self.now + 1, Event::Retry { request });
             return Ok(());
         }
         let pending = &self.requests[&request];

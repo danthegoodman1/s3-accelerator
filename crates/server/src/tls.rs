@@ -8,6 +8,7 @@
 
 use crate::config::{ClusterTlsConfig, TlsConfig};
 use crate::http::Connection;
+use crate::metrics::{Link, Metrics};
 use ktls::{CompatibleCiphers, CorkStream};
 use rustls::client::Resumption;
 use rustls::crypto::CryptoProvider;
@@ -192,22 +193,32 @@ impl Connector {
     }
 }
 
-/// A connection a client opened, once its handshake is done, or `None` if
-/// the handshake failed.
-pub async fn accept(tls: Option<&Tls>, stream: TcpStream) -> Option<Connection> {
+/// A connection a client opened on `link`, once its handshake is done, or
+/// `None` if the handshake failed.
+pub async fn accept(
+    tls: Option<&Tls>,
+    stream: TcpStream,
+    metrics: &Metrics,
+    link: Link,
+) -> Option<Connection> {
     let Some(tls) = tls else {
         return Some(Connection::new(stream));
     };
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, tls.accept(stream)).await {
-        Ok(Ok(session)) => Some(Connection::tls(session)),
+        Ok(Ok(session)) => {
+            metrics.tls_session(link, session.kernel);
+            Some(Connection::tls(session))
+        }
         // A client that closes before its handshake, such as a TCP health
         // check, is no failure.
         Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => None,
         Ok(Err(error)) => {
+            metrics.tls_failure(link);
             eprintln!("a TLS handshake failed: {error}");
             None
         }
         Err(_) => {
+            metrics.tls_failure(link);
             eprintln!("a TLS handshake timed out");
             None
         }

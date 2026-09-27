@@ -139,3 +139,41 @@ fn a_write_during_a_response_can_end_it_early() {
         panic!("{failure}");
     }
 }
+
+/// A clean shutdown finished the node's writes, which answered requests
+/// waiting on them, after the simulator had read the node's counters, so
+/// the counters missed three blocks the node sent.
+#[test]
+fn a_clean_stop_counts_what_its_last_writes_answer() {
+    if let Err(failure) = Simulator::from_seed(16648030974266863723).run() {
+        panic!("{failure}");
+    }
+}
+
+/// With both nodes down and no network delay, every gateway answered 503
+/// at once and clients retried within the same tick, forever.
+#[test]
+fn clients_back_off_from_a_cluster_that_fails_at_once() {
+    if let Err(failure) = Simulator::from_seed(16648030974266864628).run() {
+        panic!("{failure}");
+    }
+}
+
+/// A purged block found corrupt went as the last plan reading it was
+/// abandoned, and the node then freed its slot a second time.
+#[test]
+fn a_corrupt_purged_block_is_freed_once() {
+    if let Err(failure) = Simulator::from_seed(6707258591206456590).run() {
+        panic!("{failure}");
+    }
+}
+
+/// A restarted node passed an event to the home its first ring named, then
+/// adopted the cluster's ring before the event finished, and the home that
+/// ring named never heard: its metadata stayed stale past the event.
+#[test]
+fn an_event_under_way_reaches_a_new_rings_home() {
+    if let Err(failure) = Simulator::from_seed(14674409610259123330).run() {
+        panic!("{failure}");
+    }
+}

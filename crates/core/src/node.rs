@@ -20,7 +20,7 @@ use crate::s3::{
     Answer, ByteRange, ContentRange, ETag, Method, ObjectKey, Request, ResponseHead, answer,
     preconditions,
 };
-use crate::store::{BlockKey, BlockState, Location, Store, StoreConfig, VersionId};
+use crate::store::{BlockKey, BlockState, ClassUsage, Location, Store, StoreConfig, VersionId};
 use std::collections::{BTreeMap, BTreeSet};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -306,28 +306,63 @@ pub enum Action {
     PassPurge { node: NodeId, key: ObjectKey },
 }
 
+/// S3's event that `key` changed to `etag`, as a node passes it to the
+/// key's other homes.
+struct PassedEvent {
+    key: ObjectKey,
+    etag: Option<ETag>,
+    /// Homes told of it, and those yet to hear.
+    told: BTreeSet<NodeId>,
+    waiting: BTreeSet<NodeId>,
+    /// When the node stops waiting, leaving the queue to offer the event
+    /// again.
+    until: Time,
+}
+
+/// What a node has done since it started. Its owner reads these for
+/// metrics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
-    /// Body bytes served from stored blocks.
+    /// Reads from gateways, and from nodes that took over placements.
+    pub reads: u64,
+    /// Blocks the node's responses read from the store, and from S3's or a
+    /// previous owner's responses.
+    pub block_hits: u64,
+    pub blocks_fetched: u64,
+    /// Blocks an owner or leased replica fetched and could store, by what
+    /// it remembers of them: the ghost queue holds them, the doorkeeper
+    /// turned them away, or neither.
+    pub misses_evicted: u64,
+    pub misses_unadmitted: u64,
+    pub misses_new: u64,
+    /// The same blocks: stored, or turned away by the doorkeeper, the fill
+    /// budget, or a store whose eviction candidates are all in use.
+    pub admitted: u64,
+    pub refused_doorkeeper: u64,
+    pub refused_budget: u64,
+    pub refused_full: u64,
+    /// Blocks the store let go: evicted cold or disowned, purged, failing
+    /// their checksums, or left unfilled by a fill that ended without them.
+    pub evicted_blocks: u64,
+    pub disowned_blocks: u64,
+    pub purged_blocks: u64,
+    pub corrupt_blocks: u64,
+    pub unfilled_blocks: u64,
+    /// Body bytes served from stored blocks, from S3's responses, and from
+    /// previous owners' blocks.
     pub hit_bytes: u64,
-    /// Body bytes served from S3's responses.
     pub miss_bytes: u64,
+    pub peer_bytes: u64,
     pub origin_requests: u64,
     pub written_bytes: u64,
-    /// Requests from gateways.
-    pub reads: u64,
-    pub evicted_blocks: u64,
-    /// Recovered blocks checked against their checksums, and those that
-    /// failed.
+    /// Recovered blocks checked against their checksums; `corrupt_blocks`
+    /// counts those that failed.
     pub verified_blocks: u64,
-    pub corrupt_blocks: u64,
-    /// Reads sent to previous owners, those that went unanswered, objects
-    /// whose metadata a previous home supplied, and body bytes served from
-    /// previous owners' blocks.
+    /// Reads sent to previous owners, those that went unanswered, and
+    /// objects whose metadata a previous home supplied.
     pub peer_requests: u64,
     pub peer_timeouts: u64,
     pub peer_metadata: u64,
-    pub peer_bytes: u64,
     /// Reads served under a lease, and leases granted.
     pub leased_reads: u64,
     pub leases_granted: u64,
@@ -335,26 +370,56 @@ pub struct Stats {
     pub warmed_uploads: u64,
     /// Blocks of metadata the home filled before a reader asked.
     pub prefetched_blocks: u64,
+    /// Purges the node carried out.
+    pub purges: u64,
+}
+
+/// What a node holds now. Its owner reads these for metrics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Usage {
+    /// Bytes the store holds when full.
+    pub capacity: u64,
+    /// Bytes of stored blocks that are filling, and the most there may be.
+    pub filling_bytes: u64,
+    pub fill_budget: u64,
+    /// Objects whose metadata the node holds.
+    pub objects: u64,
+    /// Purges waiting on other nodes to confirm.
+    pub pending_purges: u64,
+    pub classes: Vec<ClassUsage>,
 }
 
 impl std::ops::AddAssign for Stats {
     fn add_assign(&mut self, other: Stats) {
+        self.reads += other.reads;
+        self.block_hits += other.block_hits;
+        self.blocks_fetched += other.blocks_fetched;
+        self.misses_evicted += other.misses_evicted;
+        self.misses_unadmitted += other.misses_unadmitted;
+        self.misses_new += other.misses_new;
+        self.admitted += other.admitted;
+        self.refused_doorkeeper += other.refused_doorkeeper;
+        self.refused_budget += other.refused_budget;
+        self.refused_full += other.refused_full;
+        self.evicted_blocks += other.evicted_blocks;
+        self.disowned_blocks += other.disowned_blocks;
+        self.purged_blocks += other.purged_blocks;
+        self.corrupt_blocks += other.corrupt_blocks;
+        self.unfilled_blocks += other.unfilled_blocks;
         self.hit_bytes += other.hit_bytes;
         self.miss_bytes += other.miss_bytes;
+        self.peer_bytes += other.peer_bytes;
         self.origin_requests += other.origin_requests;
         self.written_bytes += other.written_bytes;
-        self.reads += other.reads;
-        self.evicted_blocks += other.evicted_blocks;
         self.verified_blocks += other.verified_blocks;
-        self.corrupt_blocks += other.corrupt_blocks;
         self.peer_requests += other.peer_requests;
         self.peer_timeouts += other.peer_timeouts;
         self.peer_metadata += other.peer_metadata;
-        self.peer_bytes += other.peer_bytes;
         self.leased_reads += other.leased_reads;
         self.leases_granted += other.leases_granted;
         self.warmed_uploads += other.warmed_uploads;
         self.prefetched_blocks += other.prefetched_blocks;
+        self.purges += other.purges;
     }
 }
 
@@ -380,9 +445,8 @@ pub struct Node {
     /// a gateway's write, S3's answer or S3's event: a previous home's
     /// metadata validated before one is stale.
     written: BTreeMap<ObjectKey, Time>,
-    /// Events passed to other homes: the homes yet to hear, and when the
-    /// node stops waiting, leaving the queue to offer the event again.
-    events: BTreeMap<EventId, (BTreeSet<NodeId>, Time)>,
+    /// Events passed to other homes, until each hears.
+    events: BTreeMap<EventId, PassedEvent>,
     /// Reads of each placement this node owns in its current hot window:
     /// when the window began, and how many.
     read_counts: BTreeMap<PlacementHash, (Time, u64)>,
@@ -572,6 +636,8 @@ struct Plan {
     head: ResponseHead,
     meta: Option<ObjectMeta>,
     body: Vec<Segment>,
+    /// Blocks the body reads from fetches, which count once it is sent.
+    fetched: u64,
     holds: Holds,
     /// Fills and verifications that must finish before the response starts.
     awaiting: BTreeSet<Await>,
@@ -710,6 +776,18 @@ impl Node {
 
     pub fn stats(&self) -> Stats {
         self.stats
+    }
+
+    pub fn usage(&self) -> Usage {
+        let store = self.config.store;
+        Usage {
+            capacity: u64::from(store.extents) * store.extent_size,
+            filling_bytes: self.filling_bytes,
+            fill_budget: self.config.fill_budget,
+            objects: self.recency.len() as u64,
+            pending_purges: self.purges.len() as u64,
+            classes: self.store.usage(),
+        }
     }
 
     /// Every stored block the node would serve without verifying it first.
@@ -1158,17 +1236,37 @@ impl Node {
         if homes.is_empty() {
             return self.actions.push(Action::EventDone { event });
         }
-        for &node in &homes {
-            let (key, etag) = (key.clone(), etag.clone());
+        let passed = PassedEvent {
+            key,
+            etag,
+            told: BTreeSet::new(),
+            waiting: BTreeSet::new(),
+            until: Time(now.0 + self.config.peer_timeout),
+        };
+        self.events.insert(event, passed);
+        self.tell_homes(event);
+    }
+
+    /// Passes `event` to the key's other homes that have not been told,
+    /// such as a home a ring adopted since the event arrived.
+    fn tell_homes(&mut self, event: EventId) {
+        let homes = self.other_homes(&self.events[&event].key);
+        let passed = self.events.get_mut(&event).expect("a passed event");
+        let untold: Vec<NodeId> = homes.difference(&passed.told).copied().collect();
+        if untold.is_empty() {
+            return;
+        }
+        passed.until = Time(self.now.0 + self.config.peer_timeout);
+        for node in untold {
+            passed.told.insert(node);
+            passed.waiting.insert(node);
             self.actions.push(Action::PassEvent {
                 event,
                 node,
-                key,
-                etag,
+                key: passed.key.clone(),
+                etag: passed.etag.clone(),
             });
         }
-        let until = Time(now.0 + self.config.peer_timeout);
-        self.events.insert(event, (homes, until));
     }
 
     /// Another node passed on S3's event that `key` changed to `etag`, or
@@ -1182,13 +1280,13 @@ impl Node {
     /// the queue.
     pub fn on_event_passed(&mut self, now: Time, event: EventId, node: NodeId, heard: bool) {
         self.now = self.now.max(now);
-        let Some((waiting, _)) = self.events.get_mut(&event) else {
+        let Some(passed) = self.events.get_mut(&event) else {
             return;
         };
-        waiting.remove(&node);
+        passed.waiting.remove(&node);
         if !heard {
             self.events.remove(&event);
-        } else if waiting.is_empty() {
+        } else if passed.waiting.is_empty() {
             self.events.remove(&event);
             self.actions.push(Action::EventDone { event });
         }
@@ -1202,6 +1300,7 @@ impl Node {
     /// does. The owner confirms once the actions are durable.
     pub fn on_purge(&mut self, now: Time, key: &ObjectKey, passed_on: bool) {
         self.now = self.now.max(now);
+        self.stats.purges += 1;
         self.invalidate(now, key);
         let versions: Vec<VersionId> = self
             .versions
@@ -1332,6 +1431,7 @@ impl Node {
         }
         let (location, len) = (entry.location, self.config.store.slot_size(entry.len));
         self.store.remove(block);
+        self.stats.purged_blocks += 1;
         self.actions.push(Action::Erase { location, len });
         self.unref(block.version);
     }
@@ -1597,6 +1697,11 @@ impl Node {
         self.previous = Some((previous, until));
         self.unreachable.clear();
         self.store.clear_disowned();
+        // An event under way is done once the new ring's home hears too.
+        let events: Vec<EventId> = self.events.keys().copied().collect();
+        for event in events {
+            self.tell_homes(event);
+        }
     }
 
     /// The node is joining a cluster whose ring, before it arrived, was
@@ -1639,7 +1744,7 @@ impl Node {
     /// to the queue, which offers it again.
     pub fn on_tick(&mut self, now: Time) {
         self.now = self.now.max(now);
-        self.events.retain(|_, (_, until)| *until > now);
+        self.events.retain(|_, passed| passed.until > now);
         self.tick_leases(now);
         if self
             .previous
@@ -1859,6 +1964,7 @@ impl Node {
             .filter(|&waiter| self.abandon_plan(waiter))
             .collect();
         self.store.remove(block);
+        self.stats.unfilled_blocks += 1;
         self.filling_bytes -= len;
         self.unref(block.version);
         // Later reads fill the block again instead of reading this body.
@@ -1901,9 +2007,13 @@ impl Node {
             .into_iter()
             .filter(|&waiter| self.abandon_plan(waiter))
             .collect();
-        self.store.remove(block);
-        self.actions.push(Action::Clear { location });
-        self.unref(block.version);
+        // A purged block goes as its last reader lets go, which may be one
+        // of the plans just abandoned.
+        if self.store.get(&block).is_some() {
+            self.store.remove(block);
+            self.actions.push(Action::Clear { location });
+            self.unref(block.version);
+        }
         for waiter in waiters {
             self.replan(now, waiter);
         }
@@ -2244,6 +2354,7 @@ impl Node {
                         len,
                     });
                     self.read(origin, &mut holds);
+                    self.count_relayed(&head);
                 }
                 self.respond(request, head.clone(), body, holds, known);
             }
@@ -2433,12 +2544,15 @@ impl Node {
                 offset: first - start,
                 len: last - first + 1,
             });
+            self.stats.blocks_fetched +=
+                self.config.layout.blocks_covering(first, last).count() as u64;
             self.read(origin, &mut holds);
             self.forget_if_unused(version);
             self.waiting.remove(&id);
             return self.respond(id, head, body, holds, meta);
         }
         let mut awaiting = BTreeSet::new();
+        let mut fetched = 0;
         let layout = self.config.layout;
         let blocks: Vec<u64> = layout.blocks_covering(first, last).collect();
         let mut next = 0;
@@ -2494,6 +2608,7 @@ impl Node {
                 offset: piece.start - body_start,
                 len,
             });
+            fetched += 1;
             self.read(origin, &mut holds);
             if !self.origins[&origin].answered {
                 awaiting.insert(Await::Fill(origin));
@@ -2502,6 +2617,7 @@ impl Node {
         }
         self.forget_if_unused(version);
         if awaiting.is_empty() {
+            self.stats.blocks_fetched += fetched;
             self.waiting.remove(&id);
             return self.respond(id, head, body, holds, meta);
         }
@@ -2525,6 +2641,7 @@ impl Node {
             head,
             meta,
             body,
+            fetched,
             holds,
             awaiting,
         });
@@ -2637,6 +2754,7 @@ impl Node {
         for (block, _) in stored {
             let len = self.store.get(&block).expect("stored block reserved").len;
             self.store.remove(block);
+            self.stats.unfilled_blocks += 1;
             self.filling_bytes -= len;
             self.unref(block.version);
         }
@@ -2698,6 +2816,7 @@ impl Node {
                     } else {
                         let len = self.store.get(&block).expect("stored block reserved").len;
                         self.store.remove(block);
+                        self.stats.unfilled_blocks += 1;
                         self.filling_bytes -= len;
                         self.unref(block.version);
                     }
@@ -2784,6 +2903,7 @@ impl Node {
                 .expect("waiting")
                 .plan
                 .expect("plan");
+            self.stats.blocks_fetched += plan.fetched;
             self.respond(id, plan.head, plan.body, plan.holds, plan.meta);
         }
     }
@@ -2886,8 +3006,19 @@ impl Node {
                 offset: 0,
                 len,
             });
+            self.count_relayed(&head);
         }
         self.respond(id, head, body, holds, None);
+    }
+
+    /// Counts the blocks an object's bytes in a relayed body span.
+    fn count_relayed(&mut self, head: &ResponseHead) {
+        if matches!(head.status, 200 | 206)
+            && let Some((first, last)) = body_span(head, head.content_length)
+        {
+            let blocks = self.config.layout.blocks_covering(first, last).count();
+            self.stats.blocks_fetched += blocks as u64;
+        }
     }
 
     /// Answers a waiting request with S3's error response to `origin`.
@@ -2925,7 +3056,10 @@ impl Node {
     ) {
         for segment in &body {
             match segment {
-                Segment::Slot { len, .. } => self.stats.hit_bytes += len,
+                Segment::Slot { len, .. } => {
+                    self.stats.block_hits += 1;
+                    self.stats.hit_bytes += len;
+                }
                 Segment::Origin { origin, len, .. } => match self.origins[origin].peer {
                     Some(_) => self.stats.peer_bytes += len,
                     None => self.stats.miss_bytes += len,
@@ -3009,12 +3143,21 @@ impl Node {
             return None;
         }
         let hash = block_hash(block.version, layout.block_size(), block.index);
+        if self.store.remembers(hash) {
+            self.stats.misses_evicted += 1;
+        } else if self.doorkeeper.contains(hash) {
+            self.stats.misses_unadmitted += 1;
+        } else {
+            self.stats.misses_new += 1;
+        }
         if !skip_doorkeeper && !self.passes_doorkeeper(key, size, block) {
+            self.stats.refused_doorkeeper += 1;
             return None;
         }
         let span = layout.block_span(size, block.index);
         let len = span.end - span.start;
         if self.filling_bytes + len > self.config.fill_budget {
+            self.stats.refused_budget += 1;
             return None;
         }
         let location = self.store.reserve(block, len, hash, placement);
@@ -3023,12 +3166,19 @@ impl Node {
         if location.is_some() {
             self.refer(block.version);
         }
-        for (evicted, location) in self.store.drain_evicted() {
-            self.stats.evicted_blocks += 1;
+        for (evicted, location, disowned) in self.store.drain_evicted() {
+            match disowned {
+                true => self.stats.disowned_blocks += 1,
+                false => self.stats.evicted_blocks += 1,
+            }
             self.actions.push(Action::Clear { location });
             self.unref(evicted.version);
         }
-        let location = location?;
+        let Some(location) = location else {
+            self.stats.refused_full += 1;
+            return None;
+        };
+        self.stats.admitted += 1;
         self.filling_bytes += len;
         Some(location)
     }

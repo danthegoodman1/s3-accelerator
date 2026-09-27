@@ -164,7 +164,9 @@ pub struct Store {
     /// sequence number of the entry each was marked in.
     disowned: VecDeque<(Location, u64)>,
     next_seq: u64,
-    evicted: Vec<(BlockKey, Location)>,
+    /// Blocks evicted since the last drain, the slots they held, and
+    /// whether each was disowned.
+    evicted: Vec<(BlockKey, Location, bool)>,
 }
 
 struct Extent {
@@ -182,6 +184,17 @@ struct Class {
     size: u64,
     /// Extents of this class with a free slot.
     with_space: BTreeSet<u32>,
+    extents: u32,
+    blocks: u64,
+}
+
+/// A size class's share of the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClassUsage {
+    /// The class's slot size in bytes.
+    pub size: u64,
+    pub extents: u32,
+    pub blocks: u64,
 }
 
 impl Store {
@@ -195,6 +208,8 @@ impl Store {
             classes.push(Class {
                 size,
                 with_space: BTreeSet::new(),
+                extents: 0,
+                blocks: 0,
             });
             size *= 2;
         }
@@ -242,6 +257,23 @@ impl Store {
 
     pub fn blocks(&self) -> impl Iterator<Item = (&BlockKey, &Entry)> {
         self.blocks.iter()
+    }
+
+    /// Each size class's extents and blocks.
+    pub fn usage(&self) -> Vec<ClassUsage> {
+        self.classes
+            .iter()
+            .map(|class| ClassUsage {
+                size: class.size,
+                extents: class.extents,
+                blocks: class.blocks,
+            })
+            .collect()
+    }
+
+    /// Whether the ghost queue remembers evicting the block with `hash`.
+    pub fn remembers(&self, hash: u64) -> bool {
+        self.ghosts.contains_key(&hash)
     }
 
     pub fn block_at(&self, location: Location) -> Option<BlockKey> {
@@ -454,8 +486,9 @@ impl Store {
         }
     }
 
-    /// Blocks evicted since the last drain, and the slots they held.
-    pub fn drain_evicted(&mut self) -> Vec<(BlockKey, Location)> {
+    /// Blocks evicted since the last drain, the slots they held, and
+    /// whether each was disowned.
+    pub fn drain_evicted(&mut self) -> Vec<(BlockKey, Location, bool)> {
         std::mem::take(&mut self.evicted)
     }
 
@@ -481,14 +514,16 @@ impl Store {
         state.free = (0..slots).rev().map(|slot| slot * size).collect();
         state.slots = vec![None; slots as usize];
         self.classes[class].with_space.insert(extent);
+        self.classes[class].extents += 1;
     }
 
     /// Puts `key` in the slot at `location`, which its extent's class sizes.
     fn hold(&mut self, location: Location, key: BlockKey) {
         let state = &mut self.extents[location.extent as usize];
-        let size = self.classes[state.class.expect("a used extent has a class")].size;
-        state.slots[(location.offset / size) as usize] = Some(key);
+        let class = &mut self.classes[state.class.expect("a used extent has a class")];
+        state.slots[(location.offset / class.size) as usize] = Some(key);
         state.held += 1;
+        class.blocks += 1;
     }
 
     fn free_slot(&mut self, location: Location) {
@@ -497,11 +532,13 @@ impl Store {
         let size = self.classes[class].size;
         state.slots[(location.offset / size) as usize] = None;
         state.held -= 1;
+        self.classes[class].blocks -= 1;
         if state.held == 0 {
             state.class = None;
             state.free.clear();
             state.slots = Vec::new();
             self.classes[class].with_space.remove(&location.extent);
+            self.classes[class].extents -= 1;
             self.free_extents.push(location.extent);
         } else {
             state.free.push(location.offset);
@@ -549,7 +586,7 @@ impl Store {
             match self.blocks.get(&key) {
                 Some(entry) if entry.seq != seq || entry.queue == Queue::None => {}
                 Some(entry) if entry.pins > 0 => self.disowned.push_back((location, seq)),
-                Some(_) => return Some(self.evict(key).extent),
+                Some(_) => return Some(self.evict(key, true).extent),
                 None => {}
             }
         }
@@ -619,7 +656,7 @@ impl Store {
                 self.main.push_back((location, seq));
                 continue;
             }
-            return Some(self.evict(key).extent);
+            return Some(self.evict(key, false).extent);
         }
     }
 
@@ -637,10 +674,10 @@ impl Store {
         }
     }
 
-    fn evict(&mut self, key: BlockKey) -> Location {
+    fn evict(&mut self, key: BlockKey, disowned: bool) -> Location {
         let entry = self.detach(key);
         self.free_slot(entry.location);
-        self.evicted.push((key, entry.location));
+        self.evicted.push((key, entry.location, disowned));
         entry.location
     }
 
@@ -667,7 +704,7 @@ impl Store {
             .copied()
             .collect();
         for key in keys {
-            self.evict(key);
+            self.evict(key, false);
         }
     }
 }
@@ -701,7 +738,7 @@ mod tests {
         store
             .drain_evicted()
             .into_iter()
-            .map(|(key, _)| key)
+            .map(|(key, _, _)| key)
             .collect()
     }
 
@@ -709,6 +746,43 @@ mod tests {
         let location = store.reserve(key(index), len, index, PlacementHash(0))?;
         store.filled(key(index));
         Some(location)
+    }
+
+    #[test]
+    fn usage_counts_the_extents_and_blocks_of_each_class() {
+        let mut store = store();
+        let usage = |store: &Store| -> Vec<(u64, u32, u64)> {
+            let usage = store.usage().into_iter();
+            usage
+                .map(|class| (class.size, class.extents, class.blocks))
+                .collect()
+        };
+        fill(&mut store, 0, 4).unwrap();
+        for index in 1..5 {
+            fill(&mut store, index, 16).unwrap();
+        }
+        assert_eq!(usage(&store), [(4, 1, 1), (8, 0, 0), (16, 1, 4)]);
+        // The small block leaves first, and its extent changes class.
+        fill(&mut store, 5, 16).unwrap();
+        assert_eq!(store.drain_evicted()[0].0, key(0));
+        assert_eq!(usage(&store), [(4, 0, 0), (8, 0, 0), (16, 2, 5)]);
+        assert!(store.remembers(0) && !store.remembers(1));
+    }
+
+    #[test]
+    fn evictions_say_whether_they_took_a_disowned_block() {
+        let mut store = store();
+        for index in 0..8 {
+            fill(&mut store, index, 16).unwrap();
+        }
+        fill(&mut store, 8, 16).unwrap();
+        let taken = store.drain_evicted();
+        assert_eq!((taken[0].0, taken[0].2), (key(0), false));
+        store.disown(|placement| placement != PlacementHash(0));
+        fill(&mut store, 9, 16).unwrap();
+        let taken = store.drain_evicted();
+        assert_eq!(taken.len(), 1);
+        assert!(taken[0].2);
     }
 
     #[test]

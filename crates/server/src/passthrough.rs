@@ -275,7 +275,7 @@ pub async fn stream_body(
         match origin::next_frame(&mut body).await {
             Ok(Some(piece)) => {
                 match framing {
-                    Framing::Length(_) => connection.write_all(&piece).await?,
+                    Framing::Length(_) => connection.write_body(&piece).await?,
                     Framing::Chunked => connection.write_chunk(&piece).await?,
                 }
                 sent += piece.len() as u64;

@@ -25,6 +25,51 @@ fn the_doorkeeper_stores_a_block_on_its_second_read() {
     assert_eq!(sim.summary().hit_bytes - before, 256);
 }
 
+#[test]
+fn a_starting_gateway_asks_for_a_ring_before_any_read() {
+    let mut sim = Simulator::new(1, Options::scenario());
+    assert!(!sim.gateway_heard(0));
+    for _ in 0..1_000 {
+        sim.step().unwrap();
+    }
+    assert!(sim.gateway_heard(0));
+}
+
+/// Capacity is 64 blocks of 64 bytes.
+#[test]
+fn a_node_counts_misses_by_what_it_remembers_of_them() {
+    let mut sim = Simulator::new(1, Options::scenario());
+    let first = key(IMMUTABLE_BUCKET, "first");
+    sim.put(&first, 128);
+    sim.read(Request::get(first.clone())).unwrap();
+    let stats = sim.node_stats(0);
+    let counts = (
+        stats.misses_new,
+        stats.refused_doorkeeper,
+        stats.blocks_fetched,
+    );
+    assert_eq!(counts, (2, 2, 2));
+    sim.read(Request::get(first.clone())).unwrap();
+    let stats = sim.node_stats(0);
+    assert_eq!((stats.misses_unadmitted, stats.admitted), (2, 2));
+    // Cold objects read twice each fill the store and push `first` out.
+    for index in 0..40 {
+        let cold = key(IMMUTABLE_BUCKET, &format!("cold-{index}"));
+        sim.put(&cold, 128);
+        sim.read(Request::get(cold.clone())).unwrap();
+        sim.read(Request::get(cold)).unwrap();
+    }
+    let before = sim.node_stats(0);
+    assert_eq!(before.evicted_blocks, 82 - 64);
+    sim.read(Request::get(first.clone())).unwrap();
+    let stats = sim.node_stats(0);
+    assert_eq!(stats.misses_evicted - before.misses_evicted, 2);
+    sim.read(Request::get(first.clone())).unwrap();
+    assert_eq!(sim.node_stats(0).block_hits - stats.block_hits, 2);
+    sim.purge(&first).unwrap();
+    assert_eq!(sim.node_stats(0).purged_blocks, 2);
+}
+
 /// Capacity is 64 blocks. The hot set is 16 blocks read three times; the
 /// scan is 400 blocks read once.
 #[test]
@@ -767,6 +812,8 @@ fn a_node_down_past_its_grace_period_leaves_every_ring() {
     for node in 0..3 {
         assert_eq!(sim.node_ring(node), Some(vec![0, 1, 2]), "node {node}");
     }
+    // The gateway fetched a ring as it started.
+    let fetched = sim.summary().ring_fetches;
     sim.crash(2).unwrap();
     // Declared down within about 300 ticks, and kept for 500 more.
     run(&mut sim, 500);
@@ -782,7 +829,7 @@ fn a_node_down_past_its_grace_period_leaves_every_ring() {
     assert_eq!(head.status, 200);
     run(&mut sim, 50);
     assert_eq!(sim.gateway_ring(0), [0, 1]);
-    assert_eq!(sim.summary().ring_fetches, 1);
+    assert_eq!(sim.summary().ring_fetches - fetched, 1);
 }
 
 /// A gateway asks for a response's chunks a window ahead of the one it

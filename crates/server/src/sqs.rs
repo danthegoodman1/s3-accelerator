@@ -13,7 +13,7 @@ use s3_accelerator_core::s3::{ETag, ObjectKey};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// The most bytes an answer may hold: ten messages of up to 256 KiB each.
 const ANSWER_LIMIT: u64 = 4 << 20;
@@ -127,18 +127,70 @@ impl Queue {
     }
 }
 
-/// The changes an S3 event notification names: each object, and its new
-/// ETag or `None` once it is gone. A message holds S3's event, or SNS's
-/// envelope around it; S3's test event names none.
-pub fn changes(body: &str) -> Result<Vec<(ObjectKey, Option<ETag>)>, String> {
+/// What an S3 event notification names.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Changes {
+    /// Each object, and its new ETag or `None` once it is gone.
+    pub changes: Vec<(ObjectKey, Option<ETag>)>,
+    /// When S3 recorded the earliest of them.
+    pub event_time: Option<SystemTime>,
+}
+
+/// The changes an S3 event notification names. A message holds S3's event,
+/// or SNS's envelope around it; S3's test event names none.
+pub fn changes(body: &str) -> Result<Changes, String> {
     let value: Value = serde_json::from_str(body).map_err(|error| error.to_string())?;
     if let Some(Value::String(event)) = value.get("Message") {
         return changes(event);
     }
     let Some(records) = value.get("Records").and_then(Value::as_array) else {
-        return Ok(Vec::new());
+        return Ok(Changes {
+            changes: Vec::new(),
+            event_time: None,
+        });
     };
-    records.iter().map(change).collect()
+    let event_time = records
+        .iter()
+        .filter_map(|record| record["eventTime"].as_str().and_then(parse_time))
+        .min();
+    Ok(Changes {
+        changes: records.iter().map(change).collect::<Result<_, _>>()?,
+        event_time,
+    })
+}
+
+/// An ISO 8601 time in UTC, such as `2026-09-27T12:34:56.789Z`, the form
+/// S3's `eventTime` takes.
+fn parse_time(time: &str) -> Option<SystemTime> {
+    let (date, clock) = time.strip_suffix('Z')?.split_once('T')?;
+    let number = |part: &str| part.parse::<i64>().ok();
+    let mut date = date.splitn(3, '-');
+    let (year, month, day) = (
+        number(date.next()?)?,
+        number(date.next()?)?,
+        number(date.next()?)?,
+    );
+    let (clock, fraction) = clock.split_once('.').unwrap_or((clock, "0"));
+    let mut clock = clock.splitn(3, ':');
+    let (hour, minute, second) = (
+        number(clock.next()?)?,
+        number(clock.next()?)?,
+        number(clock.next()?)?,
+    );
+    let millis = number(&format!("{fraction:0<3}")[..3])?;
+    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
+    let millis = u64::try_from(seconds * 1_000 + millis).ok()?;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_millis(millis))
+}
+
+/// Days from 1970-01-01 to a date in the proleptic Gregorian calendar.
+pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 fn change(record: &Value) -> Result<(ObjectKey, Option<ETag>), String> {
@@ -182,17 +234,30 @@ mod tests {
     #[test]
     fn reads_s3_events() {
         let body = r#"{"Records":[
-            {"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"logs"},
+            {"eventName":"ObjectCreated:Put","eventTime":"2026-09-27T12:34:56.789Z",
+             "s3":{"bucket":{"name":"logs"},
              "object":{"key":"a+b%2Bc/d","eTag":"0123abcd","sequencer":"01"}}},
-            {"eventName":"ObjectRemoved:Delete","s3":{"bucket":{"name":"logs"},
+            {"eventName":"ObjectRemoved:Delete","eventTime":"2026-09-27T12:34:57Z",
+             "s3":{"bucket":{"name":"logs"},
              "object":{"key":"gone","sequencer":"02"}}}]}"#;
+        let read = changes(body).unwrap();
         assert_eq!(
-            changes(body).unwrap(),
+            read.changes,
             [
                 (key("a b+c/d"), Some(ETag("\"0123abcd\"".into()))),
                 (key("gone"), None),
             ]
         );
+        let millis = 1_790_512_496_789;
+        let earliest = SystemTime::UNIX_EPOCH + Duration::from_millis(millis);
+        assert_eq!(read.event_time, Some(earliest));
+    }
+
+    #[test]
+    fn days_count_from_the_epoch() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
     }
 
     #[test]
@@ -200,7 +265,7 @@ mod tests {
         let event = r#"{"Records":[{"eventName":"ObjectCreated:Copy","s3":{"bucket":{"name":"logs"},"object":{"key":"k","eTag":"ff"}}}]}"#;
         let body = json!({ "Type": "Notification", "Message": event }).to_string();
         assert_eq!(
-            changes(&body).unwrap(),
+            changes(&body).unwrap().changes,
             [(key("k"), Some(ETag("\"ff\"".into())))]
         );
     }
@@ -208,12 +273,12 @@ mod tests {
     #[test]
     fn an_expiration_drops_metadata() {
         let body = r#"{"Records":[{"eventName":"LifecycleExpiration:Delete","s3":{"bucket":{"name":"logs"},"object":{"key":"old","eTag":"ab"}}}]}"#;
-        assert_eq!(changes(body).unwrap(), [(key("old"), None)]);
+        assert_eq!(changes(body).unwrap().changes, [(key("old"), None)]);
     }
 
     #[test]
     fn a_test_event_names_no_change() {
         let body = r#"{"Service":"Amazon S3","Event":"s3:TestEvent","Bucket":"logs"}"#;
-        assert_eq!(changes(body).unwrap(), []);
+        assert_eq!(changes(body).unwrap().changes, []);
     }
 }

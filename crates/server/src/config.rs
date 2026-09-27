@@ -25,6 +25,15 @@ pub struct Config {
     pub cluster: ClusterConfig,
     pub gateway: Option<GatewayConfig>,
     pub node: Option<NodeConfig>,
+    pub admin: Option<AdminConfig>,
+}
+
+/// Where the process serves its metrics, health and readiness.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    /// Such as `127.0.0.1:9090`. The listener checks no credentials.
+    pub listen: String,
 }
 
 /// The storage nodes, and the secret that gateways and nodes share.

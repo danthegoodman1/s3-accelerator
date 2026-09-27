@@ -11,6 +11,7 @@
 
 use crate::disk::Disk;
 use crate::http::{Connection, Framing, Response, header};
+use crate::metrics::{Link, Metrics, S3Kind};
 use crate::origin::{self, Origin, OriginBody};
 use crate::passthrough;
 use crate::peers::{Exchanged, Peers};
@@ -23,7 +24,7 @@ use bytes::Bytes;
 use hyper::body::Incoming;
 use s3_accelerator_core::Time;
 use s3_accelerator_core::node::{
-    self, EventId, GatewayRequestId, HotHint, Node, OriginRequestId, Read, Segment,
+    self, EventId, GatewayRequestId, HotHint, Node, OriginRequestId, Read, Segment, Stats, Usage,
 };
 use s3_accelerator_core::placement::{NodeId, PlacementHash, Ring, down_version};
 use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
@@ -108,6 +109,7 @@ const PAGES_RECHECK: Duration = Duration::from_millis(10);
 
 pub struct NodeEngine {
     started: Instant,
+    metrics: Rc<Metrics>,
     origin: Arc<Origin>,
     peers: Rc<Peers>,
     disk: Arc<Disk>,
@@ -196,11 +198,13 @@ impl NodeEngine {
         peers: Rc<Peers>,
         disk: Arc<Disk>,
         addresses: BTreeMap<NodeId, String>,
+        metrics: Rc<Metrics>,
     ) -> SharedNode {
         let engine = Rc::new(RefCell::new(NodeEngine {
             addresses,
             down: Vec::new(),
             started: Instant::now(),
+            metrics,
             origin,
             peers,
             disk,
@@ -262,6 +266,9 @@ impl NodeEngine {
         let work = {
             let mut this = engine.borrow_mut();
             let now = this.now();
+            if ring.version() != this.node.ring().version() {
+                this.metrics.ring_changed(false);
+            }
             this.addresses = addresses;
             this.node.on_ring(now, ring);
             this.pump()
@@ -272,6 +279,20 @@ impl NodeEngine {
     /// Membership now holds `down` down.
     pub fn on_down(engine: &SharedNode, down: Vec<NodeId>) {
         engine.borrow_mut().down = down;
+    }
+
+    /// The core's counts and usage, and the ring's version with its nodes up
+    /// and down.
+    pub fn observe(engine: &SharedNode) -> (Stats, Usage, (u64, usize, usize)) {
+        let this = engine.borrow();
+        let ring = this.node.ring();
+        let members = ring.members();
+        let down = members
+            .iter()
+            .filter(|member| this.down.contains(&member.id))
+            .count();
+        let view = (ring.version(), members.len() - down, down);
+        (this.node.stats(), this.node.usage(), view)
     }
 
     /// What the node stamps its answers with: its ring's version, and the
@@ -997,11 +1018,12 @@ fn start(engine: &SharedNode, work: Work) {
 async fn fetch(engine: SharedNode, origin: OriginRequestId, request: Request, streams: bool) {
     let client = engine.borrow().origin.clone();
     let hold = (!streams).then(|| fill_limit(&request));
-    let (head, body) = client.read(&request, hold).await;
+    let reply = client.read(&request, hold).await;
     let (work, passing) = {
         let mut this = engine.borrow_mut();
         this.tasks.remove(&origin);
-        let arriving = match body {
+        this.metrics.s3_request(S3Kind::Read, reply.answered);
+        let arriving = match reply.body {
             OriginBody::Held(bytes) => {
                 this.bodies.insert(origin, Body::Held(bytes));
                 None
@@ -1012,7 +1034,7 @@ async fn fetch(engine: SharedNode, origin: OriginRequestId, request: Request, st
             }
         };
         let now = this.now();
-        this.node.on_origin_response(now, origin, head);
+        this.node.on_origin_response(now, origin, reply.head);
         let work = this.pump();
         let readers = match this.bodies.get_mut(&origin) {
             Some(body) => match std::mem::replace(body, Body::Passing) {
@@ -1198,19 +1220,24 @@ fn write(engine: &SharedNode, location: Location, bytes: Bytes) {
                 .map_err(io::Error::other)
                 .and_then(|written| written);
             match written {
-                Ok(false) if tokio::time::Instant::now() < deadline => {
+                Ok(None) if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(recheck).await;
                     recheck = (recheck * 2).min(Duration::from_secs(1));
                 }
-                Ok(false) => break Err(io::Error::other("the slot's old pages stayed in use")),
-                Ok(true) => break Ok(()),
+                Ok(None) => break Err(io::Error::other("the slot's old pages stayed in use")),
+                Ok(Some(written)) => break Ok(written),
                 Err(error) => break Err(error),
             }
         };
         let work = {
             let mut this = engine.borrow_mut();
             match written {
-                Ok(()) => this.node.on_written(location),
+                Ok(written) => {
+                    if let Some(took) = written.sync {
+                        this.metrics.sync(took);
+                    }
+                    this.node.on_written(location);
+                }
                 Err(error) => {
                     eprintln!("writing {location:?}: {error}");
                     this.node.on_write_failed(location);
@@ -1241,7 +1268,17 @@ pub async fn take_events(engine: SharedNode, queue: Rc<Queue>, visibility: Durat
             }
         };
         for message in offered {
-            match sqs::changes(&message.body) {
+            let read = sqs::changes(&message.body);
+            let lag = read
+                .as_ref()
+                .ok()
+                .and_then(|read| read.event_time)
+                .map(|time| {
+                    let now = std::time::SystemTime::now();
+                    now.duration_since(time).unwrap_or_default()
+                });
+            engine.borrow().metrics.event(lag);
+            match read.map(|read| read.changes) {
                 Ok(changes) if !changes.is_empty() => {
                     NodeEngine::take_message(&engine, message.receipt, changes);
                 }
@@ -1284,7 +1321,10 @@ pub async fn serve(
         stream.set_nodelay(true)?;
         let (tls, engine, secret) = (tls.clone(), engine.clone(), secret.clone());
         tokio::task::spawn_local(async move {
-            let Some(connection) = tls::accept(tls.as_deref(), stream).await else {
+            let metrics = engine.borrow().metrics.clone();
+            let Some(connection) =
+                tls::accept(tls.as_deref(), stream, &metrics, Link::Cluster).await
+            else {
                 return;
             };
             if let Err(error) = serve_connection(connection, &engine, &secret).await {
@@ -1478,7 +1518,15 @@ async fn forward_to_s3(
         _ => Vec::new(),
     };
     let reserved: u64 = keep.iter().map(|range| range.end - range.start).sum();
+    let sending = Instant::now();
     let sent = passthrough::to_s3(&origin, forward, connection, &keep).await;
+    let metrics = engine.borrow().metrics.clone();
+    let answer = sent
+        .response
+        .as_ref()
+        .ok()
+        .map(|response| (response.status().as_u16(), sending.elapsed()));
+    metrics.s3_request(S3Kind::Forward, answer);
     let response = match sent.response {
         Ok(response) => response,
         Err(error) => {

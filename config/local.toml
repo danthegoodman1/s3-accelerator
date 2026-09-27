@@ -33,3 +33,7 @@ domains = ["localhost"]
 [node]
 id = 0
 data_dir = "target/local-cache"
+
+# Metrics, health and readiness.
+[admin]
+listen = "127.0.0.1:9090"

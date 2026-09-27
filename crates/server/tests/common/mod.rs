@@ -51,6 +51,8 @@ pub const LISTING: &str = "<ListBucketResult><Name>bucket</Name></ListBucketResu
 /// object.
 pub struct Origin {
     pub requests: Cell<u64>,
+    /// Response body bytes it sent.
+    pub sent: Cell<u64>,
     pub deleted: Cell<bool>,
     /// Each request's path and query, as they arrived.
     pub paths: RefCell<Vec<String>>,
@@ -77,6 +79,7 @@ impl Default for Origin {
     fn default() -> Origin {
         Origin {
             requests: Cell::default(),
+            sent: Cell::default(),
             deleted: Cell::default(),
             paths: RefCell::default(),
             queries: RefCell::default(),
@@ -219,6 +222,7 @@ async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
                     if connection.write_all(piece).await.is_err() {
                         return;
                     }
+                    origin.sent.set(origin.sent.get() + piece.len() as u64);
                 }
             }
         });
@@ -416,9 +420,34 @@ pub fn data_dir() -> PathBuf {
     dir
 }
 
+/// The admin listener's answer at `path`: its status and body.
+pub async fn admin(port: u16, path: &str) -> (u16, String) {
+    let response = reqwest::get(format!("http://127.0.0.1:{port}{path}"))
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap())
+}
+
+/// The value of the sample `name` with `labels`, as a scrape renders it,
+/// such as `s3accel_node_reads_total` and `""`, or 0 if the scrape has
+/// none.
+pub fn sample(scrape: &str, name: &str, labels: &str) -> f64 {
+    let series = match labels {
+        "" => format!("{name} "),
+        labels => format!("{name}{{{labels}}} "),
+    };
+    scrape
+        .lines()
+        .find_map(|line| line.strip_prefix(series.as_str()))
+        .map_or(0.0, |value| value.parse().unwrap())
+}
+
 /// A server running on this `LocalSet`.
 pub struct Server {
     pub port: u16,
+    /// Where the server answers scrapes and health checks.
+    pub admin_port: u16,
     stop: oneshot::Sender<()>,
     done: tokio::task::JoinHandle<io::Result<()>>,
 }
@@ -473,9 +502,12 @@ impl Server {
         .unwrap();
         config.check().unwrap();
         let port = gateway.local_addr().unwrap().port();
+        let admin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_port = admin.local_addr().unwrap().port();
         let listeners = Listeners {
             gateway: Some(gateway),
             node: Some(node),
+            admin: Some(admin),
         };
         let (stop, stopped) = oneshot::channel::<()>();
         // A server whose handle is dropped runs until the test ends.
@@ -485,7 +517,12 @@ impl Server {
             }
         };
         let done = tokio::task::spawn_local(server::run(config, listeners, stopped));
-        Server { port, stop, done }
+        Server {
+            port,
+            admin_port,
+            stop,
+            done,
+        }
     }
 
     /// Shuts the server down cleanly and waits until it has.

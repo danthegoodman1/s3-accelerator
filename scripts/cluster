@@ -94,6 +94,9 @@ key = \"$tls_dir/member-key.pem\""
 [node]
 id = $id
 data_dir = \"$dir/node-$id\"
+
+[admin]
+listen = \"127.0.0.1:$((9091 + id))\"
 $members" >"$dir/node-$id.toml"
       "$binary" "$dir/node-$id.toml" >"$dir/node-$id.log" 2>&1 &
       echo $! >"$dir/node-$id.pid"
@@ -101,7 +104,10 @@ $members" >"$dir/node-$id.toml"
     done
     gateway='[gateway]
 listen = "127.0.0.1:9000"
-domains = ["localhost"]'
+domains = ["localhost"]
+
+[admin]
+listen = "127.0.0.1:9090"'
     if [ "$tls" = --tls ]; then
       # Rustls matches no wildcard over a single label, so the certificate
       # names the bucket the conformance suite reaches virtual-hosted-style.
@@ -121,6 +127,7 @@ $members"
     echo $! >"$dir/gateway.pid"
     wait_for 9000
     echo "a gateway and $nodes nodes are listening; logs are in $dir"
+    echo "metrics at http://127.0.0.1:9090/metrics for the gateway and 9091 on for the nodes"
     if [ "$tls" = --tls ]; then
       echo "clients trust the gateway with SSL_CERT_FILE=$PWD/$dir/tls/cert.pem"
     fi

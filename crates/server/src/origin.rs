@@ -16,7 +16,7 @@ use hyper_util::rt::TokioExecutor;
 use s3_accelerator_core::s3::{ETag, Method, ObjectKey, Request, ResponseHead};
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest S3 may take to answer, or leave a response body idle.
@@ -34,6 +34,29 @@ pub struct Origin {
     endpoint: String,
     authority: String,
     signer: Signer,
+}
+
+/// S3's answer to a read.
+pub struct Reply {
+    pub head: ResponseHead,
+    pub body: OriginBody,
+    /// S3's status and how long its head took, or `None` when S3 sent no
+    /// answer and the node answers 503 itself.
+    pub answered: Option<(u16, Duration)>,
+    /// S3's `x-amz-request-id` and `x-amz-id-2`, which name the request to
+    /// AWS.
+    pub ids: Option<(String, String)>,
+}
+
+impl Reply {
+    fn failed() -> Reply {
+        Reply {
+            head: ResponseHead::status(503),
+            body: OriginBody::Held(Bytes::new()),
+            answered: None,
+            ids: None,
+        }
+    }
 }
 
 /// S3's response body to a read.
@@ -87,20 +110,13 @@ impl Origin {
     /// answer. `hold` is the most body bytes to read in full before
     /// answering; without it, a body of known length is left arriving. A
     /// failure to reach S3 answers 503.
-    pub async fn read(
-        self: &Arc<Self>,
-        request: &Request,
-        hold: Option<u64>,
-    ) -> (ResponseHead, OriginBody) {
+    pub async fn read(self: &Arc<Self>, request: &Request, hold: Option<u64>) -> Reply {
         let (origin, request) = (self.clone(), request.clone());
         let reading = workers().spawn(async move { origin.read_here(&request, hold).await });
-        reading
-            .await
-            .unwrap_or_else(|_| (ResponseHead::status(503), OriginBody::Held(Bytes::new())))
+        reading.await.unwrap_or_else(|_| Reply::failed())
     }
 
-    async fn read_here(&self, request: &Request, hold: Option<u64>) -> (ResponseHead, OriginBody) {
-        let failed = || (ResponseHead::status(503), OriginBody::Held(Bytes::new()));
+    async fn read_here(&self, request: &Request, hold: Option<u64>) -> Reply {
         // S3 answers a whole object with its checksums, which the home
         // keeps with the metadata.
         let mut headers = vec![("x-amz-checksum-mode".to_string(), "ENABLED".to_string())];
@@ -118,25 +134,34 @@ impl Origin {
             Method::Head => "HEAD",
         };
         let path = object_path(&request.key);
+        let sending = Instant::now();
         let sent = self.send(method, &path, "", headers, UNSIGNED_PAYLOAD, empty(), None);
         let response = match tokio::time::timeout(READ_TIMEOUT, sent).await {
             Ok(Ok(response)) => response,
-            _ => return failed(),
+            _ => return Reply::failed(),
         };
+        let first_byte = sending.elapsed();
         let (parts, body) = response.into_parts();
         let headers = header_pairs(&parts.headers);
         let length = header(&headers, "content-length").and_then(|value| value.parse().ok());
-        let mut head = response_head(parts.status.as_u16(), &headers, length.unwrap_or(0));
-        match (request.method, hold, length) {
-            (Method::Head, _, _) => (head, OriginBody::Held(Bytes::new())),
-            (Method::Get, None, Some(_)) => (head, OriginBody::Arriving(body)),
+        let status = parts.status.as_u16();
+        let mut head = response_head(status, &headers, length.unwrap_or(0));
+        let body = match (request.method, hold, length) {
+            (Method::Head, _, _) => OriginBody::Held(Bytes::new()),
+            (Method::Get, None, Some(_)) => OriginBody::Arriving(body),
             (Method::Get, hold, _) => match collect(body, hold.unwrap_or(HELD_LIMIT)).await {
                 Ok(bytes) => {
                     head.content_length = bytes.len() as u64;
-                    (head, OriginBody::Held(bytes))
+                    OriginBody::Held(bytes)
                 }
-                Err(_) => failed(),
+                Err(_) => return Reply::failed(),
             },
+        };
+        Reply {
+            head,
+            body,
+            answered: Some((status, first_byte)),
+            ids: request_ids(&headers),
         }
     }
 
@@ -273,6 +298,13 @@ pub async fn next_frame(body: &mut Incoming) -> io::Result<Option<Bytes>> {
             }
         }
     }
+}
+
+/// S3's `x-amz-request-id` and `x-amz-id-2`, if it sent them.
+pub fn request_ids(headers: &[(String, String)]) -> Option<(String, String)> {
+    let id = header(headers, "x-amz-request-id")?;
+    let id2 = header(headers, "x-amz-id-2").unwrap_or("");
+    Some((id.to_string(), id2.to_string()))
 }
 
 /// What the core reads from S3's response, whose body is `len` bytes.

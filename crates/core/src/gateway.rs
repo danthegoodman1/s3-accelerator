@@ -125,6 +125,9 @@ pub struct Gateway {
     hot: BTreeMap<PlacementHash, (Vec<NodeId>, Time, usize)>,
     /// When the gateway last asked a node for its ring, until it arrives.
     fetching_ring: Option<Time>,
+    /// Whether a node has answered the gateway. Until one does, the
+    /// gateway asks the nodes it knows for a ring.
+    heard: bool,
     actions: Vec<Action>,
 }
 
@@ -262,13 +265,25 @@ impl Gateway {
             down_version: 0,
             down_fetched: None,
             fetching_ring: None,
+            heard: false,
             actions: Vec::new(),
         }
+    }
+
+    /// Whether a node has answered the gateway, with a ring or with its
+    /// ring's version.
+    pub fn has_heard(&self) -> bool {
+        self.heard
     }
 
     /// The ring the gateway routes by.
     pub fn ring(&self) -> &Ring {
         &self.ring
+    }
+
+    /// The nodes the last ring's membership held down.
+    pub fn down(&self) -> &BTreeSet<NodeId> {
+        &self.down
     }
 
     /// A node said these placements are hot: until each hint runs out, the
@@ -310,6 +325,7 @@ impl Gateway {
     /// ring from that node, one fetch at a time.
     pub fn on_ring_version(&mut self, now: Time, from: NodeId, version: u64, down: u64) {
         self.now = self.now.max(now);
+        self.heard = true;
         // A node that answers is up, whatever a ring said.
         self.down.remove(&from);
         let fetching = self
@@ -344,6 +360,7 @@ impl Gateway {
     /// this ring, around the down nodes.
     pub fn on_ring(&mut self, now: Time, ring: Ring, down: Vec<NodeId>) {
         self.now = self.now.max(now);
+        self.heard = true;
         self.fetching_ring = None;
         self.ring = ring;
         self.down_version = down_version(&down);
@@ -444,6 +461,11 @@ impl Gateway {
             .collect();
         for id in expired {
             self.fail_over(now, id, None, true);
+        }
+        // A starting gateway's ring may be old: it asks for one before its
+        // first read needs it.
+        if !self.heard {
+            self.find_ring(now);
         }
     }
 

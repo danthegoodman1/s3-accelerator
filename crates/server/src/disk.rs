@@ -28,6 +28,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 use xxhash_rust::xxh3::xxh3_64;
 
 const MAGIC: &[u8; 8] = b"S3ACSLOT";
@@ -96,8 +97,14 @@ impl GroupSync {
     }
 
     /// Makes durable a write that began when `begin` returned `first` and
-    /// has ended, running `flush` if no sync that began since will.
-    fn sync(&self, first: u64, mut flush: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    /// has ended, running `flush` if no sync that began since will. Returns
+    /// how long `flush` took, if this call ran it.
+    fn sync(
+        &self,
+        first: u64,
+        mut flush: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Option<Duration>> {
+        let mut took = None;
         let mut state = self.state.lock().expect("sync lock");
         // The first sync to begin after the write ended.
         let needed = state.begun;
@@ -107,7 +114,7 @@ impl GroupSync {
                 state.waiting -= 1;
                 return match state.failed.range(first..=needed).next() {
                     Some(_) => Err(io::Error::other("a sync of the slab file failed")),
-                    None => Ok(()),
+                    None => Ok(took),
                 };
             }
             if state.begun > state.finished {
@@ -117,7 +124,9 @@ impl GroupSync {
             let number = state.begun;
             state.begun += 1;
             drop(state);
+            let flushing = Instant::now();
             let synced = flush();
+            took = Some(flushing.elapsed());
             state = self.state.lock().expect("sync lock");
             state.finished += 1;
             if synced.is_err() {
@@ -126,6 +135,13 @@ impl GroupSync {
             self.done.notify_all();
         }
     }
+}
+
+/// A block write that reached the disk.
+pub struct Written {
+    /// How long the sync this write ran took, if it ran one rather than
+    /// sharing another's.
+    pub sync: Option<Duration>,
 }
 
 /// What a start reads back: the slot table's records and the metadata
@@ -240,9 +256,9 @@ impl Disk {
     }
 
     /// Writes a block's bytes into its slot and syncs them, after any
-    /// cleared records. Returns false, writing nothing, while a socket or
+    /// cleared records. Returns `None`, writing nothing, while a socket or
     /// pipe still holds any of the old pages the bytes would overwrite.
-    pub fn write(&self, location: Location, bytes: &[u8]) -> io::Result<bool> {
+    pub fn write(&self, location: Location, bytes: &[u8]) -> io::Result<Option<Written>> {
         let offset = self.offset(location);
         let len = bytes.len() as u64;
         let range = offset..offset + len;
@@ -257,7 +273,7 @@ impl Disk {
         if self.pages.in_use(&self.slabs, slot, range.clone())? {
             let written = self.written.lock().expect("written lock")[index];
             if written <= slot_size || self.pages.in_use(&self.slabs, span, range)? {
-                return Ok(false);
+                return Ok(None);
             }
             self.written.lock().expect("written lock")[index] = slot_size;
         }
@@ -274,13 +290,13 @@ impl Disk {
         }
         let first = self.slab_sync.begin();
         self.slabs.write_all_at(bytes, offset)?;
-        self.slab_sync.sync(first, || self.slabs.sync_data())?;
+        let sync = self.slab_sync.sync(first, || self.slabs.sync_data())?;
         let checksum = xxh3_64(bytes);
         self.checksums
             .lock()
             .expect("checksums lock")
             .insert(location, checksum);
-        Ok(true)
+        Ok(Some(Written { sync }))
     }
 
     /// Sends `len` bytes of the slab file from `offset` to `socket` with
@@ -864,7 +880,7 @@ mod tests {
             extent: 1,
             offset: 0,
         };
-        assert!(disk.write(at, &[7; 8192]).unwrap());
+        assert!(disk.write(at, &[7; 8192]).unwrap().is_some());
         let blocks = || std::fs::metadata(dir.join("slabs")).unwrap().blocks();
         let reserved = blocks();
         disk.erase(at, 8192).unwrap();
@@ -955,9 +971,9 @@ mod tests {
         {
             let (disk, recovery) = Disk::open(&dir, config()).unwrap();
             assert!(recovery.records.is_empty());
-            assert!(disk.write(at(1, 4096), &[1; 1000]).unwrap());
+            assert!(disk.write(at(1, 4096), &[1; 1000]).unwrap().is_some());
             disk.record(at(1, 4096), record()).unwrap();
-            assert!(disk.write(at(2, 0), &[2; 1000]).unwrap());
+            assert!(disk.write(at(2, 0), &[2; 1000]).unwrap().is_some());
             disk.record(at(2, 0), record()).unwrap();
             disk.clear(at(2, 0)).unwrap();
             disk.append(&key(), None).unwrap();

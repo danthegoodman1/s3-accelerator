@@ -2,12 +2,14 @@
 //! `GetObject` and `HeadObject` through the core. Other operations pass
 //! through a storage node, which signs them for S3.
 
+use crate::admin::{self, Admin};
 use crate::config::{Access, Client, Config};
 use crate::disk::Disk;
 use crate::gateway_engine::{Event, GatewayEngine, SharedGateway};
 use crate::http::{Connection, Framing, RequestHead, Response};
 use crate::http::{etag_condition, format_content_range, header, parse_range, split_path};
 use crate::membership_engine::{self, GossipKey};
+use crate::metrics::{Link, Metrics, NodeFailure, Operation, Side};
 use crate::node_engine::{self, NodeEngine};
 use crate::origin::{self, Origin};
 use crate::passthrough::{self, ToNode};
@@ -36,6 +38,7 @@ use tokio::sync::watch;
 
 struct Context {
     gateway: SharedGateway,
+    metrics: Rc<Metrics>,
     clients: Vec<Client>,
     /// Domains the gateway takes virtual-hosted-style requests for.
     domains: Vec<String>,
@@ -47,6 +50,11 @@ const MAX_DELETE_BODY: u64 = 8 << 20;
 
 pub async fn serve(config: Config) -> io::Result<()> {
     let mut listeners = Listeners::default();
+    if let Some(admin) = &config.admin {
+        let listener = TcpListener::bind(&admin.listen).await?;
+        eprintln!("admin listening on {}", listener.local_addr()?);
+        listeners.admin = Some(listener);
+    }
     if let Some(gateway) = &config.gateway {
         let listener = TcpListener::bind(&gateway.listen).await?;
         eprintln!("gateway listening on {}", listener.local_addr()?);
@@ -72,11 +80,13 @@ pub async fn serve(config: Config) -> io::Result<()> {
     run_with(config, listeners, stop, leave).await
 }
 
-/// Where a process's gateway takes S3 clients and its node takes gateways.
+/// Where a process's gateway takes S3 clients, its node takes gateways,
+/// and its admin listener takes scrapes and health checks.
 #[derive(Default)]
 pub struct Listeners {
     pub gateway: Option<TcpListener>,
     pub node: Option<TcpListener>,
+    pub admin: Option<TcpListener>,
 }
 
 /// Serves the gateway and node the config names on `listeners` until `stop`
@@ -123,11 +133,19 @@ pub async fn run_with(
         None => None,
     };
     let peers = Peers::new(config.addresses(), secret.clone(), connector);
+    let admin = Admin::new(config.node.is_some());
+    let metrics = admin.metrics.clone();
+    let admin_listener = listeners
+        .admin
+        .map(|listener| tokio::task::spawn_local(admin::serve(listener, admin.clone())));
+    let delays = tokio::task::spawn_local(measure_loop_delay(metrics.clone()));
     let (stopping, stopped) = watch::channel(false);
     let stopping = Rc::new(stopping);
     let stopper = stopping.clone();
+    let stopping_admin = admin.clone();
     tokio::task::spawn_local(async move {
         stop.await;
+        stopping_admin.stopping();
         let _ = stopper.send(true);
     });
     let node = match (&config.node, listeners.node) {
@@ -152,7 +170,13 @@ pub async fn run_with(
             let origin = Arc::new(Origin::new(&origin.endpoint, &origin.region, credentials()));
             let node_config = config.cache.node_config();
             let opening = Instant::now();
-            let (disk, recovery) = Disk::open(Path::new(&node.data_dir), node_config.store)?;
+            // Recovery reads the slot table off the event loop, which
+            // answers health checks meanwhile.
+            let (dir, store) = (node.data_dir.clone(), node_config.store);
+            let (disk, recovery) =
+                tokio::task::spawn_blocking(move || Disk::open(Path::new(&dir), store))
+                    .await
+                    .map_err(io::Error::other)??;
             eprintln!(
                 "node {} read {} slot records in {:.3} s",
                 node.id,
@@ -183,7 +207,9 @@ pub async fn run_with(
                 peers.clone(),
                 Arc::new(disk),
                 config.addresses(),
+                metrics.clone(),
             );
+            admin.recovered(engine.clone());
             let address = &config.addresses()[&id];
             let own = tokio::net::lookup_host(address.as_str())
                 .await?
@@ -203,6 +229,7 @@ pub async fn run_with(
             let gossip_key = GossipKey::new(&config.cluster.secret);
             let (engine_for_membership, peers) = (engine.clone(), peers.clone());
             let stopper = stopping.clone();
+            let joining = admin.clone();
             tokio::task::spawn_local(async move {
                 let membership = membership_engine::run(
                     started,
@@ -214,7 +241,9 @@ pub async fn run_with(
                     gossip_key,
                 )
                 .await;
+                joining.joined();
                 leave.await;
+                joining.leaving();
                 eprintln!("leaving the cluster");
                 membership_engine::start_leaving(&membership);
                 tokio::time::sleep(fallback_window).await;
@@ -237,7 +266,13 @@ pub async fn run_with(
         _ => None,
     };
     if let (Some(_), Some(listener)) = (&config.gateway, listeners.gateway) {
-        let gateway = GatewayEngine::new(config.ring(), config.cache.gateway_config(), peers);
+        let gateway = GatewayEngine::new(
+            config.ring(),
+            config.cache.gateway_config(),
+            peers,
+            metrics.clone(),
+        );
+        admin.serving(gateway.clone());
         let domains = config
             .gateway
             .as_ref()
@@ -245,14 +280,32 @@ pub async fn run_with(
             .unwrap_or_default();
         let context = Rc::new(Context {
             gateway,
+            metrics,
             clients: config.clients,
             domains,
         });
         serve_clients(listener, context, clients, stopped_signal(stopped)).await?;
     }
-    match node {
+    let stopped = match node {
         Some(node) => node.await.map_err(io::Error::other)?,
         None => Ok(()),
+    };
+    delays.abort();
+    if let Some(admin_listener) = admin_listener {
+        admin_listener.abort();
+    }
+    stopped
+}
+
+/// How often the event loop's delay is measured.
+const DELAY_PERIOD: Duration = Duration::from_millis(100);
+
+/// Measures how late the event loop runs a timer, for as long as it runs.
+async fn measure_loop_delay(metrics: Rc<Metrics>) {
+    loop {
+        let due = Instant::now() + DELAY_PERIOD;
+        tokio::time::sleep_until(due.into()).await;
+        metrics.loop_delay(due.elapsed());
     }
 }
 
@@ -293,7 +346,8 @@ async fn serve_clients(
         stream.set_nodelay(true)?;
         let (context, tls) = (context.clone(), tls.clone());
         tokio::task::spawn_local(async move {
-            let Some(connection) = tls::accept(tls.as_deref(), stream).await else {
+            let accepted = tls::accept(tls.as_deref(), stream, &context.metrics, Link::Client);
+            let Some(connection) = accepted.await else {
                 return;
             };
             if let Err(error) = serve_connection(connection, &context).await {
@@ -307,40 +361,60 @@ async fn serve_clients(
 
 async fn serve_connection(mut connection: Connection, context: &Context) -> io::Result<()> {
     while let Some(head) = connection.read_head().await? {
-        let len = match head.content_length() {
-            Ok(len) => len,
-            Err(what) => {
-                let response = error(501, "NotImplemented", &format!("unsupported {what}"));
-                return connection.write_response(&response, false).await;
-            }
-        };
-        // The signature covers the head, so a request is authenticated and
-        // authorized before its body is read. A request answered before its
-        // body is read closes the connection.
-        let authorized = authenticate(&head, context).and_then(|client| {
-            let head = normalize(&head, &context.domains);
-            authorize(&head, client).map(|()| (head, client))
-        });
-        let reusable = match authorized {
-            Err(response) => {
-                let keep_alive = head.keep_alive && len == 0;
-                connection.write_response(&response, keep_alive).await?;
-                keep_alive
-            }
-            Ok((normal, client)) => {
-                handle(&mut connection, &normal, client, len, context).await? && head.keep_alive
-            }
-        };
-        if !reusable {
-            // The client may still be sending a body; draining it lets the
-            // client read the answer before the socket closes.
-            if len > 0 {
-                connection.linger().await;
-            }
+        let arrived = Instant::now();
+        let host = header(&head.headers, "host");
+        let operation = Operation::of(&head, virtual_bucket(host, &context.domains).is_some());
+        let served = serve_request(&mut connection, &head, context).await;
+        if let Some(answered) = connection.take_answered() {
+            let first_byte = answered.head_sent.saturating_duration_since(arrived);
+            let (status, sent) = (answered.status, answered.body_sent);
+            context.metrics.request(operation, status, first_byte, sent);
+        }
+        if !served? {
             return Ok(());
         }
     }
     Ok(())
+}
+
+/// Answers one request, and returns whether the connection can take
+/// another.
+async fn serve_request(
+    connection: &mut Connection,
+    head: &RequestHead,
+    context: &Context,
+) -> io::Result<bool> {
+    let len = match head.content_length() {
+        Ok(len) => len,
+        Err(what) => {
+            let response = error(501, "NotImplemented", &format!("unsupported {what}"));
+            connection.write_response(&response, false).await?;
+            return Ok(false);
+        }
+    };
+    // The signature covers the head, so a request is authenticated and
+    // authorized before its body is read. A request answered before its
+    // body is read closes the connection.
+    let authorized = authenticate(head, context).and_then(|client| {
+        let head = normalize(head, &context.domains);
+        authorize(&head, client).map(|()| (head, client))
+    });
+    let reusable = match authorized {
+        Err(response) => {
+            let keep_alive = head.keep_alive && len == 0;
+            connection.write_response(&response, keep_alive).await?;
+            keep_alive
+        }
+        Ok((normal, client)) => {
+            handle(connection, &normal, client, len, context).await? && head.keep_alive
+        }
+    };
+    // The client may still be sending a body; draining it lets the client
+    // read the answer before the socket closes.
+    if !reusable && len > 0 {
+        connection.linger().await;
+    }
+    Ok(reusable)
 }
 
 /// The client that signed the request's head, in its `Authorization`
@@ -623,8 +697,14 @@ async fn purge(
                     .await?;
                 return Ok(true);
             }
-            Ok(_) => eprintln!("node {} answered a purge out of protocol", node.0),
-            Err(failure) => eprintln!("purging through node {}: {failure}", node.0),
+            Ok(_) => {
+                context.metrics.node_failure(NodeFailure::Error);
+                eprintln!("node {} answered a purge out of protocol", node.0)
+            }
+            Err(failure) => {
+                context.metrics.node_failure(NodeFailure::of(&failure));
+                eprintln!("purging through node {}: {failure}", node.0)
+            }
         }
     }
     let response = error(503, "ServiceUnavailable", "no storage node took the purge");
@@ -710,8 +790,10 @@ async fn read(
                 let kernel_tls = body.kernel_tls() || connection.kernel_tls();
                 let (copied, relayed) =
                     zero_copy::relay(body.stream(), connection.stream(), want, kernel_tls).await;
+                connection.sent_body(copied);
                 if let Err(Short::Destination(error)) = relayed {
                     // The client is gone, and needs none of the rest.
+                    context.metrics.relay_cut(Side::Client);
                     GatewayEngine::forwarded(&context.gateway, from, len, None);
                     return Err(error);
                 }
@@ -729,7 +811,10 @@ async fn read(
                 }
             }
             // The body ends short, and the connection with it.
-            Event::Abort => return Ok(false),
+            Event::Abort => {
+                context.metrics.relay_cut(Side::Node);
+                return Ok(false);
+            }
         }
     }
     // The gateway dropped the read.
@@ -939,7 +1024,10 @@ async fn pass(
                 opened = Some((node, connection));
                 break;
             }
-            Err(failure) => eprintln!("passing a request to node {}: {failure}", node.0),
+            Err(failure) => {
+                context.metrics.node_failure(NodeFailure::of(&failure));
+                eprintln!("passing a request to node {}: {failure}", node.0)
+            }
         }
     }
     let Some((node, mut to_node)) = opened else {
@@ -1000,8 +1088,12 @@ async fn pass(
             (status, headers, length, closes)
         }
         Ok(_) | Err(_) => {
-            if let Err(failure) = answered {
-                eprintln!("passing a request through node {}: {failure}", node.0);
+            match answered {
+                Err(failure) => {
+                    context.metrics.node_failure(NodeFailure::of(&failure));
+                    eprintln!("passing a request through node {}: {failure}", node.0);
+                }
+                Ok(_) => context.metrics.node_failure(NodeFailure::Error),
             }
             let response = error(502, "BadGateway", "the storage node failed");
             connection.write_response(&response, false).await?;
@@ -1043,13 +1135,24 @@ async fn pass(
             let kernel_tls = to_node.kernel_tls() || connection.kernel_tls();
             let (copied, relayed) =
                 zero_copy::relay(to_node.stream(), connection.stream(), length, kernel_tls).await;
+            connection.sent_body(copied);
             if let Err(Short::Destination(failure)) = relayed {
+                context.metrics.relay_cut(Side::Client);
                 return Err(failure);
             }
             copied == length
         }
-        (false, Framing::Chunked) => relay_chunks(&mut to_node, connection).await?,
+        (false, Framing::Chunked) => match relay_chunks(&mut to_node, connection).await {
+            Ok(complete) => complete,
+            Err(failure) => {
+                context.metrics.relay_cut(Side::Client);
+                return Err(failure);
+            }
+        },
     };
+    if !complete {
+        context.metrics.relay_cut(Side::Node);
+    }
     if complete && body_read && !node_closes {
         peers.keep(node, to_node);
     }

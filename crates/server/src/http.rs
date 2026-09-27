@@ -7,6 +7,7 @@ use bytes::Bytes;
 use percent_encoding::percent_decode_str;
 use s3_accelerator_core::s3::{ByteRange, ContentRange, ETag};
 use std::io;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -81,6 +82,18 @@ pub struct Connection {
     kernel_tls: bool,
     /// The session still owes the client a `close_notify`.
     owes_close_notify: bool,
+    /// The status of the last response head written and when it went, and
+    /// the body bytes sent since.
+    answered: Option<(u16, Instant)>,
+    body_sent: u64,
+}
+
+/// A response as it went: its status, when its head was written, and the
+/// body bytes sent.
+pub struct Answered {
+    pub status: u16,
+    pub head_sent: Instant,
+    pub body_sent: u64,
 }
 
 impl Connection {
@@ -90,6 +103,8 @@ impl Connection {
             buffer: Vec::new(),
             kernel_tls: false,
             owes_close_notify: false,
+            answered: None,
+            body_sent: 0,
         }
     }
 
@@ -101,6 +116,8 @@ impl Connection {
             buffer: session.read_ahead,
             kernel_tls: session.kernel,
             owes_close_notify: session.kernel,
+            answered: None,
+            body_sent: 0,
         }
     }
 
@@ -113,6 +130,22 @@ impl Connection {
     /// Whether the kernel holds the connection's TLS session.
     pub fn kernel_tls(&self) -> bool {
         self.kernel_tls
+    }
+
+    /// The response written since the last call, if one was.
+    pub fn take_answered(&mut self) -> Option<Answered> {
+        let (status, head_sent) = self.answered.take()?;
+        Some(Answered {
+            status,
+            head_sent,
+            body_sent: std::mem::take(&mut self.body_sent),
+        })
+    }
+
+    /// Counts body bytes sent around the connection's own writes, such as
+    /// with `splice`.
+    pub fn sent_body(&mut self, len: u64) {
+        self.body_sent += len;
     }
 
     /// The next request's head, or `None` once the client closes the
@@ -321,10 +354,15 @@ impl Connection {
         let mut head = response_head(status, headers, framing, keep_alive).into_bytes();
         if body.len() > COALESCED_BODY {
             self.write_all(&head).await?;
-            return self.write_all(body).await;
+            self.answered = Some((status, Instant::now()));
+            self.body_sent = 0;
+            return self.write_body(body).await;
         }
         head.extend_from_slice(body);
-        self.write_all(&head).await
+        self.write_all(&head).await?;
+        self.answered = Some((status, Instant::now()));
+        self.body_sent = body.len() as u64;
+        Ok(())
     }
 
     /// Writes a response's status line and headers; the body follows.
@@ -336,7 +374,17 @@ impl Connection {
         keep_alive: bool,
     ) -> io::Result<()> {
         let head = response_head(status, headers, framing, keep_alive);
-        self.write_all(head.as_bytes()).await
+        self.write_all(head.as_bytes()).await?;
+        self.answered = Some((status, Instant::now()));
+        self.body_sent = 0;
+        Ok(())
+    }
+
+    /// Writes body bytes, which count toward the response's.
+    pub async fn write_body(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.write_all(bytes).await?;
+        self.body_sent += bytes.len() as u64;
+        Ok(())
     }
 
     /// Writes all of `bytes`, failing if the peer takes none of them for
@@ -362,7 +410,9 @@ impl Connection {
         let mut chunk = format!("{:x}\r\n", bytes.len()).into_bytes();
         chunk.extend_from_slice(bytes);
         chunk.extend_from_slice(b"\r\n");
-        self.write_all(&chunk).await
+        self.write_all(&chunk).await?;
+        self.body_sent += bytes.len() as u64;
+        Ok(())
     }
 
     /// Reads from the socket. A kernel TLS session fails the read with EIO

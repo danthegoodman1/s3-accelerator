@@ -2,11 +2,13 @@
 //! HTTP/1.1, and nodes serve gateways over the cluster protocol. A process
 //! runs either or both.
 
+pub mod admin;
 pub mod config;
 pub mod disk;
 pub mod gateway_engine;
 pub mod http;
 pub mod membership_engine;
+pub mod metrics;
 pub mod node_engine;
 pub mod origin;
 pub mod passthrough;

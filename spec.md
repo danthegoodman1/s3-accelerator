@@ -61,7 +61,7 @@ A distributed NVMe read cache in front of S3. S3 remains the source of truth, an
 - **Membership** runs SWIM gossip among storage nodes only. Each node derives an immutable ring snapshot from what it hears: the nodes up, and those declared down within the down grace period, less any that are leaving. A ring's version is a hash of its members and their weights, so nodes that agree on the members agree on the version. A node keeps its previous ring for the fallback window after a change; changes that follow while the window lasts, such as those a joining node sees as it hears of the others, extend the window and keep the ring from before the first. A starting node counts the nodes its config names as down until it hears from them, so each holds its placements for the down grace period. Every ten probe periods, a node announces itself again to the seeds it doesn't hear from, so a lost announcement or a healed partition doesn't leave the cluster split.
 - **Joining:** a starting node asks its seeds for their ring before it announces itself. A ring that lacks the node means the node is new, and that ring becomes its previous one, so it reads what it takes over from the nodes that held it. A restarted node finds itself in the ring and reads nothing from others.
 - **Leaving:** a node told to leave, by `SIGUSR1`, drops out of every ring at once, keeps serving its blocks to their new owners through the fallback window, and then stops.
-- **Gateways fetch the ring** over HTTP from storage nodes. Every storage response carries the version of its node's ring, and a gateway fetches the ring from a node whose version differs from its own, one fetch at a time; a fetch that fails lets the next answer ask again. A ring names each node's address, so gateways and nodes reach nodes their configs never named. A gateway whose ring names no node that answers asks the nodes it knows of for a ring. Only storage nodes gossip, so adding gateways adds no membership traffic.
+- **Gateways fetch the ring** over HTTP from storage nodes. Every storage response carries the version of its node's ring, and a gateway fetches the ring from a node whose version differs from its own, one fetch at a time; a fetch that fails lets the next answer ask again. A ring names each node's address, so gateways and nodes reach nodes their configs never named. A gateway whose ring names no node that answers asks the nodes it knows of for a ring, and so does a starting gateway until a node answers it. Only storage nodes gossip, so adding gateways adds no membership traffic.
 - **Placement** uses weighted rendezvous hashing over stable node IDs. It moves few keys when membership changes, weights each node by the `weight` its config gives, typically its disk size, and gives each key an ordered candidate list that doubles as its replica set. Each home or chunk reduces to a 64-bit placement hash, and a node's score mixes that hash with the node's ID.
 - **Blocks and chunks:**
   - A **block** (1 MiB) is the unit of fill, storage and eviction.
@@ -102,7 +102,7 @@ A distributed NVMe read cache in front of S3. S3 remains the source of truth, an
   - Within the fallback window after a ring change, a gateway on either ring tells only the home that ring names, so each home passes the write to the home under its other ring.
   - The Gateway that proxied the write drops its own cached entry, and ignores answers to reads it sent before the write, however full its cache. A write that reached a node other than the home may never reach the home, so the Gateway reads that key directly from S3 until the bucket's TTL has passed. A read through the Gateway after its write succeeds therefore sees the write, as long as the Gateway's ring stays the same.
   - Other gateways catch up when their entries expire. Clusters in other zones see the change through their freshness mode.
-- **Event notifications.** S3 sends buckets' notifications to the SQS queue that `[events]` names, which every storage node long-polls. A node passes each event to the key's home, and within the fallback window to its previous home too, and deletes the message once each home has it. A message a node fails to finish returns to the queue after its visibility timeout, and a repeat changes nothing. A home keeps metadata whose ETag the event names, and otherwise drops it as it would for a write. Gateways hear of no events, so a read sees a change once its event is handled and the gateway's entries from before have expired, as long as the gateway routes by the ring of the node that handled it.
+- **Event notifications.** S3 sends buckets' notifications to the SQS queue that `[events]` names, which every storage node long-polls. A node passes each event to the key's home, and within the fallback window to its previous home too, and deletes the message once each home has it; a ring the node adopts while an event is under way adds its home to those that must hear. A message a node fails to finish returns to the queue after its visibility timeout, and a repeat changes nothing. A home keeps metadata whose ETag the event names, and otherwise drops it as it would for a write. Gateways hear of no events, so a read sees a change once its event is handled and the gateway's entries from before have expired, as long as the gateway routes by the ring of the node that handled it.
 - **Versioned reads.** Requests with a `versionId` pass through to S3.
 - **No negative caching.** Misses (404s) aren't cached, which preserves S3's read-after-write guarantee for new keys. Requests queued at the home behind a first fetch share its 404 or 5xx only if they arrived before the fetch was sent, since S3 answered after they did.
 
@@ -174,7 +174,7 @@ Gateways and nodes report what they do through metrics, health checks and logs.
 
 - **Admin listener:** `[admin] listen` names an address where the process serves plaintext HTTP/1.1: `GET /metrics`, `/healthz` and `/readyz`. It checks no credentials, so bind it to a private address.
 - **Health:** `/healthz` answers 200 while the process's event loop runs.
-- **Readiness:** `/readyz` answers 200 once each role the process runs is ready, and otherwise 503 with a body naming what it waits for. A node is ready once it has recovered its store and its ring includes it; a gateway, once a node has answered it. Both turn unready when the process starts to stop or its node starts to leave, so load balancers drain them first.
+- **Readiness:** `/readyz` answers 200 once each role the process runs is ready, and otherwise 503 with a body naming what it waits for. A node is ready once it has recovered its store, off its event loop, and joined the cluster, having taken the ring from a seed or found none answering; a gateway, once a node has answered it. Both turn unready when the process starts to stop or its node starts to leave, so load balancers drain them first.
 - **Metrics:** Prometheus's text format, each name prefixed `s3accel_`. Counters end in `_total`; latencies are histograms in seconds, with buckets from 100 µs to 10 s. Label values come from fixed sets or HTTP status codes, and none names a bucket, key or client.
 - **Where counts live:** the core counts what it decides in its own state, and its owner reads the counts at each scrape. The server counts what it measures on the event loop, where every worker's result arrives: latencies, transport outcomes and failures. No count is shared between threads, so counting takes no lock and no atomic instruction, and a scrape renders on the event loop between events.
 - **Cost:** a hit pays a few increments on its own thread. Benchmarks scraped every second stay within 2% of the same runs without the admin listener.
@@ -189,21 +189,21 @@ Gateway metrics:
 | `gateway_node_failures_total` | counter | `reason`: `refused`, `timeout`, `error` | Requests to nodes that got no usable answer. |
 | `gateway_relays_cut_total` | counter | `side`: `node`, `client` | Responses cut short after their head: the node's body ended early, or the client left. |
 
-`operation` is one of `GetObject`, `HeadObject`, `PutObject`, `CopyObject`, `DeleteObject`, `DeleteObjects`, `ListObjects`, `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload` or `Other`.
+`operation` is one of `GetObject`, `HeadObject`, `PutObject`, `CopyObject`, `DeleteObject`, `DeleteObjects`, `ListObjects`, `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`, `Purge` or `Other`.
 
 Node metrics the core counts:
 
 | Metric | Type | Labels | Counts |
 | --- | --- | --- | --- |
-| `node_reads_total` | counter | | Requests from gateways for objects. |
-| `node_block_reads_total` | counter | `result`: `hit`, `fetched` | Blocks those requests read: from the store, or from a fetch from S3 or a previous owner. |
+| `node_reads_total` | counter | | Reads from gateways, and from nodes that took over placements. |
+| `node_block_reads_total` | counter | `result`: `hit`, `fetched` | Blocks the node's responses read: from the store, or from S3's or a previous owner's response. |
 | `node_block_misses_total` | counter | `reason`: `evicted`, `unadmitted`, `new` | Blocks an owner or leased replica fetched and could store, by what it remembers of them: the ghost queue holds them, the doorkeeper turned them away, or neither. |
-| `node_body_bytes_total` | counter | `source`: `cache`, `s3`, `previous_owner` | Body bytes sent to gateways. |
+| `node_body_bytes_total` | counter | `source`: `cache`, `s3`, `previous_owner` | Body bytes the node sent, by where they came from. |
 | `node_admissions_total` | counter | `result`: `stored`, `doorkeeper`, `budget`, `full` | The same blocks: stored, or turned away by the doorkeeper, the fill budget, or a store whose eviction candidates are all in use. |
 | `node_blocks_dropped_total` | counter | `cause`: `evicted`, `disowned`, `purged`, `corrupt`, `unfilled` | Blocks the store let go: to make room, cold or no longer owned; by purge; failing their checksums; or a fill that ended without them. |
 | `node_fill_bytes`, `node_fill_budget_bytes` | gauge | | Fill budget in use, and the budget. |
 | `node_store_blocks`, `node_store_extents` | gauge | `class`: slot size in bytes | Blocks and extents of each size class. |
-| `node_store_capacity_bytes` | gauge | | The slab file's size. |
+| `node_store_capacity_bytes` | gauge | | Bytes the store holds when full. |
 | `node_objects` | gauge | | Objects whose metadata the node holds. |
 | `node_written_bytes_total` | counter | | Block bytes written to the slab file. |
 | `node_verified_blocks_total` | counter | `result`: `intact`, `corrupt` | Recovered blocks checked against their checksums. |
@@ -227,10 +227,10 @@ Metrics of every process:
 
 | Metric | Type | Labels | Counts |
 | --- | --- | --- | --- |
-| `ring_changes_total` | counter | | Rings the process adopted. |
+| `ring_changes_total` | counter | `role`: `gateway`, `node` | Rings the process adopted, by the role that adopted them. |
 | `ring_info` | gauge | `version` | 1, labeled with the current ring's version in hex. |
 | `ring_nodes` | gauge | `state`: `up`, `down` | Nodes in the current ring, by whether the process routes around them. |
-| `tls_sessions_total` | counter | `link`: `client`, `cluster`; `mode`: `kernel`, `userspace` | TLS sessions established, and whether the kernel carries them. |
+| `tls_sessions_total` | counter | `link`: `client`, `cluster`; `mode`: `kernel`, `userspace` | TLS sessions the process accepted, and whether the kernel carries them. |
 | `tls_handshake_failures_total` | counter | `link` | Handshakes that failed or timed out. |
 | `event_loop_delay_seconds` | histogram | | How late the event loop runs a 100 ms timer. |
 | `build_info` | gauge | `version` | 1, labeled with the binary's version. |

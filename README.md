@@ -20,6 +20,13 @@ Nodes poll the queue with `[origin]`'s credentials. Set the bucket's `ttl_ms` lo
 
 To remove an object from the cache, as a retention rule may require after it is deleted, send `POST /bucket/key?x-accel-purge` with a credential whose grants cover the key. Every node drops and erases the object's blocks; a node that is down drops them once it is back.
 
+To watch a process, name an address for its admin listener, which serves Prometheus metrics at `/metrics`, `/healthz`, and `/readyz` for load balancers. It checks no credentials, so keep it on a private address:
+
+```toml
+[admin]
+listen = "10.0.0.1:9090"
+```
+
 ## Layout
 
 - `crates/core`: gateway and storage-node logic as deterministic state machines that do no I/O.

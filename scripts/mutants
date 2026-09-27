@@ -42,6 +42,8 @@ PASSTHROUGH = "crates/server/src/passthrough.rs"
 SQS = "crates/server/src/sqs.rs"
 TLS = "crates/server/src/tls.rs"
 PEERS = "crates/server/src/peers.rs"
+METRICS = "crates/server/src/metrics.rs"
+ADMIN = "crates/server/src/admin.rs"
 SIGV4 = "crates/server/src/sigv4.rs"
 STEP_TIMEOUT = 600
 
@@ -269,7 +271,7 @@ MUTANTS = [
     ),
     (
         "a body answered before it was read is never drained",
-        [(SERVER, "if len > 0 {\n                connection.linger().await;\n            }", "")],
+        [(SERVER, "if !reusable && len > 0 {\n        connection.linger().await;\n    }", "")],
     ),
     (
         "a reply waits for the whole arriving body",
@@ -388,8 +390,8 @@ MUTANTS = [
     ),
     (
         "eviction leaves the slot's record",
-        [(NODE, "self.stats.evicted_blocks += 1;\n            self.actions.push(Action::Clear { location });",
-          "self.stats.evicted_blocks += 1;\n            let _ = location;")],
+        [(NODE, "}\n            self.actions.push(Action::Clear { location });\n            self.unref(evicted.version);",
+          "}\n            let _ = location;\n            self.unref(evicted.version);")],
     ),
     (
         "a restart after a crash trusts its blocks",
@@ -513,8 +515,8 @@ MUTANTS = [
     ),
     (
         "an event no home heard of leaves the queue",
-        [(NODE, "self.events.retain(|_, (_, until)| *until > now);",
-          "let expired: Vec<EventId> = self.events.iter().filter(|(_, (_, until))| *until <= now).map(|(event, _)| *event).collect();\n"
+        [(NODE, "self.events.retain(|_, passed| passed.until > now);",
+          "let expired: Vec<EventId> = self.events.iter().filter(|(_, passed)| passed.until <= now).map(|(event, _)| *event).collect();\n"
           "        for event in expired { self.events.remove(&event); self.actions.push(Action::EventDone { event }); }")],
     ),
     (
@@ -877,7 +879,7 @@ MUTANTS = [
     ),
     (
         "S3 bodies are received on the event loop",
-        [(ORIGIN, "let reading = workers().spawn(async move { origin.read_here(&request, hold).await });\n        reading\n            .await\n            .unwrap_or_else(|_| (ResponseHead::status(503), OriginBody::Held(Bytes::new())))",
+        [(ORIGIN, "let reading = workers().spawn(async move { origin.read_here(&request, hold).await });\n        reading.await.unwrap_or_else(|_| Reply::failed())",
                   "origin.read_here(&request, hold).await")],
     ),
     (
@@ -910,6 +912,75 @@ MUTANTS = [
     (
         "reads waiting on a newly down node wait out the timeout",
         [(GATEWAY, "for id in waiting {\n            self.fail_over(now, id, None, false);\n        }", "")],
+    ),
+    (
+        "a miss is counted as a hit",
+        [(NODE, "None => self.stats.miss_bytes += len,", "None => self.stats.hit_bytes += len,")],
+    ),
+    (
+        "a previous owner's bytes are counted as S3's",
+        [(NODE, "Some(_) => self.stats.peer_bytes += len,", "Some(_) => self.stats.miss_bytes += len,")],
+    ),
+    (
+        "an evicted block's miss is counted as new",
+        [(NODE, "if self.store.remembers(hash) {\n            self.stats.misses_evicted += 1;",
+                "if self.store.remembers(hash) {\n            self.stats.misses_new += 1;")],
+    ),
+    (
+        "doorkeeper refusals go uncounted",
+        [(NODE, "self.stats.refused_doorkeeper += 1;", "")],
+    ),
+    (
+        "a relayed body's blocks go uncounted",
+        [(NODE, "self.stats.blocks_fetched += blocks as u64;", "")],
+    ),
+    (
+        "purged blocks go uncounted",
+        [(NODE, "self.stats.purged_blocks += 1;", "")],
+    ),
+    (
+        "a corrupt block a purge freed is freed again",
+        [(NODE, "if self.store.get(&block).is_some() {\n            self.store.remove(block);\n            self.actions.push(Action::Clear { location });\n            self.unref(block.version);\n        }",
+                "self.store.remove(block);\n        self.actions.push(Action::Clear { location });\n        self.unref(block.version);")],
+    ),
+    (
+        "an event under way skips the home a new ring names",
+        [(NODE, "let events: Vec<EventId> = self.events.keys().copied().collect();\n        for event in events {\n            self.tell_homes(event);\n        }", "")],
+    ),
+    (
+        "a starting gateway waits for a read to ask for a ring",
+        [(GATEWAY, "if !self.heard {\n            self.find_ring(now);\n        }", "")],
+    ),
+    (
+        "a node is ready before it joins",
+        [(ADMIN, 'Some((true, false)) => waiting.push("the node is joining the cluster"),', "")],
+    ),
+    (
+        "a node is ready before it recovers",
+        [(ADMIN, 'Some((false, _)) => waiting.push("the node is recovering its store"),', "")],
+    ),
+    (
+        "S3 reads go uncounted",
+        [(NODE_ENGINE, "this.metrics.s3_request(S3Kind::Read, reply.answered);", "")],
+    ),
+    (
+        "bytes relayed from nodes go uncounted",
+        [(SERVER, "want, kernel_tls).await;\n                connection.sent_body(copied);",
+                  "want, kernel_tls).await;")],
+    ),
+    (
+        "a histogram files values under lower bounds",
+        [(METRICS, "BUCKETS.partition_point(|&bound| bound < seconds)",
+                   "BUCKETS.partition_point(|&bound| bound < seconds / 2.0)")],
+    ),
+    (
+        "cache bytes are rendered as S3's",
+        [(METRICS, '("source=\\"cache\\"", stats.hit_bytes),', '("source=\\"cache\\"", stats.miss_bytes),')],
+    ),
+    (
+        "a disowned block's eviction is counted as cold",
+        [(STORE, "Some(_) => return Some(self.evict(key, true).extent),",
+                 "Some(_) => return Some(self.evict(key, false).extent),")],
     ),
 ]
 
