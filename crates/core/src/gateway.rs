@@ -17,9 +17,9 @@
 use crate::Time;
 use crate::layout::Layout;
 use crate::node::{BucketPolicy, Freshness, HotHint, ObjectMeta, RangeRead, Read};
-use crate::placement::{NodeId, Placement, PlacementHash, Ring};
+use crate::placement::{NodeId, Placement, PlacementHash, Ring, down_version};
 use crate::s3::{Answer, ContentRange, ETag, Method, ObjectKey, Request, ResponseHead, answer};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Stale retries after which a read goes to S3 directly, through the home,
 /// uncached: a read whose object keeps changing still finishes.
@@ -100,8 +100,13 @@ pub struct Gateway {
     reads: BTreeMap<ClientRequestId, ClientRead>,
     /// The node requests of reads in progress.
     parts: BTreeMap<NodeRequestId, Part>,
-    /// Nodes that timed out, and until when the gateway routes around them.
+    /// Nodes that timed out or refused a connection, and until when the
+    /// gateway routes around them.
     suspects: BTreeMap<NodeId, Time>,
+    /// Nodes the last ring's membership held down, which the gateway routes
+    /// around, and their version.
+    down: BTreeSet<NodeId>,
+    down_version: u64,
     /// Keys written through a node other than their home, and until when
     /// the gateway reads them directly from S3: the home may keep metadata
     /// from before the write until the bucket's TTL runs out.
@@ -229,6 +234,8 @@ impl Gateway {
             detours: BTreeMap::new(),
             hot: BTreeMap::new(),
             suspects: BTreeMap::new(),
+            down: BTreeSet::new(),
+            down_version: 0,
             fetching_ring: None,
             actions: Vec::new(),
         }
@@ -262,19 +269,26 @@ impl Gateway {
     /// and an empty key.
     pub fn pass_candidates(&self, target: &ObjectKey) -> Vec<NodeId> {
         let mut candidates = self.ring.candidates(Placement::Home(target).hash());
-        candidates.sort_by_key(|node| self.suspects.contains_key(node));
+        candidates.sort_by_key(|&node| self.avoided(node));
         candidates
     }
 
-    /// A node answered with its ring's version. A version other than the
-    /// gateway's means the ring changed, so the gateway fetches it from
-    /// that node, one fetch at a time.
-    pub fn on_ring_version(&mut self, now: Time, from: NodeId, version: u64) {
+    /// Whether the gateway routes around `node`: it timed out or refused a
+    /// connection lately, or its ring's membership holds it down.
+    fn avoided(&self, node: NodeId) -> bool {
+        self.suspects.contains_key(&node) || self.down.contains(&node)
+    }
+
+    /// A node answered with its ring's version and the version of the
+    /// nodes its membership holds down. Either one other than the gateway's
+    /// means the ring or its down nodes changed, so the gateway fetches the
+    /// ring from that node, one fetch at a time.
+    pub fn on_ring_version(&mut self, now: Time, from: NodeId, version: u64, down: u64) {
         self.now = self.now.max(now);
         let fetching = self
             .fetching_ring
             .is_some_and(|since| now.0 < since.0 + self.config.node_timeout);
-        if version == self.ring.version() || fetching {
+        if (version == self.ring.version() && down == self.down_version) || fetching {
             return;
         }
         self.fetching_ring = Some(now);
@@ -288,12 +302,44 @@ impl Gateway {
         self.fetching_ring = None;
     }
 
-    /// A node sent its ring. Reads in progress keep the nodes they went
-    /// to; later ones go by this ring.
-    pub fn on_ring(&mut self, now: Time, ring: Ring) {
+    /// A node sent its ring and the nodes its membership holds down. Reads
+    /// in progress keep the nodes they went to, unless a node they wait on
+    /// is newly down: then they go to the next candidate. Later reads go by
+    /// this ring, around the down nodes.
+    pub fn on_ring(&mut self, now: Time, ring: Ring, down: Vec<NodeId>) {
         self.now = self.now.max(now);
         self.fetching_ring = None;
         self.ring = ring;
+        self.down_version = down_version(&down);
+        let newly: BTreeSet<NodeId> = down
+            .iter()
+            .filter(|node| !self.down.contains(node))
+            .copied()
+            .collect();
+        self.down = down.into_iter().collect();
+        let waiting: Vec<NodeRequestId> = self
+            .parts
+            .iter()
+            .filter(|(_, part)| part.answer.is_none() && newly.contains(&part.node))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in waiting {
+            self.fail_over(now, id, None, false);
+        }
+    }
+
+    /// A node request's connection failed before any answer: the node is
+    /// routed around for a while, and the request goes to the next
+    /// candidate.
+    pub fn on_node_unreachable(&mut self, now: Time, id: NodeRequestId) {
+        self.now = self.now.max(now);
+        if self
+            .parts
+            .get(&id)
+            .is_some_and(|part| part.answer.is_none())
+        {
+            self.fail_over(now, id, Some(ResponseHead::status(503)), true);
+        }
     }
 
     /// True when no read is in progress.
@@ -360,7 +406,7 @@ impl Gateway {
             .map(|(&id, _)| id)
             .collect();
         for id in expired {
-            self.fail_over(now, id, None);
+            self.fail_over(now, id, None, true);
         }
     }
 
@@ -382,12 +428,12 @@ impl Gateway {
         if head.status >= 500 {
             // The node could not serve it; the next candidate may.
             self.actions.push(Action::Discard { id: from });
-            return self.fail_over(now, from, Some(head));
+            return self.fail_over(now, from, Some(head), false);
         }
         if head.status == 206 && !part.what.answered_by(&head) {
             // The node sent other bytes than those asked for.
             self.actions.push(Action::Discard { id: from });
-            return self.fail_over(now, from, Some(ResponseHead::status(502)));
+            return self.fail_over(now, from, Some(ResponseHead::status(502)), false);
         }
         part.answer = Some(head.clone());
         let id = part.read;
@@ -611,13 +657,15 @@ impl Gateway {
     /// The next of a hot placement's nodes, in turn, that is not in `tried`
     /// or suspected; otherwise the best candidate.
     fn spread(&mut self, placement: PlacementHash, tried: &[NodeId]) -> Option<NodeId> {
+        let (suspects, down) = (&self.suspects, &self.down);
         if let Some((nodes, until, next)) = self.hot.get_mut(&placement)
             && *until > self.now
         {
             let count = nodes.len();
             for step in 0..count {
                 let node = nodes[(*next + step) % count];
-                if !tried.contains(&node) && !self.suspects.contains_key(&node) {
+                let avoided = suspects.contains_key(&node) || down.contains(&node);
+                if !tried.contains(&node) && !avoided {
                     *next = (*next + step + 1) % count;
                     return Some(node);
                 }
@@ -631,7 +679,7 @@ impl Gateway {
     /// whole ring.
     fn target(&self, placement: PlacementHash, tried: &[NodeId]) -> Option<NodeId> {
         let owner = self.ring.owner(placement)?;
-        if !tried.contains(&owner) && !self.suspects.contains_key(&owner) {
+        if !tried.contains(&owner) && !self.avoided(owner) {
             return Some(owner);
         }
         let candidates: Vec<NodeId> = self
@@ -640,9 +688,7 @@ impl Gateway {
             .into_iter()
             .filter(|node| !tried.contains(node))
             .collect();
-        let healthy = candidates
-            .iter()
-            .find(|node| !self.suspects.contains_key(node));
+        let healthy = candidates.iter().find(|&&node| !self.avoided(node));
         healthy.or(candidates.first()).copied()
     }
 
@@ -680,16 +726,22 @@ impl Gateway {
         node_request
     }
 
-    /// Resends a part that timed out, or that its node failed with
-    /// `failure`, to the next rendezvous candidates. A node that timed out
-    /// is routed around for a while. When no candidate is left, the client
-    /// gets the failure, or a 503.
-    fn fail_over(&mut self, now: Time, id: NodeRequestId, failure: Option<ResponseHead>) {
+    /// Resends a part whose node failed it, with `failure` if it answered,
+    /// to the next rendezvous candidates. A `suspect` node, one that timed
+    /// out or refused a connection, is routed around for a while. When no
+    /// candidate is left, the client gets the failure, or a 503.
+    fn fail_over(
+        &mut self,
+        now: Time,
+        id: NodeRequestId,
+        failure: Option<ResponseHead>,
+        suspect: bool,
+    ) {
         // An earlier failover in the same tick may have ended this read.
         let Some(part) = self.parts.remove(&id) else {
             return;
         };
-        if failure.is_none() {
+        if suspect {
             self.suspects
                 .insert(part.node, Time(now.0 + self.config.suspect_ttl));
         }
@@ -1118,15 +1170,41 @@ mod tests {
                 .filter(|action| matches!(action, Action::FetchRing { .. }))
                 .count()
         };
-        gateway.on_ring_version(Time(10), NodeId(1), 7);
+        gateway.on_ring_version(Time(10), NodeId(1), 7, 0);
         assert_eq!(fetches(&mut gateway), 1);
-        gateway.on_ring_version(Time(20), NodeId(2), 7);
+        gateway.on_ring_version(Time(20), NodeId(2), 7, 0);
         assert_eq!(fetches(&mut gateway), 0);
         gateway.on_ring_failed(Time(30));
-        gateway.on_ring_version(Time(40), NodeId(2), 7);
+        gateway.on_ring_version(Time(40), NodeId(2), 7, 0);
         assert_eq!(fetches(&mut gateway), 1);
-        gateway.on_ring_version(Time(50), NodeId(1), 1);
+        gateway.on_ring_version(Time(50), NodeId(1), 1, 0);
         assert_eq!(fetches(&mut gateway), 0);
+    }
+
+    /// An answer whose ring matches but whose down nodes differ also
+    /// fetches the ring, and the ring's down nodes are routed around.
+    #[test]
+    fn a_change_in_down_nodes_fetches_the_ring() {
+        let mut gateway = gateway();
+        let ring = gateway.ring().clone();
+        let fetches = |gateway: &mut Gateway| {
+            gateway
+                .drain()
+                .into_iter()
+                .filter(|action| matches!(action, Action::FetchRing { .. }))
+                .count()
+        };
+        let down = vec![NodeId(2)];
+        gateway.on_ring_version(Time(10), NodeId(1), ring.version(), down_version(&down));
+        assert_eq!(fetches(&mut gateway), 1);
+        gateway.on_ring(Time(20), ring.clone(), down.clone());
+        gateway.on_ring_version(Time(30), NodeId(1), ring.version(), down_version(&down));
+        assert_eq!(fetches(&mut gateway), 0);
+        let key = ObjectKey {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        assert_eq!(gateway.pass_candidates(&key).last(), Some(&NodeId(2)));
     }
 
     /// An answer to a read sent before a write through the gateway never
@@ -1214,6 +1292,51 @@ mod tests {
         };
         assert_ne!(stand_in, home);
         assert!(direct);
+    }
+
+    /// A node whose connection fails is routed around: its read goes to the
+    /// next candidate at once, and so do later reads until the suspect
+    /// window ends.
+    #[test]
+    fn a_node_that_refuses_a_connection_is_routed_around() {
+        let mut gateway = gateway();
+        let key = ObjectKey {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        let targets = |actions: Vec<Action>| -> Vec<(NodeRequestId, NodeId)> {
+            actions
+                .into_iter()
+                .filter_map(|action| match action {
+                    Action::Send { id, node, .. } => Some((id, node)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let home = gateway.ring().owner(Placement::Home(&key).hash()).unwrap();
+        gateway.on_request(Time(0), ClientRequestId(1), Request::get(key.clone()));
+        let [(id, node)] = targets(gateway.drain())[..] else {
+            panic!("one read");
+        };
+        assert_eq!(node, home);
+        gateway.on_node_unreachable(Time(1), id);
+        let [(_, stand_in)] = targets(gateway.drain())[..] else {
+            panic!("one read goes to the next candidate");
+        };
+        assert_ne!(stand_in, home);
+        gateway.on_request(Time(2), ClientRequestId(2), Request::get(key.clone()));
+        let [(_, next)] = targets(gateway.drain())[..] else {
+            panic!("one read");
+        };
+        assert_ne!(next, home);
+        // The suspect window is 100 ms.
+        gateway.on_tick(Time(200));
+        gateway.drain();
+        gateway.on_request(Time(200), ClientRequestId(3), Request::get(key));
+        let [(_, again)] = targets(gateway.drain())[..] else {
+            panic!("one read");
+        };
+        assert_eq!(again, home);
     }
 
     /// A node answers the same request twice while the gateway forwards

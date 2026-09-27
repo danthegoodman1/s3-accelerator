@@ -737,8 +737,8 @@ async fn pass(
             },
             hop,
         )) => {
-            if let Some(version) = protocol::ring_version(&hop) {
-                GatewayEngine::ring_version(&context.gateway, node, version);
+            if let Some(versions) = protocol::versions(&hop) {
+                GatewayEngine::versions(&context.gateway, node, versions);
             }
             let closes = header(&hop, "connection").is_some_and(|value| value == "close");
             (status, headers, length, closes)

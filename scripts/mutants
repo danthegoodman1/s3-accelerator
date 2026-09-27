@@ -236,7 +236,8 @@ MUTANTS = [
     ),
     (
         "gateways ignore ring versions",
-        [(GATEWAY, "if version == self.ring.version() || fetching {", "if true {")],
+        [(GATEWAY, "if (version == self.ring.version() && down == self.down_version) || fetching {",
+                   "if true {")],
     ),
     (
         "a key list of any size is read",
@@ -668,6 +669,33 @@ MUTANTS = [
     (
         "a kernel TLS session ends without close_notify",
         [(HTTP, "crate::tls::send_close_notify(&self.stream);", "")],
+    ),
+    (
+        "a refused connection waits out the node timeout",
+        [(GATEWAY, "self.fail_over(now, id, Some(ResponseHead::status(503)), true);", "")],
+    ),
+    (
+        "a node that refused a connection stays in rotation",
+        [(GATEWAY, "self.fail_over(now, id, Some(ResponseHead::status(503)), true);",
+                   "self.fail_over(now, id, Some(ResponseHead::status(503)), false);")],
+    ),
+    (
+        "gateways ignore changes in the nodes held down",
+        [(GATEWAY, "(version == self.ring.version() && down == self.down_version)",
+                   "version == self.ring.version()")],
+    ),
+    (
+        "gateways route through nodes held down",
+        [
+            (GATEWAY, "self.suspects.contains_key(&node) || self.down.contains(&node)",
+                      "self.suspects.contains_key(&node)"),
+            (GATEWAY, "let avoided = suspects.contains_key(&node) || down.contains(&node);",
+                      "let avoided = suspects.contains_key(&node) && down.contains(&node);"),
+        ],
+    ),
+    (
+        "reads waiting on a newly down node wait out the timeout",
+        [(GATEWAY, "for id in waiting {\n            self.fail_over(now, id, None, false);\n        }", "")],
     ),
 ]
 

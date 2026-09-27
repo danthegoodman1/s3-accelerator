@@ -98,3 +98,14 @@ fn warming_keeps_its_version_while_it_stores_blocks() {
         panic!("{failure}");
     }
 }
+
+/// Seed 7596: a range read misrouted to a node that had left was refused,
+/// and the gateway blamed the live node it meant, twice, until no
+/// candidate was left and the client got a 503. Misroutes stand for a
+/// ring naming another owner, so they go only to nodes that are up.
+#[test]
+fn a_misroute_goes_only_to_a_node_that_is_up() {
+    if let Err(failure) = Simulator::from_seed(7596).run() {
+        panic!("{failure}");
+    }
+}

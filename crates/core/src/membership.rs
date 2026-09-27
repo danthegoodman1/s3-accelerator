@@ -84,6 +84,9 @@ pub enum Action {
     Schedule { timer: MembershipTimer, at: Time },
     /// The ring changed.
     Ring(Ring),
+    /// The members held down changed: those declared down within the
+    /// down grace period, or not yet heard from, in order.
+    Down(Vec<NodeId>),
 }
 
 type Swim = Foca<Peer, PostcardCodec, SplitMix, NoCustomBroadcast>;
@@ -101,6 +104,8 @@ pub struct Membership {
     /// Members declared down, or not yet heard from, and since when.
     down: BTreeMap<u64, (Peer, Time)>,
     ring: Ring,
+    /// The down members the last `Action::Down` named.
+    reported_down: Vec<NodeId>,
     /// The nodes this one joined through, and when it next announces
     /// itself again to those it does not hear from.
     seeds: Vec<NodeId>,
@@ -133,6 +138,7 @@ impl Membership {
             up: BTreeMap::new(),
             down,
             ring: Ring::new(0, Vec::new()),
+            reported_down: Vec::new(),
             seeds: Vec::new(),
             next_rejoin: now,
             actions: Vec::new(),
@@ -147,6 +153,12 @@ impl Membership {
 
     pub fn me(&self) -> &Peer {
         &self.me
+    }
+
+    /// Members declared down within the down grace period, or not yet
+    /// heard from, in order.
+    pub fn down(&self) -> Vec<NodeId> {
+        self.down.keys().map(|&id| NodeId(id)).collect()
     }
 
     /// Where each node in the ring is reached.
@@ -292,6 +304,11 @@ impl Membership {
         if ring != self.ring {
             self.ring = ring.clone();
             self.actions.push(Action::Ring(ring));
+        }
+        let down = self.down();
+        if down != self.reported_down {
+            self.reported_down = down.clone();
+            self.actions.push(Action::Down(down));
         }
     }
 
@@ -488,7 +505,7 @@ mod tests {
                     Action::Send { .. } if self.cut.contains(&id) => {}
                     Action::Send { to, packet } => self.packets.push((self.now + 5, to.0, packet)),
                     Action::Schedule { timer, at } => self.timers.push((at.0, id, timer)),
-                    Action::Ring(_) => {}
+                    Action::Ring(_) | Action::Down(_) => {}
                 }
             }
         }

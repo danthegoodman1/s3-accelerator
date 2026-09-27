@@ -785,6 +785,104 @@ fn a_node_down_past_its_grace_period_leaves_every_ring() {
     assert_eq!(sim.summary().ring_fetches, 1);
 }
 
+/// Runs until `request` is answered, and returns its status and how many
+/// ticks the answer took.
+fn answer_time(sim: &mut Simulator, request: u64) -> (u16, u64) {
+    let started = sim.now();
+    loop {
+        if let Some((head, _)) = sim.take_answer(request) {
+            return (head.status, sim.now() - started);
+        }
+        assert!(
+            sim.now() < started + 100_000,
+            "request {request} unanswered"
+        );
+        sim.step().unwrap();
+    }
+}
+
+/// A key whose home is `home`.
+fn key_homed_on(sim: &Simulator, home: usize) -> ObjectKey {
+    (0..)
+        .map(|index| key(IMMUTABLE_BUCKET, &format!("k{index}")))
+        .find(|key| sim.home(key) == home)
+        .unwrap()
+}
+
+/// A read whose home has crashed goes to the next candidate as soon as
+/// the connection is refused, well within the node timeout.
+#[test]
+fn a_crashed_home_costs_a_read_no_timeout() {
+    let mut sim = Simulator::new(1, cluster());
+    let key = key_homed_on(&sim, 1);
+    sim.put(&key, 100);
+    sim.crash(1).unwrap();
+    let request = sim.start(Request::get(key));
+    let (status, ticks) = answer_time(&mut sim, request);
+    assert_eq!(status, 200);
+    assert!(ticks < 100, "the read took {ticks} ticks");
+}
+
+/// A gateway routes around a node that refused a connection for the
+/// suspect window, so a second read within it goes straight to the next
+/// candidate.
+#[test]
+fn a_refused_node_is_skipped_for_the_suspect_window() {
+    let mut sim = Simulator::new(1, cluster());
+    let key = key_homed_on(&sim, 1);
+    sim.put(&key, 100);
+    sim.crash(1).unwrap();
+    for _ in 0..2 {
+        let (head, _) = sim.read(Request::get(key.clone())).unwrap();
+        assert_eq!(head.status, 200);
+    }
+    assert_eq!(sim.summary().refused, 1);
+}
+
+/// Once membership holds a cut-off node down, any node's answer tells the
+/// gateway, which then routes the node's reads to the next candidate
+/// without waiting for the node timeout.
+#[test]
+fn a_node_held_down_is_routed_around() {
+    let mut sim = Simulator::new(1, gossiping());
+    run(&mut sim, 300);
+    let cut = key_homed_on(&sim, 2);
+    let other = key_homed_on(&sim, 0);
+    sim.put(&cut, 100);
+    sim.put(&other, 100);
+    sim.partition(2, 100_000);
+    // Declared down within about 300 ticks, and kept in the ring for 500.
+    run(&mut sim, 400);
+    let request = sim.start(Request::get(other));
+    assert_eq!(answer_time(&mut sim, request).0, 200);
+    run(&mut sim, 20);
+    let request = sim.start(Request::get(cut));
+    let (status, ticks) = answer_time(&mut sim, request);
+    assert_eq!(status, 200);
+    assert!(ticks < 100, "the read took {ticks} ticks");
+}
+
+/// A read waiting on a node when the gateway learns membership holds it
+/// down moves to the next candidate at once.
+#[test]
+fn a_read_waiting_on_a_node_held_down_moves_on() {
+    let mut sim = Simulator::new(1, gossiping());
+    run(&mut sim, 300);
+    let cut = key_homed_on(&sim, 2);
+    let other = key_homed_on(&sim, 0);
+    sim.put(&cut, 100);
+    sim.put(&other, 100);
+    sim.partition(2, 100_000);
+    let waiting = sim.start(Request::get(cut));
+    run(&mut sim, 400);
+    let request = sim.start(Request::get(other));
+    assert_eq!(answer_time(&mut sim, request).0, 200);
+    let (status, ticks) = answer_time(&mut sim, waiting);
+    assert_eq!(status, 200);
+    // The node timeout is 1,000 ticks from when the read was sent.
+    assert!(ticks < 500, "the read took {ticks} more ticks");
+}
+
 /// A node that comes back within the grace period moves no ownership.
 #[test]
 fn a_node_back_within_its_grace_period_changes_no_ring() {

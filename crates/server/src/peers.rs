@@ -3,7 +3,7 @@
 //! requests, and answers whose bodies stay in their connections until read.
 
 use crate::http::{Connection, header};
-use crate::protocol::{self, NodeAnswer, NodeRequest};
+use crate::protocol::{self, NodeAnswer, NodeRequest, Versions};
 use crate::tls::Connector;
 use bytes::Bytes;
 use rustix::io::Errno;
@@ -57,10 +57,10 @@ impl NodeBody {
     }
 }
 
-/// A node's answer, the version of its ring, and its body.
+/// A node's answer, the versions it stamped it with, and its body.
 pub struct Exchanged {
     pub answer: NodeAnswer,
-    pub ring: Option<u64>,
+    pub versions: Option<Versions>,
     pub body: NodeBody,
 }
 
@@ -99,7 +99,7 @@ impl Peers {
         let address =
             address.ok_or_else(|| io::Error::other(format!("no address for node {}", node.0)))?;
         let address = address.as_str();
-        let (answer, ring, len, connection) = match self.take_idle(node) {
+        let (answer, versions, len, connection) = match self.take_idle(node) {
             Some(connection) => match exchange_on(connection, request, &self.secret).await {
                 Ok(exchanged) => exchanged,
                 Err(_) => exchange_on(self.connect(address).await?, request, &self.secret).await?,
@@ -111,7 +111,11 @@ impl Peers {
             connection,
             len,
         };
-        Ok(Exchanged { answer, ring, body })
+        Ok(Exchanged {
+            answer,
+            versions,
+            body,
+        })
     }
 
     /// Sends `request`'s head to `node`, and returns the connection, which
@@ -209,16 +213,16 @@ async fn exchange_on(
     mut connection: Connection,
     request: &NodeRequest,
     secret: &str,
-) -> io::Result<(NodeAnswer, Option<u64>, u64, Connection)> {
+) -> io::Result<(NodeAnswer, Option<Versions>, u64, Connection)> {
     let (method, target, headers) = protocol::encode_request(request, secret);
     connection
         .write_request(method, &target, &headers, &[])
         .await?;
     let (status, headers) = connection.read_response_head().await?;
     let answer = protocol::decode_answer(status, &headers).map_err(io::Error::other)?;
-    let ring = protocol::ring_version(&headers);
+    let versions = protocol::versions(&headers);
     let len = header(&headers, "content-length")
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(0);
-    Ok((answer, ring, len, connection))
+    Ok((answer, versions, len, connection))
 }

@@ -28,7 +28,9 @@ use s3_accelerator_core::node::{
     self, BucketPolicy, EventId, Freshness, GatewayRequestId, HotHint, Node, ObjectMeta,
     OriginRequestId, Read, Segment, StoredBlock,
 };
-use s3_accelerator_core::placement::{Member, NodeId, Placement, PlacementHash, Ring};
+use s3_accelerator_core::placement::{
+    Member, NodeId, Placement, PlacementHash, Ring, down_version,
+};
 use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
 use s3_accelerator_core::store::{Location, StoreConfig, VersionId};
 use std::collections::{BTreeMap, BTreeSet};
@@ -520,13 +522,13 @@ enum Message {
         body: Body,
         meta: Option<ObjectMeta>,
         hot: Vec<HotHint>,
-        ring: (usize, u64),
+        ring: (usize, u64, u64),
     },
     NodeMetadata {
         id: NodeRequestId,
         meta: ObjectMeta,
         hot: Vec<HotHint>,
-        ring: (usize, u64),
+        ring: (usize, u64, u64),
     },
     /// An owner leases a hot placement to a node, and the node reports the
     /// reads the lease served.
@@ -541,7 +543,7 @@ enum Message {
     },
     NodeStale {
         id: NodeRequestId,
-        ring: (usize, u64),
+        ring: (usize, u64, u64),
     },
     /// Membership's packets between nodes.
     Gossip {
@@ -552,9 +554,15 @@ enum Message {
     },
     RingResponse {
         ring: Ring,
+        down: Vec<NodeId>,
     },
     /// A ring request that found its node down, as a refused connection.
     RingFailed,
+    /// A gateway's node request that found its node down, as a refused
+    /// connection.
+    NodeRefused {
+        id: NodeRequestId,
+    },
     /// A write one node passes to another.
     WriteNotice {
         key: ObjectKey,
@@ -637,7 +645,7 @@ enum Message {
         key: ObjectKey,
         status: u16,
         applied: u64,
-        ring: (usize, u64),
+        ring: (usize, u64, u64),
     },
     ClientWriteResponse {
         change: u64,
@@ -1733,6 +1741,8 @@ impl Simulator {
                         up.on_ring(Time(self.now), ring);
                     }
                 }
+                // Answers read the down nodes from membership as they go.
+                membership::Action::Down(_) => {}
             }
         }
         self.drain_node(node)
@@ -1799,6 +1809,11 @@ impl Simulator {
             disk.damage(location, 0);
         }
         found.is_some()
+    }
+
+    /// The simulated time, in ticks.
+    pub fn now(&self) -> u64 {
+        self.now
     }
 
     /// The answer to a started request, once it has arrived.
@@ -2465,6 +2480,13 @@ impl Simulator {
             self.send(to, from, Message::RingFailed);
             return Ok(());
         }
+        if let (Address::Node(node), Message::NodeRequest { gateway, id, .. }) = (to, &message)
+            && self.nodes[node].is_none()
+        {
+            let refused = Message::NodeRefused { id: *id };
+            self.send(to, Address::Gateway(*gateway), refused);
+            return Ok(());
+        }
         if let (
             Address::Node(node),
             Message::NodeWrite {
@@ -2507,13 +2529,13 @@ impl Simulator {
                     body,
                     meta,
                     hot,
-                    ring: (node, version),
+                    ring: (node, version, down),
                 },
             ) => {
                 self.gateway_bodies.insert((gateway, id), body);
                 self.gateways[gateway].on_hot(now, hot);
                 self.gateways[gateway].on_node_response(now, id, head, meta);
-                self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version);
+                self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version, down);
                 self.drain_gateway(gateway)
             }
             (
@@ -2522,33 +2544,38 @@ impl Simulator {
                     id,
                     meta,
                     hot,
-                    ring: (node, version),
+                    ring: (node, version, down),
                 },
             ) => {
                 self.gateways[gateway].on_hot(now, hot);
                 self.gateways[gateway].on_node_metadata(now, id, meta);
-                self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version);
+                self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version, down);
                 self.drain_gateway(gateway)
             }
             (
                 Address::Gateway(gateway),
                 Message::NodeStale {
                     id,
-                    ring: (node, version),
+                    ring: (node, version, down),
                 },
             ) => {
                 self.summary.retries += 1;
                 self.gateways[gateway].on_node_stale(now, id);
-                self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version);
+                self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version, down);
                 self.drain_gateway(gateway)
             }
-            (Address::Gateway(gateway), Message::RingResponse { ring }) => {
+            (Address::Gateway(gateway), Message::RingResponse { ring, down }) => {
                 self.summary.ring_fetches += 1;
-                self.gateways[gateway].on_ring(now, ring);
+                self.gateways[gateway].on_ring(now, ring, down);
                 self.drain_gateway(gateway)
             }
-            (Address::Node(node), Message::RingResponse { ring }) => {
+            (Address::Node(node), Message::RingResponse { ring, .. }) => {
                 self.finish_joining(node, Some(ring))
+            }
+            (Address::Gateway(gateway), Message::NodeRefused { id }) => {
+                self.summary.refused += 1;
+                self.gateways[gateway].on_node_unreachable(now, id);
+                self.drain_gateway(gateway)
             }
             (Address::Gateway(gateway), Message::RingFailed) => {
                 self.gateways[gateway].on_ring_failed(now);
@@ -2713,7 +2740,7 @@ impl Simulator {
                     }
                     self.drain_node(node)?;
                 }
-                let ring = (node, self.node(node).ring().version());
+                let ring = self.stamp(node);
                 let response = Message::NodeWriteResponse {
                     change,
                     key,
@@ -2731,7 +2758,7 @@ impl Simulator {
                     key,
                     status,
                     applied,
-                    ring: (node, version),
+                    ring: (node, version, down),
                 },
             ) => {
                 if status < 300 {
@@ -2744,7 +2771,7 @@ impl Simulator {
                     }
                     self.gateways[gateway].on_write(now, &key, Some(via));
                 }
-                self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version);
+                self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version, down);
                 self.drain_gateway(gateway)?;
                 if let Some(entry) = self.changes.get(&change) {
                     let client = entry.client;
@@ -2799,7 +2826,8 @@ impl Simulator {
             }
             (Address::Node(node), Message::RingRequest { from }) => {
                 let ring = self.node(node).ring().clone();
-                let response = Message::RingResponse { ring };
+                let down = self.down_of(node);
+                let response = Message::RingResponse { ring, down };
                 self.send(Address::Node(node), from, response);
                 Ok(())
             }
@@ -2933,6 +2961,13 @@ impl Simulator {
         let version = self.gateways[gateway].ring().version();
         if self.gateway_rings[gateway].0 != version {
             self.gateway_rings[gateway] = (version, self.now);
+            if self.trace {
+                let members = members(self.gateways[gateway].ring());
+                eprintln!(
+                    "{} gateway {gateway} ring {version:016x} {members:?}",
+                    self.now
+                );
+            }
         }
         for action in self.gateways[gateway].drain() {
             match action {
@@ -3033,11 +3068,16 @@ impl Simulator {
 
     /// Where a read goes: its node, or sometimes, for a range, another one.
     fn route(&mut self, node: usize, read: &Read) -> usize {
+        // Another node that is up: a gateway's ring may name a different
+        // owner, and the gateway blames the node it meant for any failure.
+        let others: Vec<usize> = (0..self.nodes.len())
+            .filter(|&other| other != node && self.nodes[other].is_some())
+            .collect();
         let misroute = matches!(read, Read::Range(_))
-            && self.nodes.len() > 1
+            && !others.is_empty()
             && self.misroutes.percent(self.options.misroute_percent);
         match misroute {
-            true => (node + 1 + self.misroutes.index(self.nodes.len() - 1)) % self.nodes.len(),
+            true => others[self.misroutes.index(others.len())],
             false => node,
         }
     }
@@ -3405,13 +3445,28 @@ impl Simulator {
         self.drain_node(node)
     }
 
+    /// What a node's answers to gateways carry: the node, its ring's
+    /// version, and the version of the nodes its membership holds down.
+    fn stamp(&self, node: usize) -> (usize, u64, u64) {
+        let up = self.nodes[node].as_ref().expect("the node is up");
+        (node, up.ring().version(), down_version(&self.down_of(node)))
+    }
+
+    /// The nodes `node`'s membership holds down; none without membership.
+    fn down_of(&self, node: usize) -> Vec<NodeId> {
+        self.memberships[node]
+            .as_ref()
+            .map(Membership::down)
+            .unwrap_or_default()
+    }
+
     /// Sends a node's answer to whoever asked: a gateway, with the node's
     /// ring version, or a node reading from a previous owner.
     fn answer_request(&mut self, node: usize, requester: Requester, answer: NodeAnswer) {
         let from = Address::Node(node);
         match requester {
             Requester::Gateway(gateway, id) => {
-                let ring = (node, self.node(node).ring().version());
+                let ring = self.stamp(node);
                 let message = match answer {
                     NodeAnswer::Response {
                         head,
@@ -3801,6 +3856,8 @@ pub struct Summary {
     pub lost: u64,
     pub server_errors: u64,
     pub client_retries: u64,
+    /// Gateways' node requests that found their node down.
+    pub refused: u64,
     /// Nodes that crashed and that shut down cleanly; recovered blocks
     /// checked against their checksums, and those that failed.
     pub crashes: u64,

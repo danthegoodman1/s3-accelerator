@@ -14,7 +14,7 @@ use crate::http::{Connection, Framing, Response, header};
 use crate::origin::{self, Origin, OriginBody};
 use crate::passthrough;
 use crate::peers::{Exchanged, Peers};
-use crate::protocol::{self, Forward, Hint, NodeAnswer, NodeRequest};
+use crate::protocol::{self, Forward, Hint, NodeAnswer, NodeRequest, Versions};
 use crate::sqs::{self, Queue};
 use crate::tls::{self, Tls};
 use bytes::Bytes;
@@ -23,7 +23,7 @@ use s3_accelerator_core::Time;
 use s3_accelerator_core::node::{
     self, EventId, GatewayRequestId, HotHint, Node, OriginRequestId, Read, Segment,
 };
-use s3_accelerator_core::placement::{NodeId, PlacementHash, Ring};
+use s3_accelerator_core::placement::{NodeId, PlacementHash, Ring, down_version};
 use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
 use s3_accelerator_core::store::{Location, VersionId};
 use std::cell::RefCell;
@@ -122,6 +122,8 @@ pub struct NodeEngine {
     unsynced_metadata: bool,
     /// Where each node in the ring is reached, for answering ring requests.
     addresses: BTreeMap<NodeId, String>,
+    /// The nodes membership holds down, which answers tell gateways of.
+    down: Vec<NodeId>,
     events: Events,
     /// Bytes of uploads the node may still keep for warming.
     warm_budget: u64,
@@ -183,6 +185,7 @@ impl NodeEngine {
     ) -> SharedNode {
         let engine = Rc::new(RefCell::new(NodeEngine {
             addresses,
+            down: Vec::new(),
             started: Instant::now(),
             origin,
             peers,
@@ -246,6 +249,21 @@ impl NodeEngine {
             this.pump()
         };
         start(engine, work);
+    }
+
+    /// Membership now holds `down` down.
+    pub fn on_down(engine: &SharedNode, down: Vec<NodeId>) {
+        engine.borrow_mut().down = down;
+    }
+
+    /// What the node stamps its answers with: its ring's version, and the
+    /// version of the nodes membership holds down.
+    pub fn versions(engine: &SharedNode) -> Versions {
+        let this = engine.borrow();
+        Versions {
+            ring: this.node.ring().version(),
+            down: down_version(&this.down),
+        }
     }
 
     /// The node is joining a cluster whose ring was `before`.
@@ -1288,6 +1306,7 @@ async fn serve_connection(
                 answer: NodeAnswer::Ring {
                     ring: NodeEngine::ring(engine),
                     addresses: engine.borrow().addresses.clone(),
+                    down: engine.borrow().down.clone(),
                 },
                 body: Vec::new(),
                 len: 0,
@@ -1305,8 +1324,8 @@ async fn serve_connection(
                 reply
             }
         };
-        let version = NodeEngine::ring(engine).version();
-        let (status, headers) = protocol::encode_answer(&reply.answer, version);
+        let versions = NodeEngine::versions(engine);
+        let (status, headers) = protocol::encode_answer(&reply.answer, versions);
         let framing = Framing::Length(reply.len);
         let sent = async {
             connection
@@ -1403,8 +1422,8 @@ async fn forward_to_s3(
         (false, Some(length)) => Framing::Length(length),
         (false, None) => Framing::Chunked,
     };
-    let version = NodeEngine::ring(engine).version();
-    let (status, headers) = protocol::encode_answer(&answer, version);
+    let versions = NodeEngine::versions(engine);
+    let (status, headers) = protocol::encode_answer(&answer, versions);
     let keep_alive = keep_alive && sent.body_read;
     connection
         .write_response_head(status, &headers, framing, keep_alive)

@@ -53,6 +53,17 @@ impl Placement<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PlacementHash(pub u64);
 
+/// A version of the nodes membership holds down: 0 when none are, and a
+/// hash of their IDs otherwise. Nodes send it with every answer, so a
+/// gateway learns of a change from any node it asks.
+pub fn down_version(down: &[NodeId]) -> u64 {
+    if down.is_empty() {
+        return 0;
+    }
+    let bytes: Vec<u8> = down.iter().flat_map(|node| node.0.to_le_bytes()).collect();
+    xxh3_64(&bytes)
+}
+
 /// An immutable, versioned snapshot of the storage nodes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ring {

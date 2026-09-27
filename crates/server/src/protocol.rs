@@ -38,6 +38,8 @@ const META_SIZE: &str = "x-accel-meta-size";
 const META_AGE: &str = "x-accel-meta-age";
 const META_HEADER: &str = "x-accel-meta-header";
 const RING: &str = "x-accel-ring";
+const DOWN: &str = "x-accel-down";
+const RING_DOWN: &str = "x-accel-ring-down";
 const PASSED_ON: &str = "x-accel-passed-on";
 const RING_MEMBERS: &str = "x-accel-ring-members";
 const PAYLOAD: &str = "x-accel-payload";
@@ -126,10 +128,12 @@ pub enum NodeAnswer {
     Stale,
     /// The node took a write or event notice.
     Written,
-    /// The node's ring, and where each of its nodes is reached.
+    /// The node's ring, where each of its nodes is reached, and the nodes
+    /// its membership holds down.
     Ring {
         ring: Ring,
         addresses: BTreeMap<NodeId, String>,
+        down: Vec<NodeId>,
     },
     /// S3's answer to a forwarded request. Its body follows, `length` bytes
     /// long, or chunked when S3 sent no length; a HEAD's `length` is what a
@@ -362,8 +366,13 @@ pub fn decode_request(
 
 /// An answer's status and headers, which name the version of the node's
 /// ring. A `Respond` answer's body follows it.
-pub fn encode_answer(answer: &NodeAnswer, ring: u64) -> (u16, Vec<(String, String)>) {
-    let mut headers = vec![(RING.to_string(), format!("{ring:016x}"))];
+/// A node's answer, stamped with its `versions`: its ring's and that of
+/// the nodes its membership holds down.
+pub fn encode_answer(answer: &NodeAnswer, versions: Versions) -> (u16, Vec<(String, String)>) {
+    let mut headers = vec![
+        (RING.to_string(), format!("{:016x}", versions.ring)),
+        (DOWN.to_string(), format!("{:016x}", versions.down)),
+    ];
     let status = match answer {
         NodeAnswer::Respond { head, meta, hot } => {
             encode_hints(hot, &mut headers);
@@ -409,8 +418,14 @@ pub fn encode_answer(answer: &NodeAnswer, ring: u64) -> (u16, Vec<(String, Strin
             }
             *status
         }
-        NodeAnswer::Ring { ring, addresses } => {
+        NodeAnswer::Ring {
+            ring,
+            addresses,
+            down,
+        } => {
             headers.push((ANSWER.to_string(), "ring".into()));
+            let down: Vec<String> = down.iter().map(|node| node.0.to_string()).collect();
+            headers.push((RING_DOWN.to_string(), down.join(",")));
             let members: Vec<String> = ring
                 .members()
                 .iter()
@@ -439,9 +454,22 @@ fn unprefixed(headers: &[(String, String)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The version of the ring of the node that answered.
-pub fn ring_version(headers: &[(String, String)]) -> Option<u64> {
-    u64::from_str_radix(header(headers, RING)?, 16).ok()
+/// The versions an answering node stamps its answers with: of its ring,
+/// and of the nodes its membership holds down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Versions {
+    pub ring: u64,
+    pub down: u64,
+}
+
+/// The versions of the node that answered. A node that names no down
+/// nodes holds none down.
+pub fn versions(headers: &[(String, String)]) -> Option<Versions> {
+    let hex = |name| u64::from_str_radix(header(headers, name)?, 16).ok();
+    Some(Versions {
+        ring: hex(RING)?,
+        down: hex(DOWN).unwrap_or(0),
+    })
 }
 
 pub fn decode_answer(status: u16, headers: &[(String, String)]) -> Result<NodeAnswer, String> {
@@ -490,7 +518,7 @@ pub fn decode_answer(status: u16, headers: &[(String, String)]) -> Result<NodeAn
             })
         }
         "ring" => {
-            let version = ring_version(headers).ok_or_else(|| format!("no {RING}"))?;
+            let version = versions(headers).ok_or_else(|| format!("no {RING}"))?.ring;
             let mut addresses = BTreeMap::new();
             let members = field(RING_MEMBERS)?
                 .split(',')
@@ -511,7 +539,17 @@ pub fn decode_answer(status: u16, headers: &[(String, String)]) -> Result<NodeAn
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             let ring = Ring::new(version, members);
-            Ok(NodeAnswer::Ring { ring, addresses })
+            let down = field(RING_DOWN)?
+                .split(',')
+                .filter(|node| !node.is_empty())
+                .map(|node| node.parse().map(NodeId))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| format!("{RING_DOWN} is no list of nodes"))?;
+            Ok(NodeAnswer::Ring {
+                ring,
+                addresses,
+                down,
+            })
         }
         other => Err(format!("{ANSWER} {other}")),
     }
@@ -765,7 +803,11 @@ mod tests {
             NodeAnswer::Metadata(meta, Vec::new()),
             NodeAnswer::Stale,
             NodeAnswer::Written,
-            NodeAnswer::Ring { ring, addresses },
+            NodeAnswer::Ring {
+                ring,
+                addresses,
+                down: vec![NodeId(2), NodeId(5)],
+            },
             NodeAnswer::Forwarded {
                 status: 404,
                 headers: vec![("content-type".into(), "application/xml".into())],
@@ -778,12 +820,13 @@ mod tests {
             },
         ] {
             // A node's answer names its ring, which a ring answer carries.
-            let version = match &answer {
+            let ring = match &answer {
                 NodeAnswer::Ring { ring, .. } => ring.version(),
                 _ => 0xabc,
             };
-            let (status, headers) = encode_answer(&answer, version);
-            assert_eq!(ring_version(&headers), Some(version));
+            let stamp = Versions { ring, down: 0xdef };
+            let (status, headers) = encode_answer(&answer, stamp);
+            assert_eq!(versions(&headers), Some(stamp));
             assert_eq!(decode_answer(status, &headers), Ok(answer));
         }
     }

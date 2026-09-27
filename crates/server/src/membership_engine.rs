@@ -56,7 +56,9 @@ pub async fn run(
     for &seed in seeds.iter().filter(|&&seed| seed != me) {
         let exchanged = tokio::time::timeout(RING_WAIT, peers.exchange(seed, &NodeRequest::Ring));
         if let Ok(Ok(Exchanged {
-            answer: NodeAnswer::Ring { ring, addresses },
+            answer: NodeAnswer::Ring {
+                ring, addresses, ..
+            },
             body,
             ..
         })) = exchanged.await
@@ -209,6 +211,10 @@ fn apply(engine: &SharedMembership) {
                 let members: Vec<u64> = ring.members().iter().map(|member| member.id.0).collect();
                 eprintln!("ring {:016x}: nodes {members:?}", ring.version());
                 NodeEngine::on_ring(&node, ring, addresses);
+            }
+            membership::Action::Down(down) => {
+                let node = engine.borrow().node.clone();
+                NodeEngine::on_down(&node, down);
             }
         }
     }

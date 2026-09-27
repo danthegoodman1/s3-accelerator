@@ -6,7 +6,7 @@
 //! fetches a ring whose version differs from its own.
 
 use crate::peers::{Exchanged, NodeBody, Peers};
-use crate::protocol::{Hint, NodeAnswer, NodeRequest};
+use crate::protocol::{Hint, NodeAnswer, NodeRequest, Versions};
 use s3_accelerator_core::Time;
 use s3_accelerator_core::gateway::{self, ClientRequestId, Gateway, NodeRequestId};
 use s3_accelerator_core::node::{HotHint, Read};
@@ -182,12 +182,13 @@ impl GatewayEngine {
         engine.borrow().peers.clone()
     }
 
-    /// `node` answered under a ring of `version`.
-    pub fn ring_version(engine: &SharedGateway, node: NodeId, version: u64) {
+    /// `node` answered stamped with `versions`.
+    pub fn versions(engine: &SharedGateway, node: NodeId, versions: Versions) {
         let work = {
             let mut this = engine.borrow_mut();
             let now = this.now();
-            this.gateway.on_ring_version(now, node, version);
+            this.gateway
+                .on_ring_version(now, node, versions.ring, versions.down);
             this.pump()
         };
         start(engine, work);
@@ -302,7 +303,10 @@ fn start(engine: &SharedGateway, work: Work) {
             let work = {
                 let mut this = engine.borrow_mut();
                 let now = this.now();
-                let version = exchanged.as_ref().ok().and_then(|exchanged| exchanged.ring);
+                let versions = exchanged
+                    .as_ref()
+                    .ok()
+                    .and_then(|exchanged| exchanged.versions);
                 match exchanged {
                     Ok(Exchanged {
                         answer: NodeAnswer::Respond { head, meta, hot },
@@ -330,16 +334,19 @@ fn start(engine: &SharedGateway, work: Work) {
                         this.peers.idle(body);
                         this.gateway.on_node_stale(now, id);
                     }
-                    Ok(_) | Err(_) => {
-                        if let Err(error) = &exchanged {
-                            eprintln!("reading from node {}: {error}", node.0);
-                        }
+                    // The node was reached, but answered out of protocol.
+                    Ok(_) => {
                         this.gateway
                             .on_node_response(now, id, ResponseHead::status(503), None);
                     }
+                    Err(error) => {
+                        eprintln!("reading from node {}: {error}", node.0);
+                        this.gateway.on_node_unreachable(now, id);
+                    }
                 }
-                if let Some(version) = version {
-                    this.gateway.on_ring_version(now, node, version);
+                if let Some(versions) = versions {
+                    this.gateway
+                        .on_ring_version(now, node, versions.ring, versions.down);
                 }
                 this.pump()
             };
@@ -359,7 +366,12 @@ fn start(engine: &SharedGateway, work: Work) {
                     tokio::time::timeout(RING_WAIT, peers.exchange(node, &NodeRequest::Ring));
                 match exchanged.await {
                     Ok(Ok(Exchanged {
-                        answer: NodeAnswer::Ring { ring, addresses },
+                        answer:
+                            NodeAnswer::Ring {
+                                ring,
+                                addresses,
+                                down,
+                            },
                         body,
                         ..
                     })) => {
@@ -367,7 +379,7 @@ fn start(engine: &SharedGateway, work: Work) {
                         peers.learn(&addresses);
                         let mut this = engine.borrow_mut();
                         let now = this.now();
-                        this.gateway.on_ring(now, ring);
+                        this.gateway.on_ring(now, ring, down);
                         return;
                     }
                     Ok(Ok(_)) => {
