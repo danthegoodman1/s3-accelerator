@@ -158,8 +158,8 @@ MUTANTS = [
     ),
     (
         "blocks from a previous owner wait for the doorkeeper",
-        [(NODE, "if let Some(location) = self.admit(key, size, block, peer.is_some()) {",
-          "if let Some(location) = self.admit(key, size, block, false) {")],
+        [(NODE, "if let Some(location) = self.admit(key, size, block, peer.is_some() || prefetch) {",
+          "if let Some(location) = self.admit(key, size, block, prefetch) {")],
     ),
     (
         "nodes never announce again to silent seeds",
@@ -459,7 +459,8 @@ MUTANTS = [
     ),
     (
         "a fill spans more than a chunk",
-        [(NODE, ".take(chunk_blocks)", "")],
+        [(NODE, "&& !self.in_flight.contains_key(&block)\n                                && layout.placement(key, size, index).hash() == placement\n                        })\n                        .take(chunk_blocks)",
+          "&& !self.in_flight.contains_key(&block)\n                                && layout.placement(key, size, index).hash() == placement\n                        })")],
     ),
     (
         "a reader waiting on a first fetch's write is never told",
@@ -564,6 +565,22 @@ MUTANTS = [
     (
         "the home keeps no upload",
         [(NODE_ENGINE, "let region = this.node.warm_region(key, len);", "let region: Vec<Range<u64>> = Vec::new();")],
+    ),
+    (
+        "a home never prefetches metadata",
+        [(NODE, "self.prefetch(&key, &etag, size, version, span);\n        }\n        self.unref(version);", "let _ = span;\n        }\n        self.unref(version);")],
+    ),
+    (
+        "a spot's blocks wait for the doorkeeper",
+        [(NODE, "&& !at_spot", "&& !(at_spot && false)")],
+    ),
+    (
+        "a first fetch of a spot stores none of it",
+        [(NODE, "self.prefetch(&key, &meta.etag, meta.size, version, spot);", "let _ = spot;")],
+    ),
+    (
+        "spot reads come back empty",
+        [(NODE_ENGINE, "Ok(Ok(bytes)) => bytes,\n                    _ => Vec::new(),", "_ => Vec::new(),")],
     ),
 ]
 

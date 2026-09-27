@@ -24,7 +24,7 @@ use s3_accelerator_core::node::{
 };
 use s3_accelerator_core::placement::{NodeId, PlacementHash, Ring};
 use s3_accelerator_core::s3::{ByteRange, ETag, Method, ObjectKey, Request, ResponseHead};
-use s3_accelerator_core::store::Location;
+use s3_accelerator_core::store::{Location, VersionId};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
@@ -142,6 +142,9 @@ struct Events {
     messages: BTreeMap<u64, (String, usize, Instant)>,
 }
 
+/// Slot bytes to read, each a location, an offset into it and a length.
+type SpotParts = Vec<(Location, u64, u64)>;
+
 /// What the node's actions left to start off this thread.
 #[derive(Default)]
 struct Work {
@@ -158,6 +161,8 @@ struct Work {
     writes: Vec<(Location, Bytes)>,
     /// Slots to verify: location, length and checksum.
     verifies: Vec<(Location, u64, u64)>,
+    /// Spots to read: a version and the slot bytes that hold its spot.
+    spots: Vec<(VersionId, SpotParts)>,
 }
 
 impl NodeEngine {
@@ -528,6 +533,7 @@ impl NodeEngine {
                 len,
                 checksum,
             } => self.work.verifies.push((location, len, checksum)),
+            node::Action::ReadSpot { version, parts } => self.work.spots.push((version, parts)),
             node::Action::Release { origin } => {
                 if let Some(Body::Kept { reserved, .. }) = self.bodies.remove(&origin) {
                     self.warm_budget += reserved;
@@ -759,6 +765,32 @@ fn start(engine: &SharedNode, work: Work) {
     }
     for (location, bytes) in work.writes {
         write(engine, location, bytes);
+    }
+    for (version, parts) in work.spots {
+        let engine = engine.clone();
+        let disk = engine.borrow().disk.clone();
+        tokio::task::spawn_local(async move {
+            let read = tokio::task::spawn_blocking(move || {
+                let mut bytes = Vec::new();
+                for (location, offset, len) in parts {
+                    bytes.extend(disk.read(location, offset, len)?);
+                }
+                Ok::<_, io::Error>(bytes)
+            })
+            .await;
+            let work = {
+                let mut this = engine.borrow_mut();
+                // A spot that cannot be read names no metadata.
+                let bytes = match read {
+                    Ok(Ok(bytes)) => bytes,
+                    _ => Vec::new(),
+                };
+                let now = this.now();
+                this.node.on_spot(now, version, bytes);
+                this.pump()
+            };
+            start(&engine, work);
+        });
     }
     for (location, len, checksum) in work.verifies {
         let engine = engine.clone();

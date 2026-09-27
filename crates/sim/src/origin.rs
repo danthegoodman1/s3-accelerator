@@ -1,9 +1,13 @@
 //! A model of S3 that remembers every state of every key and when it began.
 //!
 //! An object's bytes are a function of its version's seed and the offset, so
-//! the model stores no data and the checker can rebuild any response.
+//! the model stores no data and the checker can rebuild any response. An
+//! object whose name says it is Parquet, ORC or safetensors starts and ends
+//! with that format's framing, which states the span of its metadata.
 
 use crate::prng::{Prng, splitmix64};
+use s3_accelerator_core::formats::Format;
+use s3_accelerator_core::formats::fixtures::frame;
 use s3_accelerator_core::s3::{
     ByteRange, ContentRange, ETag, Method, ObjectKey, Request, ResponseHead,
 };
@@ -19,11 +23,21 @@ pub struct Object {
     pub size: u64,
     pub headers: Vec<(String, String)>,
     seed: u64,
+    /// The format's framing at the object's start and end, if any.
+    head: Vec<u8>,
+    tail: Vec<u8>,
 }
 
 impl Object {
     pub fn bytes(&self, span: Range<u64>) -> Vec<u8> {
+        let tail_start = self.size - self.tail.len() as u64;
         span.map(|offset| {
+            if offset < self.head.len() as u64 {
+                return self.head[offset as usize];
+            }
+            if offset >= tail_start {
+                return self.tail[(offset - tail_start) as usize];
+            }
             let mut state = self.seed ^ (offset / 8).wrapping_mul(0x9e37_79b9_7f4a_7c15);
             (splitmix64(&mut state) >> (offset % 8 * 8)) as u8
         })
@@ -62,12 +76,18 @@ impl Origin {
                 self.versions.len().to_string(),
             ),
         ];
+        // Metadata of up to a third of the object, by the seed.
+        let (head, tail) = Format::of(key)
+            .and_then(|format| frame(format, size, 1 + seed % (size / 3).max(1)))
+            .unwrap_or_default();
         let object = Object {
             key: key.clone(),
             etag: etag.clone(),
             size,
             headers,
             seed,
+            head,
+            tail,
         };
         self.versions.insert(etag.clone(), object);
         self.ids.insert(VersionId::of(key, &etag), etag.clone());

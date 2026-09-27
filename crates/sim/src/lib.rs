@@ -156,6 +156,9 @@ pub struct Options {
     /// Whether each bucket's home stores the uploads that pass through it.
     pub immutable_warm_on_write: bool,
     pub ttl_warm_on_write: bool,
+    /// Keys are named for formats that state their metadata's span, in
+    /// turn: none, Parquet, ORC and safetensors.
+    pub formats: bool,
     /// One-way network delay, in ticks.
     pub delay_min: u64,
     pub delay_max: u64,
@@ -255,6 +258,7 @@ impl Options {
             hot_percent: 0,
             immutable_warm_on_write: false,
             ttl_warm_on_write: false,
+            formats: false,
         };
         // Timeouts outlast every exchange of a fault-free run, so only
         // faults make them fire: S3 answers within two hops, and a node
@@ -321,6 +325,7 @@ impl Options {
         };
         options.immutable_warm_on_write = prng.percent(50);
         options.ttl_warm_on_write = prng.percent(50);
+        options.formats = prng.percent(50);
         options
     }
 
@@ -391,6 +396,7 @@ impl Options {
             hot_percent: 0,
             immutable_warm_on_write: false,
             ttl_warm_on_write: false,
+            formats: false,
         }
     }
 
@@ -671,6 +677,13 @@ enum Event {
         request: ClientRequestId,
         from: NodeRequestId,
         bytes: Vec<u8>,
+    },
+    /// A node read the bytes at a version's spot.
+    SpotRead {
+        node: usize,
+        run: u64,
+        version: VersionId,
+        parts: Vec<(Location, u64, u64)>,
     },
     /// A node read a recovered block back to check its checksum.
     Verified {
@@ -968,9 +981,15 @@ impl Simulator {
             _ => Ring::new(1, members),
         };
         let keys: Vec<ObjectKey> = (0..options.keys)
-            .map(|index| ObjectKey {
-                bucket: [IMMUTABLE_BUCKET, TTL_BUCKET][index % 2].to_string(),
-                key: format!("key-{index}"),
+            .map(|index| {
+                let suffix = match options.formats {
+                    true => ["", ".parquet", ".orc", ".safetensors"][index % 4],
+                    false => "",
+                };
+                ObjectKey {
+                    bucket: [IMMUTABLE_BUCKET, TTL_BUCKET][index % 2].to_string(),
+                    key: format!("key-{index}{suffix}"),
+                }
             })
             .collect();
         let mut origin = Origin::default();
@@ -1716,6 +1735,7 @@ impl Simulator {
             summary.leases += stats.leases_granted;
             summary.leased_reads += stats.leased_reads;
             summary.warmed_uploads += stats.warmed_uploads;
+            summary.prefetched_blocks += stats.prefetched_blocks;
             summary.node_reads.push(stats.reads);
         }
         summary
@@ -2275,6 +2295,7 @@ impl Simulator {
             Event::Written { node, run, .. }
             | Event::Sent { node, run, .. }
             | Event::Verified { node, run, .. }
+            | Event::SpotRead { node, run, .. }
             | Event::MembershipTimer { node, run, .. }
             | Event::JoinTimeout { node, run }
                 if run != self.runs[node] =>
@@ -2296,6 +2317,23 @@ impl Simulator {
                 bytes,
             } => self.forwarded(gateway, request, from, bytes),
             Event::Sent { node, id, .. } => self.sent(node, id),
+            Event::SpotRead {
+                node,
+                version,
+                parts,
+                ..
+            } => {
+                let bytes = parts
+                    .iter()
+                    .flat_map(|&(location, offset, len)| {
+                        self.disks[node].read(location, offset, len)
+                    })
+                    .copied()
+                    .collect();
+                let now = Time(self.now);
+                self.node(node).on_spot(now, version, bytes);
+                self.drain_node(node)
+            }
             Event::Verified {
                 node,
                 location,
@@ -3138,6 +3176,16 @@ impl Simulator {
                     };
                     self.queue.push(self.now + delay, verified);
                 }
+                node::Action::ReadSpot { version, parts } => {
+                    let delay = self.disk_delays.range(0..=self.options.disk_delay_max);
+                    let read = Event::SpotRead {
+                        node,
+                        run,
+                        version,
+                        parts,
+                    };
+                    self.queue.push(self.now + delay, read);
+                }
                 node::Action::Cancel { origin } => {
                     if self.trace {
                         eprintln!("{} node {node} cancelled {origin:?}", self.now);
@@ -3601,8 +3649,10 @@ pub struct Summary {
     /// Leases owners granted, and reads replicas served under them.
     pub leases: u64,
     pub leased_reads: u64,
-    /// Uploads whose blocks their home stored as they passed through.
+    /// Uploads whose blocks their home stored as they passed through, and
+    /// metadata blocks homes filled before a reader asked.
     pub warmed_uploads: u64,
+    pub prefetched_blocks: u64,
     /// Requests a node sent back because their object changed.
     pub retries: u64,
     pub origin_requests: u64,
@@ -3660,7 +3710,8 @@ impl fmt::Display for Summary {
         write!(
             f,
             "seed {} passed: {} ticks, {} writes ({} through gateways, {} around homes), {} events, \
-             {} leases serving {} reads, {} uploads warmed, {} retries, responses {}, \
+             {} leases serving {} reads, {} uploads warmed, {} blocks prefetched, {} retries, \
+             responses {}, \
              {}% of body bytes from disk, {} S3 requests, {} bytes written, \
              {} blocks evicted, node reads {:?}, {} messages lost, {} server errors, \
              {} client retries, {} crashes, {} clean shutdowns, {} blocks verified, \
@@ -3675,6 +3726,7 @@ impl fmt::Display for Summary {
             self.leases,
             self.leased_reads,
             self.warmed_uploads,
+            self.prefetched_blocks,
             self.retries,
             statuses.join(" "),
             self.hit_percent(),

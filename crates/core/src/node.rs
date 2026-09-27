@@ -13,6 +13,7 @@
 
 use crate::Time;
 use crate::doorkeeper::Doorkeeper;
+use crate::formats::Format;
 use crate::layout::Layout;
 use crate::placement::{NodeId, Placement, PlacementHash, Ring};
 use crate::s3::{
@@ -284,6 +285,13 @@ pub enum Action {
         placement: PlacementHash,
         reads: u64,
     },
+    /// Read the bytes of the slots `parts` name, each a location, an offset
+    /// into it and a length, and pass them, in order, to `on_spot`; or
+    /// pass nothing if the read fails.
+    ReadSpot {
+        version: VersionId,
+        parts: Vec<(Location, u64, u64)>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -313,6 +321,8 @@ pub struct Stats {
     pub leases_granted: u64,
     /// Uploads whose blocks the home stored as they passed through.
     pub warmed_uploads: u64,
+    /// Blocks of metadata the home filled before a reader asked.
+    pub prefetched_blocks: u64,
 }
 
 impl std::ops::AddAssign for Stats {
@@ -332,6 +342,7 @@ impl std::ops::AddAssign for Stats {
         self.leased_reads += other.leased_reads;
         self.leases_granted += other.leases_granted;
         self.warmed_uploads += other.warmed_uploads;
+        self.prefetched_blocks += other.prefetched_blocks;
     }
 }
 
@@ -368,6 +379,10 @@ pub struct Node {
     leases: BTreeMap<PlacementHash, Lease>,
     /// Hints for reads in progress, which their answers carry.
     hints: BTreeMap<GatewayRequestId, Vec<HotHint>>,
+    /// Versions whose spot the node read, and the blocks it pins while the
+    /// read is in progress.
+    inspected: BTreeSet<VersionId>,
+    spots: BTreeMap<VersionId, Vec<BlockKey>>,
     config: Config,
     objects: BTreeMap<ObjectKey, Object>,
     /// Known objects by when they were last used, oldest first.
@@ -573,6 +588,8 @@ impl Node {
             hot: BTreeMap::new(),
             leases: BTreeMap::new(),
             hints: BTreeMap::new(),
+            inspected: BTreeSet::new(),
+            spots: BTreeMap::new(),
             store: Store::new(config.store),
             doorkeeper: Doorkeeper::new(config.doorkeeper_window),
             config,
@@ -1491,6 +1508,125 @@ impl Node {
         for waiter in self.awaiting_writes.remove(&location).unwrap_or_default() {
             self.arrived(waiter, Await::Written(location));
         }
+        self.inspect(block.version);
+    }
+
+    /// Once the blocks at a stored object's spot are all ready, a home
+    /// reads the spot to learn where the object's metadata lies, once per
+    /// version, pinning the blocks while the read lasts.
+    fn inspect(&mut self, version: VersionId) {
+        if self.inspected.contains(&version) {
+            return;
+        }
+        let Some((key, etag)) = self
+            .versions
+            .get(&version)
+            .and_then(|version| version.name.clone())
+        else {
+            return;
+        };
+        let Some(format) = Format::of(&key) else {
+            return;
+        };
+        let size = match self.objects.get(&key) {
+            Some(Object::Known { meta, .. }) if meta.etag == etag => meta.size,
+            _ => return,
+        };
+        let Some(spot) = format.spot(size) else {
+            return;
+        };
+        let layout = self.config.layout;
+        let mut parts = Vec::new();
+        let mut blocks = Vec::new();
+        for index in layout.blocks_covering(spot.start, spot.end - 1) {
+            let block = BlockKey { version, index };
+            let Some(entry) = self.store.get(&block) else {
+                return;
+            };
+            if entry.state != BlockState::Ready || entry.verify.is_some() {
+                return;
+            }
+            let span = layout.block_span(size, index);
+            let (from, to) = (span.start.max(spot.start), span.end.min(spot.end));
+            parts.push((entry.location, from - span.start, to - from));
+            blocks.push(block);
+        }
+        for &block in &blocks {
+            self.store.pin(block);
+        }
+        self.refer(version);
+        self.inspected.insert(version);
+        self.spots.insert(version, blocks);
+        self.actions.push(Action::ReadSpot { version, parts });
+    }
+
+    /// The bytes at a version's spot, or none if reading them failed. If
+    /// they name the span of the object's metadata, and the home still
+    /// keeps that version's metadata, it fills every block of the span it
+    /// places and lacks, before the reader asks.
+    pub fn on_spot(&mut self, now: Time, version: VersionId, bytes: Vec<u8>) {
+        self.now = self.now.max(now);
+        let Some(blocks) = self.spots.remove(&version) else {
+            return;
+        };
+        for block in blocks {
+            self.store.unpin(block);
+        }
+        let prefetch = self.versions.get(&version).and_then(|entry| {
+            let (key, etag) = entry.name.clone()?;
+            let size = match self.objects.get(&key) {
+                Some(Object::Known { meta, .. }) if meta.etag == etag => meta.size,
+                _ => return None,
+            };
+            let span = Format::of(&key)?.metadata(size, &bytes)?;
+            Some((key, etag, size, span))
+        });
+        if let Some((key, etag, size, span)) = prefetch {
+            self.prefetch(&key, &etag, size, version, span);
+        }
+        self.unref(version);
+    }
+
+    /// Fills the blocks of `span` this node places and lacks, a run per
+    /// placement, skipping the doorkeeper.
+    fn prefetch(
+        &mut self,
+        key: &ObjectKey,
+        etag: &ETag,
+        size: u64,
+        version: VersionId,
+        span: std::ops::Range<u64>,
+    ) {
+        let layout = self.config.layout;
+        let chunk_blocks = usize::try_from(layout.chunk_size() / layout.block_size()).unwrap_or(1);
+        let missing: Vec<u64> = layout
+            .blocks_covering(span.start, span.end - 1)
+            .filter(|&index| {
+                let block = BlockKey { version, index };
+                let placement = layout.placement(key, size, index).hash();
+                self.store.get(&block).is_none()
+                    && !self.in_flight.contains_key(&block)
+                    && self.ring.owner(placement) == Some(self.id)
+            })
+            .collect();
+        let mut next = 0;
+        while next < missing.len() {
+            let placement = layout.placement(key, size, missing[next]).hash();
+            let run = missing[next..]
+                .iter()
+                .enumerate()
+                .take_while(|&(offset, &index)| {
+                    index == missing[next] + offset as u64
+                        && layout.placement(key, size, index).hash() == placement
+                })
+                .take(chunk_blocks)
+                .count();
+            let first = missing[next];
+            let last = missing[next + run - 1];
+            self.stats.prefetched_blocks += last - first + 1;
+            self.fill(key, etag, size, version, first..=last, true);
+            next += run;
+        }
     }
 
     /// S3's response body ended before the bytes for the slot at
@@ -1907,6 +2043,17 @@ impl Node {
             self.store_first_fetch(origin, &key, &meta, first, last);
             let version = VersionId::of(&key, &meta.etag);
             self.arriving = Some((origin, version, first, last));
+            // A read of a format's spot that stored none of its blocks
+            // fills them, so the home can read the spot.
+            if let Some(spot) = Format::of(&key).and_then(|format| format.spot(meta.size))
+                && first < spot.end
+                && spot.start <= last
+            {
+                let version = self.version(&key, &meta.etag);
+                self.refer(version);
+                self.prefetch(&key, &meta.etag, meta.size, version, spot);
+                self.unref(version);
+            }
         }
         self.resume(now, waiters, sent, &head, has_meta);
         self.arriving = None;
@@ -2137,7 +2284,7 @@ impl Node {
                         .take(chunk_blocks)
                         .count();
                     let run = blocks[next]..=blocks[next + run_end - 1];
-                    self.fill(key, etag, size, version, run)
+                    self.fill(key, etag, size, version, run, false)
                 }
             };
             let body_start = self.origins[&origin].body_start;
@@ -2191,6 +2338,7 @@ impl Node {
         size: u64,
         version: VersionId,
         run: std::ops::RangeInclusive<u64>,
+        prefetch: bool,
     ) -> OriginRequestId {
         let layout = self.config.layout;
         let first = layout.block_span(size, *run.start()).start;
@@ -2233,7 +2381,7 @@ impl Node {
         for index in run {
             let block = BlockKey { version, index };
             self.track_in_flight(block, origin);
-            if let Some(location) = self.admit(key, size, block, peer.is_some()) {
+            if let Some(location) = self.admit(key, size, block, peer.is_some() || prefetch) {
                 stored.push((block, location));
             }
         }
@@ -2629,7 +2777,15 @@ impl Node {
             return None;
         }
         let hash = block_hash(block.version, layout.block_size(), block.index);
+        // A block at a format's spot is metadata every reader asks for.
+        let at_spot = Format::of(key)
+            .and_then(|format| format.spot(size))
+            .is_some_and(|spot| {
+                let span = layout.block_span(size, block.index);
+                span.start < spot.end && spot.start < span.end
+            });
         if !skip_doorkeeper
+            && !at_spot
             && !self.policy(&key.bucket).admit_on_first_read
             && !self.doorkeeper.contains(hash)
         {
@@ -2704,6 +2860,7 @@ impl Node {
             .is_some_and(|version| version.refs == 0)
         {
             self.versions.remove(&id);
+            self.inspected.remove(&id);
         }
     }
 

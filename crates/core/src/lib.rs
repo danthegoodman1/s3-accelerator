@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod doorkeeper;
+pub mod formats;
 pub mod gateway;
 pub mod layout;
 pub mod membership;

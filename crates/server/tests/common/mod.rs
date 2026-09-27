@@ -7,6 +7,8 @@ use s3_accelerator::config::Config;
 use s3_accelerator::http::{Connection, Framing, Response};
 use s3_accelerator::server::{self, Listeners};
 use s3_accelerator::sigv4::{self, Credentials, Signer, UNSIGNED_PAYLOAD};
+use s3_accelerator_core::formats::Format;
+use s3_accelerator_core::formats::fixtures::frame;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::io;
@@ -83,12 +85,21 @@ impl Default for Origin {
 }
 
 impl Origin {
-    /// The object it serves at `path`, before any write to it.
+    /// The object it serves at `path`, before any write to it. A Parquet
+    /// file's footer is its last third.
     pub fn object(&self, path: &str) -> Vec<u8> {
-        match self.distinct.get() {
+        let mut object = match self.distinct.get() {
             true => object_of(self.size.get(), path),
             false => object_of(self.size.get(), ""),
+        };
+        if path.ends_with(".parquet") {
+            let size = object.len() as u64;
+            let (head, tail) = frame(Format::Parquet, size, size / 3).expect("room for a footer");
+            object[..head.len()].copy_from_slice(&head);
+            let end = object.len() - tail.len();
+            object[end..].copy_from_slice(&tail);
         }
+        object
     }
 
     /// The ETag and bytes it serves at `path` now.
@@ -210,6 +221,10 @@ fn read(
     let size = object.len();
     let range = header("range").and_then(|value| {
         let (first, last) = value.strip_prefix("bytes=")?.split_once('-')?;
+        if first.is_empty() {
+            let length: usize = last.parse().ok()?;
+            return Some((size - length.min(size), size - 1));
+        }
         let first: usize = first.parse().ok()?;
         let last = last
             .parse()

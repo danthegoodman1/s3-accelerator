@@ -438,3 +438,43 @@ async fn an_upload_warms_its_home() {
         })
         .await;
 }
+
+/// A reader asks for a Parquet file's last 8 bytes, which state its
+/// footer's length. The home fills the block they lie in, reads the
+/// length, and fills the footer's other block: the reader's next read, of
+/// the footer, comes from disk.
+#[tokio::test(flavor = "current_thread")]
+async fn a_parquet_footer_is_prefetched() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            let cluster = Cluster::new(&data_dir(), origin_port, CLUSTER_CACHE);
+            let _node = cluster.start_node().await;
+            let _gateway = cluster.start_gateway().await;
+            let port = cluster.gateway_port;
+            let path = "/bucket/table.parquet";
+            let object = origin.object(path);
+            let size = object.len();
+            let (status, trailer) =
+                send(port, "GET", path, "", &[("range", "bytes=-8")], Vec::new()).await;
+            assert_eq!((status, &trailer[4..]), (206, &b"PAR1"[..]));
+            let footer = u32::from_le_bytes(trailer[..4].try_into().unwrap()) as usize;
+            // The read, the block holding the trailer, and the footer's
+            // other block.
+            let prefetched = async {
+                while origin.requests.get() < 3 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            tokio::time::timeout(Duration::from_secs(5), prefetched)
+                .await
+                .expect("the home prefetches the footer");
+            let (first, last) = (size - 8 - footer, size - 9);
+            let range = format!("bytes={first}-{last}");
+            let read = send(port, "GET", path, "", &[("range", &range)], Vec::new()).await;
+            assert!(read == (206, object[first..=last].to_vec()), "{}", read.0);
+            assert_eq!(origin.requests.get(), 3);
+        })
+        .await;
+}
