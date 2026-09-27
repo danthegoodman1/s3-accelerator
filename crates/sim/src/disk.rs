@@ -64,7 +64,7 @@ impl Disk {
     /// Makes durable the first `count` entries appended since the last
     /// sync.
     pub fn keep_appended(&mut self, count: usize) {
-        let kept: Vec<_> = self.unsynced.drain(..).collect();
+        let kept = std::mem::take(&mut self.unsynced);
         let (durable, lost) = kept.split_at(count.min(kept.len()));
         self.metadata.extend(
             durable

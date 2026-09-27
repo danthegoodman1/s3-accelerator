@@ -1,0 +1,4 @@
+# CI and local builds use this toolchain, so clippy's lints match.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
