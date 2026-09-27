@@ -2122,6 +2122,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "s3-accelerator-bench"
+version = "0.1.0"
+dependencies = [
+ "httparse",
+ "rcgen",
+ "rustix",
+ "rustls 0.23.45",
+ "rustls-pki-types",
+ "s3-accelerator",
+ "tokio",
+ "tokio-rustls 0.26.5",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "s3-accelerator-conformance"
 version = "0.1.0"
 dependencies = [

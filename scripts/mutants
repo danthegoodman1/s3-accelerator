@@ -27,6 +27,7 @@ from pathlib import Path
 
 NODE = "crates/core/src/node.rs"
 STORE = "crates/core/src/store.rs"
+CONFIG = "crates/server/src/config.rs"
 GATEWAY = "crates/core/src/gateway.rs"
 MEMBERSHIP = "crates/core/src/membership.rs"
 SERVER = "crates/server/src/server.rs"
@@ -262,8 +263,8 @@ MUTANTS = [
     ),
     (
         "a slot is overwritten while its pages are in flight",
-        [(DISK, "if self.pages.in_use(&self.slabs, slot, offset..offset + len)? {",
-          "if false && self.pages.in_use(&self.slabs, slot, offset..offset + len)? {")],
+        [(DISK, "if self.pages.in_use(&self.slabs, slot, range.clone())?",
+          "if false && self.pages.in_use(&self.slabs, slot, range.clone())?")],
     ),
     (
         "an arriving body's blocks are never written",
@@ -293,7 +294,7 @@ MUTANTS = [
     ),
     (
         "a record is written before its block's sync",
-        [(DISK, "self.slabs.write_all_at(bytes, offset)?;\n        self.slabs.sync_data()?;",
+        [(DISK, "self.slabs.write_all_at(bytes, offset)?;\n        self.slab_sync.sync(|| self.slabs.sync_data())?;",
           "self.slabs.write_all_at(bytes, offset)?;")],
     ),
     (
@@ -607,12 +608,50 @@ MUTANTS = [
         [(NODE, ".filter(|&node| self.in_rings(node))", ".filter(|&node| node.0 < u64::MAX)")],
     ),
     (
+        "a write shares a sync that began before it ended",
+        [(DISK, "let covers = state.asked;", "let covers = state.asked + 1_000_000;")],
+    ),
+    (
+        "a write that a failed sync covered counts as durable",
+        [(DISK, "Err(_) => state.failed = state.failed.max(covers),", "Err(_) => state.durable = state.durable.max(covers),")],
+    ),
+    (
+        "relays under kernel TLS run on the event loop",
+        [(ZERO_COPY, "if !kernel_tls {", "if true {")],
+    ),
+    (
+        "a relay under kernel TLS copies through userspace",
+        [(ZERO_COPY, "let failure = match splice(from, None, &pipe.write, None, want, flags) {",
+          "let failure = match (|| -> rustix::io::Result<usize> { let mut buf = vec![0u8; want]; "
+          "let read = rustix::io::read(from, &mut buf[..])?; rustix::io::write(&pipe.write, &buf[..read]) })() {")],
+    ),
+    (
+        "a class's room comes from the extent with the fewest blocks",
+        [(STORE, "victims.take().is_some_and(|extent| self.evacuate(extent))",
+          "victims.take().is_some_and(|_| { let fewest = (0..self.config.extents)"
+          ".filter(|&e| self.extents[e as usize].class.is_some() && self.extents[e as usize].busy == 0)"
+          ".min_by_key(|&e| (self.extents[e as usize].held, e)); fewest.is_some_and(|e| self.evacuate(e)) })")],
+    ),
+    (
+        "a reservation never empties an extent",
+        [(STORE, "if !victims.take().is_some_and(|extent| self.evacuate(extent)) {", "if true {")],
+    ),
+    (
+        "extents hold 64 blocks by default",
+        [(CONFIG, "extent_size: 1 << 20,", "extent_size: 64 << 20,")],
+    ),
+    (
+        "a write drops only its own slot's pages",
+        [(DISK, "&& self.pages.in_use(&self.slabs, span, range)?", "&& true")],
+    ),
+    (
         "TLS sessions stay in userspace",
-        [(TLS, "let kernel = wanted && kernel_takes_sessions().await;", "let kernel = false;")],
+        [(TLS, "if !wanted {\n        return None;", "if true {\n        return None;")],
     ),
     (
         "sessions among members stay in userspace",
-        [(SERVER, "let kernel = kernel && tls.kernel;\n            let members", "let kernel = false;\n            let members")],
+        [(SERVER, "let kernel = kernel.as_ref().filter(|_| tls.kernel);\n            let members",
+                  "let kernel = None;\n            let members")],
     ),
     (
         "a node takes members without the cluster's certificates",

@@ -41,6 +41,11 @@ impl NodeBody {
         self.connection.stream()
     }
 
+    /// Whether the kernel holds the connection's TLS session.
+    pub fn kernel_tls(&self) -> bool {
+        self.connection.kernel_tls()
+    }
+
     /// Body bytes still unread.
     pub fn unread(&self) -> u64 {
         self.len

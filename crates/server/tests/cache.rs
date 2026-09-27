@@ -2,7 +2,9 @@
 
 mod common;
 
-use common::{object, send, start};
+use common::{Server, data_dir, object, send, start, start_origin};
+use s3_accelerator::disk::decode_record;
+use std::time::Duration;
 use tokio::task::LocalSet;
 
 #[tokio::test(flavor = "current_thread")]
@@ -49,6 +51,62 @@ async fn delete_objects_drops_cached_metadata() {
             assert_eq!(status, 200);
             assert!(origin.deleted.get());
             assert_eq!(get().await.0, 404);
+        })
+        .await;
+}
+
+/// A cache full of 1 MiB blocks makes room for 4 KiB ones, whose slots lie
+/// where a larger block's pages were cached, in one folio larger than the
+/// new slot on kernels that cache writes in large folios. Each small block
+/// must still reach the disk: its record appears in the slot table.
+#[tokio::test(flavor = "current_thread")]
+async fn small_blocks_take_space_that_held_larger_ones() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            origin.distinct.set(true);
+            let block = 1 << 20;
+            let cache = format!(
+                "block_size = {block}\nextent_size = {block}\nextents = 4\nmin_slot = 4096"
+            );
+            let dir = data_dir();
+            let server =
+                Server::start_with(origin_port, &dir, r#"{ bucket = "bucket" }"#, "", &cache).await;
+            let get = |path: String| async move {
+                let answer = send(server.port, "GET", &path, "", &[], Vec::new());
+                tokio::time::timeout(Duration::from_secs(10), answer)
+                    .await
+                    .unwrap_or_else(|_| panic!("{path} took over ten seconds"))
+            };
+            // Four blocks fill the cache: the doorkeeper admits them on the
+            // second read, and the third reads their cached pages.
+            origin.size.set(4 * block);
+            for _ in 0..3 {
+                assert_eq!(get("/bucket/large".into()).await.0, 200);
+            }
+            // Small objects, each admitted on its second read, then hit.
+            origin.size.set(4096);
+            let keys: Vec<String> = (0..8)
+                .map(|index| format!("/bucket/small-{index}"))
+                .collect();
+            for _ in 0..2 {
+                for key in &keys {
+                    assert_eq!(get(key.clone()).await, (200, origin.object(key)));
+                }
+            }
+            let recorded = || {
+                let table = std::fs::read(dir.join("slots")).unwrap();
+                table[4096..]
+                    .chunks(64)
+                    .filter_map(decode_record)
+                    .filter(|(record, _, _)| record.len == 4096)
+                    .count()
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while recorded() < keys.len() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(recorded(), keys.len(), "small blocks recorded");
         })
         .await;
 }

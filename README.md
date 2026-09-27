@@ -56,6 +56,15 @@ CONFORMANCE_ENDPOINT=https://127.0.0.1:9000 SSL_CERT_FILE=$PWD/target/cluster/tl
   cargo test -p s3-accelerator-conformance -- --ignored
 ```
 
+### Benchmarks
+
+`crates/bench` runs a node and a gateway, each its own process, on this machine's disk, in front of an in-process stand-in for S3 that answers after a fixed delay and never limits them. It prints a Markdown report of hit and fill throughput, time to first byte, scan and reread workloads against a cache smaller than the data, a shift in object sizes, and plaintext against kernel and userspace TLS. Every figure comes from outside the server: the clients' clocks, the bytes the stand-in sent, and the kernel's counters of each process's CPU time and writes and of the drive's reads. `BENCHMARKS.md` records a run and what it decided.
+
+```console
+cargo build --release -p s3-accelerator -p s3-accelerator-bench
+target/release/s3-accelerator-bench [--scale X] [--clients N] [--only hits|scan|shift|transports] [--extent-mib N]
+```
+
 ### Simulator
 
 The seed determines the whole run: the cluster's size, block and slot sizes, disk capacity, admission policy, the workload, and every network, disk and send delay. Writers create, overwrite and delete objects in the model of S3 while clients read. Every response must equal what S3 would have returned for a state its key held between the request's issue, less the bucket's staleness bound, and its answer. Every stored block must hold the bytes of the version it is keyed by.

@@ -137,7 +137,8 @@ enum Queue {
     Main,
 }
 
-/// Evictions a reservation tries before it empties a whole extent.
+/// Evictions a reservation tries before it empties the extent of the last
+/// block evicted.
 const EVICTIONS_PER_RESERVE: u32 = 8;
 const SMALL_QUEUE_PERCENT: u64 = 10;
 const MAX_FREQ: u8 = 3;
@@ -163,7 +164,10 @@ pub struct Store {
 struct Extent {
     class: Option<usize>,
     free: Vec<u64>,
-    blocks: BTreeMap<u64, BlockKey>,
+    /// The block in each slot, by slot number.
+    slots: Vec<Option<BlockKey>>,
+    /// Slots that hold a block.
+    held: u32,
     /// Blocks that are filling or pinned, which keep the extent in use.
     busy: u32,
 }
@@ -195,7 +199,8 @@ impl Store {
                 .map(|_| Extent {
                     class: None,
                     free: Vec::new(),
-                    blocks: BTreeMap::new(),
+                    slots: Vec::new(),
+                    held: 0,
                     busy: 0,
                 })
                 .collect(),
@@ -235,7 +240,11 @@ impl Store {
 
     pub fn block_at(&self, location: Location) -> Option<BlockKey> {
         let extent = self.extents.get(location.extent as usize)?;
-        extent.blocks.get(&location.offset).copied()
+        let size = self.classes[extent.class?].size;
+        if !location.offset.is_multiple_of(size) {
+            return None;
+        }
+        *extent.slots.get((location.offset / size) as usize)?
     }
 
     /// Reserves a slot for a block about to fill, evicting blocks as needed.
@@ -255,6 +264,9 @@ impl Store {
         assert!(!self.blocks.contains_key(&key), "{key:?} reserved twice");
         let class = self.class_of(len);
         let mut evictions = 0;
+        // The extent of the last block evicted, which eviction chose as the
+        // coldest, emptied if evictions free no room.
+        let mut victims = None;
         let location = loop {
             if let Some(location) = self.take_free(class) {
                 break location;
@@ -263,16 +275,13 @@ impl Store {
                 self.assign(extent, class);
             } else if evictions < EVICTIONS_PER_RESERVE {
                 evictions += 1;
-                if !self.evict_one() {
-                    return None;
-                }
-            } else if !self.evacuate() {
+                victims = Some(self.evict_one()?);
+            } else if !victims.take().is_some_and(|extent| self.evacuate(extent)) {
                 return None;
             }
         };
-        let extent = &mut self.extents[location.extent as usize];
-        extent.blocks.insert(location.offset, key);
-        extent.busy += 1;
+        self.hold(location, key);
+        self.extents[location.extent as usize].busy += 1;
         self.blocks.insert(
             key,
             Entry {
@@ -333,7 +342,7 @@ impl Store {
         if state.free.is_empty() {
             self.classes[class].with_space.remove(&location.extent);
         }
-        state.blocks.insert(location.offset, key);
+        self.hold(location, key);
         let seq = self.next_seq;
         self.next_seq += 1;
         self.small.push_back((key, seq));
@@ -453,16 +462,28 @@ impl Store {
         let state = &mut self.extents[extent as usize];
         state.class = Some(class);
         state.free = (0..slots).rev().map(|slot| slot * size).collect();
+        state.slots = vec![None; slots as usize];
         self.classes[class].with_space.insert(extent);
+    }
+
+    /// Puts `key` in the slot at `location`, which its extent's class sizes.
+    fn hold(&mut self, location: Location, key: BlockKey) {
+        let state = &mut self.extents[location.extent as usize];
+        let size = self.classes[state.class.expect("a used extent has a class")].size;
+        state.slots[(location.offset / size) as usize] = Some(key);
+        state.held += 1;
     }
 
     fn free_slot(&mut self, location: Location) {
         let state = &mut self.extents[location.extent as usize];
         let class = state.class.expect("a used extent has a class");
-        state.blocks.remove(&location.offset);
-        if state.blocks.is_empty() {
+        let size = self.classes[class].size;
+        state.slots[(location.offset / size) as usize] = None;
+        state.held -= 1;
+        if state.held == 0 {
             state.class = None;
             state.free.clear();
+            state.slots = Vec::new();
             self.classes[class].with_space.remove(&location.extent);
             self.free_extents.push(location.extent);
         } else {
@@ -497,8 +518,9 @@ impl Store {
     }
 
     /// Evicts one block: a disowned one if any is unpinned, and otherwise
-    /// by S3-FIFO. Returns false when every queued block is pinned.
-    fn evict_one(&mut self) -> bool {
+    /// by S3-FIFO. Returns the extent it left, or `None` when every queued
+    /// block is pinned.
+    fn evict_one(&mut self) -> Option<u32> {
         for _ in 0..self.disowned.len() {
             let Some((key, seq)) = self.disowned.pop_front() else {
                 break;
@@ -507,19 +529,16 @@ impl Store {
             match self.blocks.get(&key) {
                 Some(entry) if entry.seq != seq || entry.queue == Queue::None => {}
                 Some(entry) if entry.pins > 0 => self.disowned.push_back((key, seq)),
-                Some(_) => {
-                    self.evict(key);
-                    return true;
-                }
+                Some(_) => return Some(self.evict(key).extent),
                 None => {}
             }
         }
         self.evict_by_frequency()
     }
 
-    /// Evicts one block by S3-FIFO. Returns false when every queued block
-    /// is pinned.
-    fn evict_by_frequency(&mut self) -> bool {
+    /// Evicts one block by S3-FIFO. Returns the extent it left, or `None`
+    /// when every queued block is pinned.
+    fn evict_by_frequency(&mut self) -> Option<u32> {
         let small_target =
             self.config.extent_size * u64::from(self.config.extents) * SMALL_QUEUE_PERCENT / 100;
         // Pinned blocks each queue has rotated past since the last block
@@ -530,7 +549,7 @@ impl Store {
             let small_stuck = pinned_small >= self.small.len();
             let main_stuck = pinned_main >= self.main.len();
             let from_small = match (small_stuck, main_stuck) {
-                (true, true) => return false,
+                (true, true) => return None,
                 (true, false) => false,
                 (false, true) => true,
                 (false, false) => self.small_bytes > small_target,
@@ -540,9 +559,7 @@ impl Store {
             } else {
                 (Queue::Main, self.main.pop_front())
             };
-            let Some((key, seq)) = popped else {
-                return false;
-            };
+            let (key, seq) = popped?;
             let Some(entry) = self.blocks.get_mut(&key) else {
                 continue;
             };
@@ -579,8 +596,7 @@ impl Store {
                 self.main.push_back((key, seq));
                 continue;
             }
-            self.evict(key);
-            return true;
+            return Some(self.evict(key).extent);
         }
     }
 
@@ -598,25 +614,22 @@ impl Store {
         }
     }
 
-    fn evict(&mut self, key: BlockKey) {
+    fn evict(&mut self, key: BlockKey) -> Location {
         let entry = self.detach(key);
         self.free_slot(entry.location);
         self.evicted.push((key, entry.location));
+        entry.location
     }
 
-    /// Empties the extent with the fewest blocks, among those whose blocks
-    /// are all readable and unpinned, so its space can change class.
-    fn evacuate(&mut self) -> bool {
-        let candidate = self
-            .extents
-            .iter()
-            .enumerate()
-            .filter(|(_, extent)| extent.class.is_some() && extent.busy == 0)
-            .min_by_key(|(index, extent)| (extent.blocks.len(), *index))
-            .map(|(index, extent)| (index, extent.blocks.values().copied().collect::<Vec<_>>()));
-        let Some((_, keys)) = candidate else {
+    /// Empties `extent` so its space can change class, unless it is free
+    /// already or holds a block filling or pinned. Its blocks lie at most
+    /// one extent from what eviction chose, since eviction left it.
+    fn evacuate(&mut self, extent: u32) -> bool {
+        let state = &self.extents[extent as usize];
+        if state.class.is_none() || state.busy > 0 {
             return false;
-        };
+        }
+        let keys: Vec<BlockKey> = state.slots.iter().flatten().copied().collect();
         for key in keys {
             self.evict(key);
         }
@@ -832,6 +845,31 @@ mod tests {
         assert_eq!(evicted(&mut store).len(), 4);
     }
 
+    /// Room for a class comes from the extent eviction's victims left,
+    /// which holds the coldest blocks, rather than the extent with the
+    /// fewest.
+    #[test]
+    fn emptying_an_extent_follows_eviction() {
+        let mut store = store();
+        // Extent 0 holds sixteen 4-byte blocks, and extent 1 four 16-byte
+        // blocks read again.
+        for index in 0..16 {
+            fill(&mut store, index, 4);
+        }
+        for index in 16..20 {
+            fill(&mut store, index, 16);
+            store.hit(key(index));
+        }
+        // Eight evictions take small blocks and free no 16-byte slot, so
+        // the reservation empties the rest of their extent.
+        let location = fill(&mut store, 100, 16).unwrap();
+        assert_eq!(location.extent, 0);
+        let mut gone = evicted(&mut store);
+        gone.sort();
+        assert_eq!(gone, (0..16).map(key).collect::<Vec<_>>());
+        assert!((16..20).all(|index| store.get(&key(index)).is_some()));
+    }
+
     #[test]
     fn restored_blocks_take_their_recorded_slots() {
         let mut store = store();
@@ -860,5 +898,80 @@ mod tests {
         store.remove(key(0));
         assert_eq!(store.free_extents.len(), 2);
         assert!(store.blocks().next().is_none());
+    }
+
+    /// Hot and cold blocks share extents, admitted in turn as concurrent
+    /// fills write them, until the cache is full. Small blocks then need
+    /// slots of smaller classes. With extents of one largest slot, each
+    /// takes the room eviction's coldest victim left, and the hot set,
+    /// read throughout, keeps every block.
+    #[test]
+    fn a_shift_to_smaller_blocks_keeps_the_hot_set() {
+        const LARGEST: u64 = 1024;
+        const EXTENTS: u64 = 4096;
+        let mut store = Store::new(StoreConfig {
+            extent_size: LARGEST,
+            extents: EXTENTS as u32,
+            min_slot: 4,
+            max_slot: LARGEST,
+        });
+        let block = |object: u64, index: u64| BlockKey {
+            version: VersionId {
+                key: object,
+                version: 1,
+            },
+            index,
+        };
+        let admit = |store: &mut Store, key: BlockKey, len: u64| {
+            store.reserve(key, len, key.version.key << 8 | key.index, PlacementHash(0))?;
+            store.filled(key);
+            store.drain_evicted();
+            Some(())
+        };
+        // 96 objects of 64 largest blocks, in groups of 32 whose blocks
+        // arrive in turn; every third object is hot and read again.
+        let mut hot = Vec::new();
+        for group in 0..3 {
+            let objects: Vec<u64> = (group * 32..group * 32 + 32).collect();
+            for index in 0..64 {
+                for &object in &objects {
+                    admit(&mut store, block(object, index), LARGEST).unwrap();
+                }
+            }
+            for object in objects.into_iter().filter(|object| object % 3 == 2) {
+                for index in 0..64 {
+                    store.hit(block(object, index));
+                    hot.push(block(object, index));
+                }
+            }
+        }
+        assert!(hot.iter().all(|key| store.get(key).is_some()));
+        // Small blocks from 4 to 512 bytes filling 30% of the cache, with
+        // the hot set read twice among them; a hot block missing is
+        // fetched and admitted again.
+        let mut small = Vec::new();
+        let (mut held, mut next) = (0, 0x9e37_79b9_u64);
+        while held < EXTENTS * LARGEST * 3 / 10 {
+            next = next.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let len = (4f64 * 2f64.powf((next >> 11) as f64 / (1u64 << 53) as f64 * 7.0)) as u64;
+            small.push((block(1_000_000 + small.len() as u64, 0), len));
+            held += len;
+        }
+        let reads: Vec<BlockKey> = hot.iter().chain(&hot).copied().collect();
+        let (mut taken, mut misses) = (0, 0);
+        for (position, &(key, len)) in small.iter().enumerate() {
+            admit(&mut store, key, len).unwrap();
+            let due = (position + 1) * reads.len() / small.len();
+            for &read in &reads[taken..due] {
+                if store.get(&read).is_some() {
+                    store.hit(read);
+                } else {
+                    misses += 1;
+                    admit(&mut store, read, LARGEST).unwrap();
+                }
+            }
+            taken = due;
+        }
+        assert_eq!(misses, 0);
     }
 }

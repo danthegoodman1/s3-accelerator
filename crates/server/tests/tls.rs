@@ -279,6 +279,11 @@ async fn hits_reach_kernel_tls_sessions_through_sendfile_and_splice() {
             "{} bytes were written to {name} sockets",
             link.written
         );
+        assert_eq!(
+            link.on_event_loop, 0,
+            "the event loop moved {} hit bytes into {name} sockets, encrypting them",
+            link.on_event_loop
+        );
     }
     let sockets = (kernel.clients.sockets + kernel.peers.sockets) as u64;
     assert!(
@@ -332,6 +337,8 @@ struct Link {
     /// the kernel: the gateway's `splice` to clients, and the node's
     /// `sendfile` to the gateway.
     zero_copy: i64,
+    /// Those bytes the process's event loop moved, on its main thread.
+    on_event_loop: i64,
     /// Bytes written to the same ends from userspace during the hits.
     written: i64,
 }
@@ -361,6 +368,7 @@ async fn evidence(kernel: bool) -> Evidence {
             let gateway = Process::traced(&cluster.gateway, &gateway_trace, &calls);
             let port = cluster.gateway_port;
             common::listening(port).await;
+            let (node_loop, gateway_loop) = (node.server_pid(), gateway.server_pid());
 
             let client = client(&trusted);
             let keys = ["a", "b", "c"];
@@ -420,32 +428,30 @@ async fn evidence(kernel: bool) -> Evidence {
                     .collect()
             };
             let (gateway_hits, node_hits) = (during_hits(&gateway_calls), during_hits(&node_calls));
-            let spliced = gateway_hits
-                .iter()
-                .filter(|call| call.name == "splice" && on(call.fds().get(1), &gateway_end))
-                .map(|call| call.result.max(0))
-                .sum();
-            let sent = node_hits
-                .iter()
-                .filter(|call| call.name == "sendfile" && on(call.fds().first(), &node_end))
-                .map(|call| call.result.max(0))
-                .sum();
-            let written = |process: &str, calls: &[Call], end: &str| -> i64 {
-                let to_end: Vec<Call> = calls
+            // Bytes moved into a link's ends by `name` calls, whose
+            // destination is argument `at`, on any thread or on `thread`.
+            let moved = |calls: &[Call], name: &str, at: usize, end: &str, thread: Option<u32>| {
+                calls
                     .iter()
-                    .filter(|call| on(call.fds().first(), end))
-                    .cloned()
-                    .collect();
-                if kernel {
-                    check_writes_carry_no_body(process, &to_end, &windows, total)
-                } else {
-                    to_end
-                        .iter()
-                        .filter(|call| WRITES.split(',').any(|name| name == call.name))
-                        .map(|call| call.result.max(0))
-                        .sum()
-                }
+                    .filter(|call| call.name == name && on(call.fds().get(at), end))
+                    .filter(|call| thread.is_none_or(|thread| call.thread == thread))
+                    .map(|call| call.result.max(0))
+                    .sum::<i64>()
             };
+            let written = |calls: &[Call], end: &str| -> i64 {
+                calls
+                    .iter()
+                    .filter(|call| WRITES.split(',').any(|name| name == call.name))
+                    .filter(|call| on(call.fds().first(), end))
+                    .map(|call| call.result.max(0))
+                    .sum()
+            };
+            if kernel {
+                // No write carries body bytes anywhere: to a socket or to a
+                // pipe.
+                check_writes_carry_no_body("gateway", &gateway_hits, &windows, total);
+                check_writes_carry_no_body("node", &node_hits, &windows, total);
+            }
             let rose = |names: [&str; 2]| -> u64 {
                 names.iter().map(|name| after[*name] - before[*name]).sum()
             };
@@ -454,16 +460,24 @@ async fn evidence(kernel: bool) -> Evidence {
                     sockets: client_sockets.0,
                     ulp_sockets: client_sockets.1,
                     ulp_calls: ulp_calls(&gateway_calls, &gateway_end),
-                    zero_copy: spliced,
-                    written: written("gateway", &gateway_hits, &gateway_end),
+                    zero_copy: moved(&gateway_hits, "splice", 1, &gateway_end, None),
+                    on_event_loop: moved(
+                        &gateway_hits,
+                        "splice",
+                        1,
+                        &gateway_end,
+                        Some(gateway_loop),
+                    ),
+                    written: written(&gateway_hits, &gateway_end),
                 },
                 peers: Link {
                     sockets: peer_sockets.0,
                     ulp_sockets: peer_sockets.1,
                     ulp_calls: ulp_calls(&node_calls, &node_end)
                         + ulp_calls(&gateway_calls, &peer_end),
-                    zero_copy: sent,
-                    written: written("node", &node_hits, &node_end),
+                    zero_copy: moved(&node_hits, "sendfile", 0, &node_end, None),
+                    on_event_loop: moved(&node_hits, "sendfile", 0, &node_end, Some(node_loop)),
+                    written: written(&node_hits, &node_end),
                 },
                 tx_sessions: rose(["TlsTxSw", "TlsTxDevice"]),
                 rx_sessions: rose(["TlsRxSw", "TlsRxDevice"]),

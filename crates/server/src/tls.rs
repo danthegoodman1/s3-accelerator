@@ -8,8 +8,9 @@
 
 use crate::config::{ClusterTlsConfig, TlsConfig};
 use crate::http::Connection;
-use ktls::CorkStream;
+use ktls::{CompatibleCiphers, CorkStream};
 use rustls::client::Resumption;
+use rustls::crypto::CryptoProvider;
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pki_types::pem::PemObject;
@@ -17,6 +18,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -44,22 +46,45 @@ pub struct Session {
     pub kernel: bool,
 }
 
-/// Whether sessions move into the kernel: the config asks for it, and the
-/// kernel takes them.
-pub async fn kernel(wanted: bool) -> bool {
-    let kernel = wanted && kernel_takes_sessions().await;
-    if wanted && !kernel {
+/// How long a client has to finish its handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The ciphers the kernel takes, when the config asks for kernel sessions
+/// and the kernel takes a TLS 1.3 cipher rustls offers.
+pub async fn kernel(wanted: bool) -> Option<CompatibleCiphers> {
+    if !wanted {
+        return None;
+    }
+    let ciphers = CompatibleCiphers::new().await.ok().filter(|ciphers| {
+        let tls13 = &ciphers.tls13;
+        tls13.aes_gcm_128 || tls13.aes_gcm_256 || tls13.chacha20_poly1305
+    });
+    if ciphers.is_none() {
         eprintln!(
             "the kernel cannot take TLS sessions (is the tls module loaded?); using userspace TLS"
         );
     }
-    kernel
+    ciphers
+}
+
+/// rustls's ciphers, less those the kernel cannot take when sessions move
+/// into it, so no handshake agrees on a cipher the kernel refuses.
+fn provider(kernel: Option<&CompatibleCiphers>) -> Arc<CryptoProvider> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    if let Some(ciphers) = kernel {
+        provider
+            .cipher_suites
+            .retain(|&suite| ciphers.is_compatible(suite));
+    }
+    Arc::new(provider)
 }
 
 impl Tls {
     /// Serves S3 clients with the certificate `config` names.
-    pub fn clients(config: &TlsConfig, kernel: bool) -> io::Result<Tls> {
-        let server = ServerConfig::builder()
+    pub fn clients(config: &TlsConfig, kernel: Option<&CompatibleCiphers>) -> io::Result<Tls> {
+        let server = ServerConfig::builder_with_provider(provider(kernel))
+            .with_safe_default_protocol_versions()
+            .map_err(io::Error::other)?
             .with_no_client_auth()
             .with_single_cert(chain(&config.cert)?, key(&config.key)?)
             .map_err(io::Error::other)?;
@@ -68,18 +93,25 @@ impl Tls {
 
     /// Serves cluster members, each with a certificate the cluster's CA
     /// signed.
-    pub fn members(config: &ClusterTlsConfig, kernel: bool) -> io::Result<Tls> {
-        let verifier = WebPkiClientVerifier::builder(Arc::new(roots(&config.ca)?))
+    pub fn members(
+        config: &ClusterTlsConfig,
+        kernel: Option<&CompatibleCiphers>,
+    ) -> io::Result<Tls> {
+        let provider = provider(kernel);
+        let roots = Arc::new(roots(&config.ca)?);
+        let verifier = WebPkiClientVerifier::builder_with_provider(roots, provider.clone())
             .build()
             .map_err(io::Error::other)?;
-        let server = ServerConfig::builder()
+        let server = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(io::Error::other)?
             .with_client_cert_verifier(verifier)
             .with_single_cert(chain(&config.cert)?, key(&config.key)?)
             .map_err(io::Error::other)?;
         Ok(Tls::new(server, kernel))
     }
 
-    fn new(mut server: ServerConfig, kernel: bool) -> Tls {
+    fn new(mut server: ServerConfig, kernel: Option<&CompatibleCiphers>) -> Tls {
         // The kernel takes the session's secrets once the handshake ends,
         // and with no tickets to send, rustls has nothing left to write.
         server.enable_secret_extraction = true;
@@ -87,7 +119,7 @@ impl Tls {
         server.alpn_protocols = vec![b"http/1.1".to_vec()];
         Tls {
             acceptor: TlsAcceptor::from(Arc::new(server)),
-            kernel,
+            kernel: kernel.is_some(),
         }
     }
 
@@ -112,8 +144,13 @@ impl Tls {
 impl Connector {
     /// Reaches nodes whose certificates the cluster's CA signed, with this
     /// process's own certificate.
-    pub fn new(config: &ClusterTlsConfig, kernel: bool) -> io::Result<Connector> {
-        let mut client = ClientConfig::builder()
+    pub fn new(
+        config: &ClusterTlsConfig,
+        kernel: Option<&CompatibleCiphers>,
+    ) -> io::Result<Connector> {
+        let mut client = ClientConfig::builder_with_provider(provider(kernel))
+            .with_safe_default_protocol_versions()
+            .map_err(io::Error::other)?
             .with_root_certificates(roots(&config.ca)?)
             .with_client_auth_cert(chain(&config.cert)?, key(&config.key)?)
             .map_err(io::Error::other)?;
@@ -122,7 +159,7 @@ impl Connector {
         client.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Connector {
             connector: TlsConnector::from(Arc::new(client)),
-            kernel,
+            kernel: kernel.is_some(),
         })
     }
 
@@ -160,13 +197,17 @@ pub async fn accept(tls: Option<&Tls>, stream: TcpStream) -> Option<Connection> 
     let Some(tls) = tls else {
         return Some(Connection::new(stream));
     };
-    match tls.accept(stream).await {
-        Ok(session) => Some(Connection::tls(session)),
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, tls.accept(stream)).await {
+        Ok(Ok(session)) => Some(Connection::tls(session)),
         // A client that closes before its handshake, such as a TCP health
         // check, is no failure.
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => None,
-        Err(error) => {
+        Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => None,
+        Ok(Err(error)) => {
             eprintln!("a TLS handshake failed: {error}");
+            None
+        }
+        Err(_) => {
+            eprintln!("a TLS handshake timed out");
             None
         }
     }
@@ -208,18 +249,6 @@ fn roots(path: &str) -> io::Result<RootCertStore> {
             .map_err(|error| io::Error::other(format!("{path}: {error}")))?;
     }
     Ok(roots)
-}
-
-/// Whether the kernel takes TLS sessions: the `tls` module is loaded and
-/// takes at least one of the TLS 1.3 ciphers rustls offers.
-async fn kernel_takes_sessions() -> bool {
-    match ktls::CompatibleCiphers::new().await {
-        Ok(ciphers) => {
-            let tls13 = &ciphers.tls13;
-            tls13.aes_gcm_128 || tls13.aes_gcm_256 || tls13.chacha20_poly1305
-        }
-        Err(_) => false,
-    }
 }
 
 /// A connected pair of loopback sockets.

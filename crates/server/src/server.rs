@@ -106,14 +106,17 @@ pub async fn run_with(
     let kernel = tls::kernel(wants_kernel).await;
     let (members, connector) = match &config.cluster.tls {
         Some(tls) => {
-            let kernel = kernel && tls.kernel;
+            let kernel = kernel.as_ref().filter(|_| tls.kernel);
             let members = Rc::new(Tls::members(tls, kernel)?);
             (Some(members), Some(Connector::new(tls, kernel)?))
         }
         None => (None, None),
     };
     let clients = match client_tls {
-        Some(tls) => Some(Rc::new(Tls::clients(tls, kernel && tls.kernel)?)),
+        Some(tls) => {
+            let kernel = kernel.as_ref().filter(|_| tls.kernel);
+            Some(Rc::new(Tls::clients(tls, kernel)?))
+        }
         None => None,
     };
     let peers = Peers::new(config.addresses(), secret.clone(), connector);
@@ -528,8 +531,9 @@ async fn read(
             }
             Event::Forward { from, body, len } => {
                 let want = len.min(body.unread());
+                let kernel_tls = body.kernel_tls() || connection.kernel_tls();
                 let (copied, relayed) =
-                    zero_copy::relay(body.stream(), connection.stream(), want).await;
+                    zero_copy::relay(body.stream(), connection.stream(), want, kernel_tls).await;
                 if let Err(Short::Destination(error)) = relayed {
                     // The client is gone, and needs none of the rest.
                     GatewayEngine::forwarded(&context.gateway, from, len, None);
@@ -780,8 +784,9 @@ async fn pass(
     let complete = match (bodiless, framing) {
         (true, _) => true,
         (false, Framing::Length(length)) => {
+            let kernel_tls = to_node.kernel_tls() || connection.kernel_tls();
             let (copied, relayed) =
-                zero_copy::relay(to_node.stream(), connection.stream(), length).await;
+                zero_copy::relay(to_node.stream(), connection.stream(), length, kernel_tls).await;
             if let Err(Short::Destination(failure)) = relayed {
                 return Err(failure);
             }

@@ -27,7 +27,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use xxhash_rust::xxh3::xxh3_64;
 
 const MAGIC: &[u8; 8] = b"S3ACSLOT";
@@ -40,6 +40,8 @@ const NO_RUN: u64 = u64::MAX;
 
 pub struct Disk {
     slabs: File,
+    /// Syncs the slab file once for every block write waiting on it.
+    slab_sync: GroupSync,
     /// Which of the slab file's pages are cached.
     pages: PageCache,
     table: File,
@@ -56,6 +58,62 @@ pub struct Disk {
     /// Records cleared since the table was last synced. A block write
     /// syncs them first.
     clears: Mutex<bool>,
+}
+
+/// Syncs a file for many writers at once. Each writer waits for a sync that
+/// began after its write ended, and one sync serves every writer waiting
+/// when it begins, so concurrent block writes share each flush of the
+/// drive.
+#[derive(Default)]
+struct GroupSync {
+    state: Mutex<SyncState>,
+    done: Condvar,
+}
+
+#[derive(Default)]
+struct SyncState {
+    /// Writes that have asked for a sync, each numbered in turn.
+    asked: u64,
+    /// Every write numbered below this is durable.
+    durable: u64,
+    /// Every write numbered below this was in a sync that failed. The
+    /// kernel may have dropped such a write's pages, so no later sync makes
+    /// it durable.
+    failed: u64,
+    syncing: bool,
+}
+
+impl GroupSync {
+    /// Makes durable the writes that ended before this call, running
+    /// `flush` if no sync that began since will.
+    fn sync(&self, mut flush: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+        let mut state = self.state.lock().expect("sync lock");
+        let write = state.asked;
+        state.asked += 1;
+        loop {
+            if write < state.failed {
+                return Err(io::Error::other("a sync of the slab file failed"));
+            }
+            if write < state.durable {
+                return Ok(());
+            }
+            if state.syncing {
+                state = self.done.wait(state).expect("sync lock");
+                continue;
+            }
+            state.syncing = true;
+            let covers = state.asked;
+            drop(state);
+            let synced = flush();
+            state = self.state.lock().expect("sync lock");
+            state.syncing = false;
+            match synced {
+                Ok(()) => state.durable = state.durable.max(covers),
+                Err(_) => state.failed = state.failed.max(covers),
+            }
+            self.done.notify_all();
+        }
+    }
 }
 
 /// What a start reads back: the slot table's records and the metadata
@@ -136,6 +194,7 @@ impl Disk {
         let purge_entries = read_purges(&mut purges)?;
         let disk = Disk {
             slabs,
+            slab_sync: GroupSync::default(),
             pages,
             table,
             metadata: Mutex::new(metadata),
@@ -160,8 +219,16 @@ impl Disk {
     pub fn write(&self, location: Location, bytes: &[u8]) -> io::Result<bool> {
         let offset = self.offset(location);
         let len = bytes.len() as u64;
+        let range = offset..offset + len;
         let slot = offset..offset + self.config.slot_size(len);
-        if self.pages.in_use(&self.slabs, slot, offset..offset + len)? {
+        // A larger block that held this space may have left its bytes cached
+        // in one folio that spans the slot, as the kernel caches a write;
+        // only dropping the whole largest slot's span releases that folio.
+        let largest = self.config.max_slot;
+        let span = offset / largest * largest..(offset / largest + 1) * largest;
+        if self.pages.in_use(&self.slabs, slot, range.clone())?
+            && self.pages.in_use(&self.slabs, span, range)?
+        {
             return Ok(false);
         }
         {
@@ -172,7 +239,7 @@ impl Disk {
             }
         }
         self.slabs.write_all_at(bytes, offset)?;
-        self.slabs.sync_data()?;
+        self.slab_sync.sync(|| self.slabs.sync_data())?;
         let checksum = xxh3_64(bytes);
         self.checksums
             .lock()
@@ -724,5 +791,49 @@ mod tests {
         let (_, recovery) = Disk::open(&dir, other).unwrap();
         assert!(recovery.records.is_empty() && recovery.metadata.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Writes that asked while another sync ran share the next one, and if
+    /// it fails, each of them fails, while later writes sync afresh.
+    #[test]
+    fn a_failed_sync_fails_every_write_it_covered() {
+        use std::sync::Arc;
+        use std::sync::mpsc::channel;
+        let group = Arc::new(GroupSync::default());
+        let (started, has_started) = channel();
+        let (release, released) = channel::<()>();
+        let first = {
+            let group = group.clone();
+            std::thread::spawn(move || {
+                group.sync(|| {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(())
+                })
+            })
+        };
+        has_started.recv().unwrap();
+        let flushes = Arc::new(Mutex::new(0));
+        let waiting: Vec<_> = (0..2)
+            .map(|_| {
+                let (group, flushes) = (group.clone(), flushes.clone());
+                std::thread::spawn(move || {
+                    group.sync(|| {
+                        *flushes.lock().unwrap() += 1;
+                        Err(io::Error::other("the drive failed a flush"))
+                    })
+                })
+            })
+            .collect();
+        while group.state.lock().unwrap().asked < 3 {
+            std::thread::yield_now();
+        }
+        release.send(()).unwrap();
+        assert!(first.join().unwrap().is_ok());
+        for write in waiting {
+            assert!(write.join().unwrap().is_err());
+        }
+        assert_eq!(*flushes.lock().unwrap(), 1, "one sync covers both");
+        assert!(group.sync(|| Ok(())).is_ok());
     }
 }

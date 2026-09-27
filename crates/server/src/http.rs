@@ -110,6 +110,11 @@ impl Connection {
         &self.stream
     }
 
+    /// Whether the kernel holds the connection's TLS session.
+    pub fn kernel_tls(&self) -> bool {
+        self.kernel_tls
+    }
+
     /// The next request's head, or `None` once the client closes the
     /// connection between requests.
     pub async fn read_head(&mut self) -> io::Result<Option<RequestHead>> {

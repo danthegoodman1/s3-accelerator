@@ -276,6 +276,8 @@ impl Client {
 pub struct CacheConfig {
     pub block_size: u64,
     pub chunk_blocks: u64,
+    /// Bytes per extent, the unit of disk a size class takes: by default
+    /// one block, so a class that needs room frees at most a block's worth.
     pub extent_size: u64,
     /// Extents in the slab file.
     pub extents: u32,
@@ -314,8 +316,8 @@ impl Default for CacheConfig {
         CacheConfig {
             block_size: 1 << 20,
             chunk_blocks: 16,
-            extent_size: 64 << 20,
-            extents: 4,
+            extent_size: 1 << 20,
+            extents: 256,
             min_slot: 4 << 10,
             doorkeeper_window: 100_000,
             fill_budget: 64 << 20,
@@ -431,6 +433,14 @@ impl CacheConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A size class takes disk one block at a time, so a class that needs
+    /// room frees at most a block's worth.
+    #[test]
+    fn an_extent_holds_one_block_by_default() {
+        let cache = CacheConfig::default();
+        assert_eq!(cache.extent_size, cache.block_size);
+    }
 
     #[test]
     fn parses_a_minimal_config() {

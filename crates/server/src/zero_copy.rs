@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io;
 use std::num::NonZeroU64;
 use std::ops::Range;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::time::Duration;
 use tokio::io::Interest;
 use tokio::net::TcpStream;
@@ -37,22 +37,23 @@ pub fn send_file(socket: &OwnedFd, file: &File, offset: u64, len: u64) -> io::Re
         match rustix::fs::sendfile(socket, file, Some(&mut offset), count) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(_) | Err(Errno::INTR) => {}
-            Err(Errno::AGAIN) => wait_writable(socket)?,
+            Err(Errno::AGAIN) => wait(socket, PollFlags::OUT)?,
             Err(error) => return Err(error.into()),
         }
     }
     Ok(())
 }
 
-fn wait_writable(socket: &OwnedFd) -> io::Result<()> {
-    let mut fds = [PollFd::new(socket, PollFlags::OUT)];
+/// Waits until `socket` is ready for `flags`, for up to `IDLE`.
+fn wait(socket: &OwnedFd, flags: PollFlags) -> io::Result<()> {
+    let mut fds = [PollFd::new(socket, flags)];
     let timeout = Timespec {
         tv_sec: IDLE.as_secs() as i64,
         tv_nsec: 0,
     };
     match poll(&mut fds, Some(&timeout)) {
         Ok(0) => Err(io::ErrorKind::TimedOut.into()),
-        // An error or hangup shows in the next `sendfile`.
+        // An error or hangup shows in the next call on the socket.
         Ok(_) | Err(Errno::INTR) => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -67,10 +68,37 @@ pub enum Short {
     Destination(io::Error),
 }
 
-/// Moves `len` bytes from `from` to `to` through a pipe, on this thread's
-/// event loop: sockets never block `splice`. Returns the bytes that reached
-/// `to`, and why the relay stopped short if it did.
-pub async fn relay(from: &TcpStream, to: &TcpStream, len: u64) -> (u64, Result<(), Short>) {
+/// Moves `len` bytes from `from` to `to` through a pipe. Returns the bytes
+/// that reached `to`, and why the relay stopped short if it did.
+///
+/// Sockets never block `splice`, so the relay runs on this thread's event
+/// loop, unless `kernel_tls` says either socket carries a kernel TLS
+/// session: then each `splice` encrypts or decrypts, and the relay runs on
+/// a worker thread so the crypto leaves the event loop free.
+pub async fn relay(
+    from: &TcpStream,
+    to: &TcpStream,
+    len: u64,
+    kernel_tls: bool,
+) -> (u64, Result<(), Short>) {
+    if !kernel_tls {
+        return relay_here(from, to, len).await;
+    }
+    let from = match from.as_fd().try_clone_to_owned() {
+        Ok(from) => from,
+        Err(error) => return (0, Err(Short::Source(error))),
+    };
+    let to = match to.as_fd().try_clone_to_owned() {
+        Ok(to) => to,
+        Err(error) => return (0, Err(Short::Destination(error))),
+    };
+    tokio::task::spawn_blocking(move || relay_blocking(&from, &to, len))
+        .await
+        .unwrap_or_else(|error| (0, Err(Short::Source(io::Error::other(error)))))
+}
+
+/// A relay on this thread's event loop.
+async fn relay_here(from: &TcpStream, to: &TcpStream, len: u64) -> (u64, Result<(), Short>) {
     let pipe = match Pipe::take() {
         Ok(pipe) => pipe,
         Err(error) => return (0, Err(Short::Source(error))),
@@ -109,6 +137,55 @@ pub async fn relay(from: &TcpStream, to: &TcpStream, len: u64) -> (u64, Result<(
                 Ok(moved) => drained += moved,
                 Err(error) => return (copied + drained as u64, Err(Short::Destination(error))),
             }
+        }
+        copied += filled as u64;
+    }
+    pipe.put_back();
+    (copied, Ok(()))
+}
+
+/// A relay on a worker thread, which waits for each socket with `poll`.
+fn relay_blocking(from: &OwnedFd, to: &OwnedFd, len: u64) -> (u64, Result<(), Short>) {
+    let pipe = match Pipe::take() {
+        Ok(pipe) => pipe,
+        Err(error) => return (0, Err(Short::Source(error))),
+    };
+    let flags = SpliceFlags::MOVE | SpliceFlags::NONBLOCK;
+    let mut copied = 0;
+    while copied < len {
+        let want = usize::try_from(len - copied)
+            .unwrap_or(usize::MAX)
+            .min(pipe.capacity);
+        let filled = loop {
+            let failure = match splice(from, None, &pipe.write, None, want, flags) {
+                Ok(0) => io::ErrorKind::UnexpectedEof.into(),
+                Ok(filled) => break filled,
+                Err(Errno::INTR) => continue,
+                Err(Errno::AGAIN) => match wait(from, PollFlags::IN) {
+                    Ok(()) => continue,
+                    Err(error) => error,
+                },
+                Err(error) => error.into(),
+            };
+            pipe.put_back();
+            return (copied, Err(Short::Source(failure)));
+        };
+        let mut drained = 0;
+        while drained < filled {
+            let failure = match splice(&pipe.read, None, to, None, filled - drained, flags) {
+                Ok(0) => io::ErrorKind::WriteZero.into(),
+                Ok(moved) => {
+                    drained += moved;
+                    continue;
+                }
+                Err(Errno::INTR) => continue,
+                Err(Errno::AGAIN) => match wait(to, PollFlags::OUT) {
+                    Ok(()) => continue,
+                    Err(error) => error,
+                },
+                Err(error) => error.into(),
+            };
+            return (copied + drained as u64, Err(Short::Destination(failure)));
         }
         copied += filled as u64;
     }
@@ -197,13 +274,13 @@ impl PageCache {
         Ok(PageCache { address, len })
     }
 
-    /// Drops the pages of `slot` that nothing references, then reports
+    /// Drops the pages of `span` that nothing references, then reports
     /// whether any page of `range`, which lies within it, is still cached.
-    pub fn in_use(&self, file: &File, slot: Range<u64>, range: Range<u64>) -> io::Result<bool> {
-        let Some(slot_len) = NonZeroU64::new(slot.end - slot.start) else {
+    pub fn in_use(&self, file: &File, span: Range<u64>, range: Range<u64>) -> io::Result<bool> {
+        let Some(span_len) = NonZeroU64::new(span.end - span.start) else {
             return Ok(false);
         };
-        fadvise(file, slot.start, Some(slot_len), Advice::DontNeed)?;
+        fadvise(file, span.start, Some(span_len), Advice::DontNeed)?;
         let page = rustix::param::page_size() as u64;
         let first = range.start / page * page;
         let end = range.end.div_ceil(page) * page;

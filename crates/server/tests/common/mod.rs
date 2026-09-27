@@ -641,7 +641,8 @@ impl Process {
     }
 
     /// The server's process: this child, or the child `strace` started.
-    fn server_pid(&self) -> u32 {
+    /// Its main thread, which runs the event loop, has the same ID.
+    pub fn server_pid(&self) -> u32 {
         let pid = self.0.id();
         let children = format!("/proc/{pid}/task/{pid}/children");
         std::fs::read_to_string(children)

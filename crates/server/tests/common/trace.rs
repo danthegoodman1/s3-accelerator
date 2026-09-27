@@ -76,6 +76,8 @@ pub fn unescape(text: &str) -> String {
 #[derive(Clone)]
 pub struct Call {
     pub name: String,
+    /// The thread that made it.
+    pub thread: u32,
     /// When it began and returned, in seconds since the epoch.
     pub start: f64,
     pub end: f64,
@@ -175,6 +177,7 @@ pub fn read_trace(path: &Path, from: f64, until: f64) -> Vec<Call> {
         if time >= from && time <= until {
             calls.push(Call {
                 name: name.to_string(),
+                thread: pid.parse().unwrap_or_default(),
                 start,
                 end: time,
                 args: args.to_string(),
