@@ -179,7 +179,10 @@ async fn a_node_killed_during_fills_serves_correct_bytes_after_it_restarts() {
                 drop(node);
                 for read in reads {
                     let (status, body) = read.await.unwrap();
-                    assert!(status >= 500 || (status, body) == (200, object()), "{status}");
+                    assert!(
+                        status >= 500 || (status, body) == (200, object()),
+                        "{status}"
+                    );
                 }
                 origin.delay.set(Duration::ZERO);
                 let node = cluster.start_node().await;
