@@ -14,6 +14,8 @@ const MAX_HEADERS: usize = 100;
 const READ_CHUNK: usize = 256 * 1024;
 /// How long a peer may leave a write waiting.
 const WRITE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a closing connection drains a body it never read.
+const LINGER: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestHead {
@@ -84,14 +86,9 @@ impl Connection {
     }
 
     /// The socket, for moving body bytes inside the kernel. Bytes already
-    /// read ahead stay in `buffered`.
+    /// read ahead stay in the connection's buffer.
     pub fn stream(&self) -> &TcpStream {
         &self.stream
-    }
-
-    /// How many bytes were read from the socket and not yet consumed.
-    pub fn buffered(&self) -> usize {
-        self.buffer.len()
     }
 
     /// The next request's head, or `None` once the client closes the
@@ -254,10 +251,19 @@ impl Connection {
         self.write_all(head.as_bytes()).await
     }
 
-    pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        tokio::time::timeout(WRITE_IDLE, self.stream.write_all(bytes))
-            .await
-            .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
+    /// Writes all of `bytes`, failing if the peer takes none of them for
+    /// `WRITE_IDLE`.
+    pub async fn write_all(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            let written = tokio::time::timeout(WRITE_IDLE, self.stream.write(bytes))
+                .await
+                .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))?;
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            bytes = &bytes[written..];
+        }
+        Ok(())
     }
 
     /// Writes one chunk of a chunked body.
@@ -265,10 +271,24 @@ impl Connection {
         if bytes.is_empty() {
             return Ok(());
         }
-        self.write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
-            .await?;
-        self.write_all(bytes).await?;
-        self.write_all(b"\r\n").await
+        let mut chunk = format!("{:x}\r\n", bytes.len()).into_bytes();
+        chunk.extend_from_slice(bytes);
+        chunk.extend_from_slice(b"\r\n");
+        self.write_all(&chunk).await
+    }
+
+    /// Stops writing, then reads and drops what the peer still sends,
+    /// for up to `LINGER`. A server that answers before reading a request's
+    /// body closes this way: closing with unread bytes would reset the
+    /// connection, and the client could lose the answer.
+    pub async fn linger(&mut self) {
+        let _ = self.stream.shutdown().await;
+        let deadline = tokio::time::Instant::now() + LINGER;
+        let mut sink = vec![0; READ_CHUNK];
+        while let Ok(Ok(read)) =
+            tokio::time::timeout_at(deadline, self.stream.read(&mut sink)).await
+            && read > 0
+        {}
     }
 
     /// Ends a chunked body.

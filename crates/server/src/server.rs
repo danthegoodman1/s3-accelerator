@@ -38,8 +38,6 @@ struct Context {
 /// The largest `DeleteObjects` body the gateway reads: S3 takes at most
 /// 1,000 keys of at most 1,024 bytes each.
 const MAX_DELETE_BODY: u64 = 8 << 20;
-/// The SHA-256 of an empty body.
-const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 pub async fn serve(config: Config) -> io::Result<()> {
     let mut listeners = Listeners::default();
@@ -187,15 +185,20 @@ async fn connection(stream: TcpStream, context: &Context) -> io::Result<()> {
         // authorized before its body is read. A request answered before its
         // body is read closes the connection.
         let refusal = authenticate(&head, context).and_then(|client| authorize(&head, client));
-        if let Err(response) = refusal {
-            let keep_alive = head.keep_alive && len == 0;
-            connection.write_response(&response, keep_alive).await?;
-            if keep_alive {
-                continue;
+        let reusable = match refusal {
+            Err(response) => {
+                let keep_alive = head.keep_alive && len == 0;
+                connection.write_response(&response, keep_alive).await?;
+                keep_alive
             }
-            return Ok(());
-        }
-        if !handle(&mut connection, &head, len, context).await? || !head.keep_alive {
+            Ok(()) => handle(&mut connection, &head, len, context).await? && head.keep_alive,
+        };
+        if !reusable {
+            // The client may still be sending a body; draining it lets the
+            // client read the answer before the socket closes.
+            if len > 0 {
+                connection.linger().await;
+            }
             return Ok(());
         }
     }
@@ -263,13 +266,15 @@ async fn handle(
     {
         if digest
             .as_deref()
-            .is_some_and(|digest| digest != EMPTY_SHA256)
+            .is_some_and(|digest| digest != sigv4::EMPTY_SHA256)
         {
             let response = hash_mismatch();
-            connection.write_response(&response, true).await?;
+            connection
+                .write_response(&response, head.keep_alive)
+                .await?;
             return Ok(true);
         }
-        return read(connection, request, context).await;
+        return read(connection, request, head.keep_alive, context).await;
     }
     let request = Forward {
         head,
@@ -325,6 +330,7 @@ fn cacheable(head: &RequestHead, bucket: &str, key: &str) -> Option<Request> {
 async fn read(
     connection: &mut Connection,
     request: Request,
+    keep_alive: bool,
     context: &Context,
 ) -> io::Result<bool> {
     let method = request.method;
@@ -342,7 +348,7 @@ async fn read(
             Event::Start(head) => {
                 let framing = Framing::Length(head.content_length);
                 connection
-                    .write_response_head(head.status, &client_headers(&head), framing, true)
+                    .write_response_head(head.status, &client_headers(&head), framing, keep_alive)
                     .await?;
                 remaining = Some(head.content_length);
             }

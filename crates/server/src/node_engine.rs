@@ -43,8 +43,9 @@ pub struct Reply {
 pub enum Part {
     /// `len` bytes of the slab file from `offset`, sent with `sendfile`.
     File { offset: u64, len: u64 },
-    /// Bytes of a body the node holds.
-    Held(Bytes),
+    /// `len` bytes of a body the node holds. Fewer bytes end the reply
+    /// there.
+    Held { bytes: Bytes, len: u64 },
     /// `len` bytes of an S3 body, as they arrive.
     Arriving {
         chunks: mpsc::Receiver<Bytes>,
@@ -80,7 +81,8 @@ enum Reader {
 /// this far behind holds up the body for every reader.
 const QUEUED_CHUNKS: usize = 4;
 /// How long a write waits for a slot's old pages to be released, and how
-/// often it looks.
+/// long it waits before it first looks again; each wait doubles, up to a
+/// second.
 const PAGES_WAIT: Duration = Duration::from_secs(30);
 const PAGES_RECHECK: Duration = Duration::from_millis(10);
 
@@ -324,9 +326,10 @@ impl NodeEngine {
                     offset,
                     len,
                 } => match self.bodies.get_mut(&origin) {
-                    Some(Body::Held(bytes)) => {
-                        Part::Held(slice(bytes, offset, len).unwrap_or_default())
-                    }
+                    Some(Body::Held(bytes)) => Part::Held {
+                        bytes: slice(bytes, offset, len).unwrap_or_default(),
+                        len,
+                    },
                     Some(Body::Arriving(readers)) => {
                         let (sender, receiver) = mpsc::channel(QUEUED_CHUNKS);
                         readers.push(Reader::Reply {
@@ -341,7 +344,10 @@ impl NodeEngine {
                     }
                     // The reply ends short, and the gateway reads the rest
                     // from elsewhere.
-                    Some(Body::Passing) | None => Part::Held(Bytes::new()),
+                    Some(Body::Passing) | None => Part::Held {
+                        bytes: Bytes::new(),
+                        len,
+                    },
                 },
             };
             parts.push(part);
@@ -506,12 +512,13 @@ async fn pass_through(engine: &SharedNode, mut body: Incoming, readers: Vec<Read
             let (from, to) = (position.max(*start), chunk_end.min(*end));
             if from < to
                 && let Some(sender) = chunks
+                && sender
+                    .send(chunk.slice((from - position) as usize..(to - position) as usize))
+                    .await
+                    .is_err()
             {
-                let piece = chunk.slice((from - position) as usize..(to - position) as usize);
-                if sender.send(piece).await.is_err() {
-                    // The gateway hung up.
-                    *chunks = None;
-                }
+                // The gateway hung up.
+                *chunks = None;
             }
         }
         let mut complete = Vec::new();
@@ -555,6 +562,7 @@ fn write(engine: &SharedNode, location: Location, bytes: Bytes) {
     tokio::task::spawn_local(async move {
         let disk = engine.borrow().disk.clone();
         let deadline = tokio::time::Instant::now() + PAGES_WAIT;
+        let mut recheck = PAGES_RECHECK;
         let written = loop {
             let (disk, bytes) = (disk.clone(), bytes.clone());
             let written = tokio::task::spawn_blocking(move || disk.write(location, &bytes))
@@ -563,7 +571,8 @@ fn write(engine: &SharedNode, location: Location, bytes: Bytes) {
                 .and_then(|written| written);
             match written {
                 Ok(false) if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(PAGES_RECHECK).await;
+                    tokio::time::sleep(recheck).await;
+                    recheck = (recheck * 2).min(Duration::from_secs(1));
                 }
                 Ok(false) => break Err(io::Error::other("the slot's old pages stayed in use")),
                 Ok(true) => break Ok(()),
@@ -721,13 +730,19 @@ async fn send_body(
                 .map_err(io::Error::other)??;
                 sent += total;
             }
-            Part::Held(bytes) => {
+            Part::Held { bytes, len } => {
                 connection.write_all(&bytes).await?;
                 sent += bytes.len() as u64;
+                if (bytes.len() as u64) < len {
+                    return Ok(sent);
+                }
             }
             Part::Arriving { mut chunks, len } => {
                 let mut arrived = 0;
-                while let Some(chunk) = chunks.recv().await {
+                // The body goes on for other readers after this one's bytes.
+                while arrived < len
+                    && let Some(chunk) = chunks.recv().await
+                {
                     connection.write_all(&chunk).await?;
                     arrived += chunk.len() as u64;
                 }

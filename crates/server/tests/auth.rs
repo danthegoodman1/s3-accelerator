@@ -94,6 +94,21 @@ async fn dot_segment_keys_reach_s3_as_written() {
         .await;
 }
 
+/// A client that asks to close after a read is told the server closes.
+#[tokio::test(flavor = "current_thread")]
+async fn a_read_tells_a_closing_client_it_closes() {
+    LocalSet::new()
+        .run_until(async {
+            let (port, _) = start(r#"{ bucket = "bucket" }"#, "").await;
+            for _ in 0..2 {
+                let response = head_only(port, &raw_head(port, "GET", "/bucket/k", "", &[])).await;
+                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                assert!(response.contains("Connection: close\r\n"), "{response}");
+            }
+        })
+        .await;
+}
+
 /// The gateway reads a `DeleteObjects` key list to learn what it deletes,
 /// so it refuses one larger than S3 takes before reading it.
 #[tokio::test(flavor = "current_thread")]

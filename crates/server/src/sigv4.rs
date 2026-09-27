@@ -9,6 +9,8 @@ use std::fmt;
 
 /// Clients may sign a request without hashing its body.
 pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+/// The payload hash of an empty body.
+pub const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 /// How far a request's signing time may be from now, in seconds.
 const MAX_SKEW: i64 = 15 * 60;
 
@@ -376,8 +378,6 @@ mod tests {
     use super::*;
 
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-    /// The payload hash of an empty body.
-    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs

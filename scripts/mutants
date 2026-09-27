@@ -136,6 +136,14 @@ MUTANTS = [
         [(NODE_ENGINE, "let done = slot.bytes.len() as u64 == slot.end - slot.start;", "let done = false;")],
     ),
     (
+        "a body answered before it was read is never drained",
+        [(SERVER, "if len > 0 {\n                connection.linger().await;\n            }", "")],
+    ),
+    (
+        "a reply waits for the whole arriving body",
+        [(NODE_ENGINE, "while arrived < len\n                    && let Some(chunk) = chunks.recv().await", "while let Some(chunk) = chunks.recv().await")],
+    ),
+    (
         "a hit is copied rather than sent with sendfile",
         [(ZERO_COPY, "match rustix::fs::sendfile(socket, file, Some(&mut offset), count) {",
           "match { let mut buf = vec![0u8; count.min(1 << 20)]; std::os::unix::fs::FileExt::read_at(file, &mut buf, offset)"

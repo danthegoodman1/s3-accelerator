@@ -4,7 +4,7 @@
 #![allow(dead_code, reason = "each test crate uses its own part of the harness")]
 
 use s3_accelerator::config::Config;
-use s3_accelerator::http::{Connection, Response};
+use s3_accelerator::http::{Connection, Framing, Response};
 use s3_accelerator::server::{self, Listeners};
 use s3_accelerator::sigv4::{self, Credentials, Signer, UNSIGNED_PAYLOAD};
 use std::cell::{Cell, RefCell};
@@ -50,6 +50,10 @@ pub struct Origin {
     pub distinct: Cell<bool>,
     /// Bodies of the writes it received in full.
     pub uploads: RefCell<Vec<Vec<u8>>>,
+    /// Refuse each `PUT` with 403 from its head, before its body arrives.
+    pub refuse_writes: Cell<bool>,
+    /// How long it waits before each 64 KiB of a body after the first.
+    pub trickle: Cell<Duration>,
 }
 
 impl Default for Origin {
@@ -62,6 +66,8 @@ impl Default for Origin {
             size: Cell::new(SIZE),
             distinct: Cell::default(),
             uploads: RefCell::default(),
+            refuse_writes: Cell::default(),
+            trickle: Cell::default(),
         }
     }
 }
@@ -86,6 +92,17 @@ async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
         tokio::task::spawn_local(async move {
             let mut connection = Connection::new(stream);
             while let Ok(Some(head)) = connection.read_head().await {
+                if head.method == "PUT" && origin.refuse_writes.get() {
+                    let response = Response {
+                        status: 403,
+                        headers: Vec::new(),
+                        content_length: 0,
+                        body: Vec::new().into(),
+                    };
+                    let _ = connection.write_response(&response, false).await;
+                    connection.linger().await;
+                    return;
+                }
                 let len = head.content_length().unwrap();
                 let Ok(upload) = connection.read_body(len).await else {
                     return;
@@ -110,19 +127,26 @@ async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
                     _ => (200, Vec::new()),
                 };
                 tokio::time::sleep(origin.delay.get()).await;
-                let response = Response {
-                    status,
-                    headers,
-                    content_length: body.len() as u64,
-                    body: if head.method == "HEAD" {
-                        Vec::new()
-                    } else {
-                        body
-                    }
-                    .into(),
-                };
-                if connection.write_response(&response, true).await.is_err() {
+                let framing = Framing::Length(body.len() as u64);
+                if connection
+                    .write_response_head(status, &headers, framing, true)
+                    .await
+                    .is_err()
+                {
                     return;
+                }
+                let body = if head.method == "HEAD" {
+                    &[][..]
+                } else {
+                    &body
+                };
+                for (index, piece) in body.chunks(64 << 10).enumerate() {
+                    if index > 0 {
+                        tokio::time::sleep(origin.trickle.get()).await;
+                    }
+                    if connection.write_all(piece).await.is_err() {
+                        return;
+                    }
                 }
             }
         });
@@ -407,7 +431,15 @@ impl Process {
 }
 
 impl Drop for Process {
+    /// Kills the server, and the tracer too, which would otherwise leave
+    /// the server running once it died.
     fn drop(&mut self) {
+        let server = self.server_pid();
+        if server != self.0.id() {
+            let _ = Command::new("kill")
+                .args(["-KILL", &server.to_string()])
+                .status();
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
