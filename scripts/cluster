@@ -13,8 +13,9 @@
 # process reaches nodes over mutual TLS with a certificate a CA made there
 # signed.
 #
-# With --metadata, nodes look up every bucket's origin in the reference
-# metadata service on 127.0.0.1:9200, which names s3proxy as each one's.
+# With --metadata, nodes look up every bucket's origin, and the gateway
+# every client, in the reference metadata service on 127.0.0.1:9200, which
+# names s3proxy as each bucket's origin and serves s3proxy's credentials.
 set -euo pipefail
 
 dir=target/cluster
@@ -27,13 +28,15 @@ secret_access_key = "local-credential"'
 origin="[origin]
 $s3proxy"
 
+clients='[[clients]]
+access_key_id = "local-identity"
+secret_access_key = "local-credential"
+grants = [{ bucket = "*", access = "admin" }]'
+
 config() {
   local nodes=$1 role=$2
   cat <<TOML
-[[clients]]
-access_key_id = "local-identity"
-secret_access_key = "local-credential"
-grants = [{ bucket = "*", access = "admin" }]
+$clients
 
 [cache]
 block_size = 65536
@@ -81,9 +84,14 @@ case "${1:-}" in
 listen = "127.0.0.1:9200"
 token = "metadata-token"
 nodes = [$(for id in $(seq 0 $((nodes - 1))); do printf '"127.0.0.1:%d", ' $((9091 + id)); done)]
+gateways = ["127.0.0.1:9090"]
 
 [default]
 $s3proxy
+
+[clients.local-identity]
+secret_access_key = "local-credential"
+grants = [{ bucket = "*", access = "admin" }]
 TOML
       target/debug/s3-accelerator-metadata "$dir/metadata.toml" >"$dir/metadata.log" 2>&1 &
       echo $! >"$dir/metadata.pid"
@@ -91,6 +99,7 @@ TOML
       origin='[metadata]
 url = "http://127.0.0.1:9200"
 token = "metadata-token"'
+      clients=
     fi
     members=
     if [ "$tls" = --tls ]; then
@@ -143,6 +152,12 @@ listen = "127.0.0.1:9090"'
 cert = \"$dir/tls/cert.pem\"
 key = \"$dir/tls/key.pem\"
 $members"
+    fi
+    if [ "$metadata" = --metadata ]; then
+      # The gateway looks up clients where nodes look up origins.
+      gateway="$origin
+
+$gateway"
     fi
     config "$nodes" "$gateway" >"$dir/gateway.toml"
     "$binary" "$dir/gateway.toml" >"$dir/gateway.log" 2>&1 &

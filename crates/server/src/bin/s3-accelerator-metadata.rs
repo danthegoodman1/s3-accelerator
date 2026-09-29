@@ -1,6 +1,7 @@
 //! The reference metadata service. `s3-accelerator-metadata CONFIG` answers
-//! nodes' lookups of buckets' origins from the config, and on `SIGHUP`
-//! reloads it and invalidates each bucket whose origin changed.
+//! nodes' lookups of buckets' origins and gateways' lookups of clients from
+//! the config, and on `SIGHUP` reloads it and invalidates each bucket and
+//! client that changed.
 
 use s3_accelerator::log;
 use s3_accelerator::metadata_service::{self, MetadataService, ServiceConfig};
@@ -40,7 +41,12 @@ fn main() -> ExitCode {
                     Err(error) => Err(error),
                 };
                 match reloaded {
-                    Ok(changed) => log!(Info, "reloaded", changed = changed.len()),
+                    Ok(changed) => log!(
+                        Info,
+                        "reloaded",
+                        buckets = changed.buckets.len(),
+                        clients = changed.clients.len()
+                    ),
                     Err(error) => log!(Warn, "the reload failed", error = error),
                 }
             });

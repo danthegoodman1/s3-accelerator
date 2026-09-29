@@ -7,7 +7,7 @@ use s3_accelerator_core::membership::{self, Peer};
 use s3_accelerator_core::node::{self, BucketPolicy, Freshness};
 use s3_accelerator_core::placement::{NodeId, Ring};
 use s3_accelerator_core::store::StoreConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Deserialize)]
@@ -19,8 +19,9 @@ pub struct Config {
     /// Origins of single buckets, by bucket name.
     #[serde(default)]
     pub origins: BTreeMap<String, OriginConfig>,
-    /// The metadata service, which names each bucket's origin in place of
-    /// `origin` and `origins`.
+    /// The metadata service, which names each bucket's origin and each
+    /// client's grants and signing keys in place of `origin`, `origins` and
+    /// `clients`.
     pub metadata: Option<MetadataConfig>,
     /// The SQS queue S3 sends its event notifications to, which storage
     /// nodes poll.
@@ -188,6 +189,13 @@ impl Config {
         if self.cluster.secret.is_empty() {
             return Err("cluster.secret is empty".into());
         }
+        let mut keys = BTreeSet::new();
+        for client in &self.clients {
+            if !keys.insert(&client.access_key_id) {
+                let id = &client.access_key_id;
+                return Err(format!("access key {id} appears twice in [[clients]]"));
+            }
+        }
         let mut ids = BTreeSet::new();
         for node in &self.cluster.nodes {
             if !ids.insert(node.id) {
@@ -209,8 +217,13 @@ impl Config {
                 return Err("[events] needs a region without [origin]".into());
             }
         }
-        if self.metadata.is_some() && (self.origin.is_some() || !self.origins.is_empty()) {
-            return Err("[metadata] names origins in place of [origin] and [origins]".into());
+        let configured =
+            self.origin.is_some() || !self.origins.is_empty() || !self.clients.is_empty();
+        if self.metadata.is_some() && configured {
+            return Err(
+                "[metadata] names origins and clients in place of [origin], [origins] and [[clients]]"
+                    .into(),
+            );
         }
         if let Some(node) = &self.node {
             if self.origin.is_none() && self.origins.is_empty() && self.metadata.is_none() {
@@ -288,19 +301,21 @@ pub struct OriginConfig {
     pub secret_access_key: String,
 }
 
-/// Where nodes look up buckets' origins.
+/// Where nodes look up buckets' origins, and gateways clients.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetadataConfig {
     /// Such as `https://metadata.example.com`; a lookup asks
-    /// `<url>/buckets/<bucket>`.
+    /// `<url>/buckets/<bucket>` or `<url>/clients/<access key ID>`.
     pub url: String,
     /// Sent with each lookup, and the key that signs invalidations.
     pub token: String,
-    /// How long past its TTL a node uses an entry while lookups fail.
+    /// How long past its TTL a process uses an entry, a bucket's origin or
+    /// a client's grants and keys, while lookups fail.
     #[serde(default = "default_grace")]
     pub grace_ms: u64,
-    /// How long a node remembers that the service doesn't serve a bucket.
+    /// How long a process remembers that the service doesn't know a bucket
+    /// or an access key.
     #[serde(default = "default_unknown_ttl")]
     pub unknown_ttl_ms: u64,
 }
@@ -322,7 +337,7 @@ pub struct Client {
     pub grants: Vec<Grant>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grant {
     /// What the grant allows: `read`, `write` (the default, which reads
@@ -337,7 +352,7 @@ pub struct Grant {
 }
 
 /// What a grant allows, each level including the ones before it.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Access {
     /// Reading objects and listing them.
@@ -348,26 +363,6 @@ pub enum Access {
     /// Changing and deleting the bucket: its policy, lifecycle and other
     /// settings.
     Admin,
-}
-
-impl Client {
-    /// Whether a grant gives `access` to `key` in `bucket`. A listing
-    /// passes the prefix it lists, and a request about the bucket itself
-    /// an empty key, which only a grant on the whole bucket covers.
-    pub fn may(&self, access: Access, bucket: &str, key: &str) -> bool {
-        self.grants.iter().any(|grant| {
-            grant.access >= access
-                && (grant.bucket == "*" || grant.bucket == bucket)
-                && key.starts_with(&grant.prefix)
-        })
-    }
-
-    /// Whether some grant gives `access` to part of `bucket`.
-    pub fn may_reach(&self, access: Access, bucket: &str) -> bool {
-        self.grants
-            .iter()
-            .any(|grant| grant.access >= access && (grant.bucket == "*" || grant.bucket == bucket))
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -623,12 +618,29 @@ mod tests {
             "#,
         )
         .unwrap();
-        let client = &config.clients[0];
-        assert!(client.may(Access::Write, "logs", "2026/01/a"));
-        assert!(!client.may(Access::Admin, "logs", "2026/01/a"));
-        assert!(!client.may(Access::Read, "logs", "2025/12/a"));
-        assert!(!client.may(Access::Read, "other", "2026/01/a"));
-        assert!(client.may_reach(Access::Write, "logs"));
+        let twice = r#"
+            [[clients]]
+            access_key_id = "k"
+            secret_access_key = "a"
+            grants = []
+            [[clients]]
+            access_key_id = "k"
+            secret_access_key = "b"
+            grants = []
+            [cluster]
+            secret = "s"
+            nodes = [{ id = 0, address = "127.0.0.1:9100" }]
+            [gateway]
+            listen = "127.0.0.1:9000"
+            "#;
+        let twice: Config = toml::from_str(twice).unwrap();
+        assert!(twice.check().unwrap_err().contains("appears twice"));
+        let grant = &config.clients[0].grants[0];
+        assert_eq!(grant.access, Access::Write);
+        assert_eq!(
+            (grant.bucket.as_str(), grant.prefix.as_str()),
+            ("logs", "2026/")
+        );
         assert_eq!(config.check(), Ok(()));
         let node = config.cache.node_config();
         assert_eq!(node.buckets["parquet"].freshness, Freshness::Immutable);

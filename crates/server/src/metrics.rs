@@ -4,7 +4,7 @@
 //! so no count is shared between threads.
 
 use crate::http::RequestHead;
-use crate::origins::{Lookup, Unresolved};
+use crate::lookups::{Kind, Lookup, Unresolved};
 use s3_accelerator_core::node::{Stats, Usage};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -169,11 +169,11 @@ struct Counts {
     syncs: Histogram,
     events: u64,
     events_lag: Histogram,
-    /// Lookups in the metadata service, by `Lookup`.
-    origin_lookups: [u64; 3],
-    origin_invalidations: u64,
-    origin_stale: u64,
-    /// Requests answered without an origin, by `Unresolved`.
+    /// Lookups in the metadata service, by `Kind` and `Lookup`.
+    metadata_lookups: [[u64; 4]; 2],
+    metadata_invalidations: [u64; 2],
+    metadata_stale: [u64; 2],
+    /// Requests answered without an origin: unknown, and unavailable.
     origin_unresolved: [u64; 2],
     /// Rings the gateway adopted, and the node.
     ring_changes: [u64; 2],
@@ -249,21 +249,25 @@ impl Metrics {
         }
     }
 
-    pub fn origin_lookup(&self, result: Lookup) {
-        self.counts.borrow_mut().origin_lookups[result as usize] += 1;
+    pub fn metadata_lookup(&self, kind: Kind, result: Lookup) {
+        self.counts.borrow_mut().metadata_lookups[kind as usize][result as usize] += 1;
     }
 
-    pub fn origin_invalidated(&self) {
-        self.counts.borrow_mut().origin_invalidations += 1;
+    pub fn metadata_invalidated(&self, kind: Kind) {
+        self.counts.borrow_mut().metadata_invalidations[kind as usize] += 1;
     }
 
-    /// `requests` went out with an entry past its TTL.
-    pub fn origin_stale(&self, requests: u64) {
-        self.counts.borrow_mut().origin_stale += requests;
+    /// `requests` used an entry past its TTL.
+    pub fn metadata_stale(&self, kind: Kind, requests: u64) {
+        self.counts.borrow_mut().metadata_stale[kind as usize] += requests;
     }
 
     pub fn origin_unresolved(&self, reason: Unresolved) {
-        self.counts.borrow_mut().origin_unresolved[reason as usize] += 1;
+        let index = match reason {
+            Unresolved::Unknown => 0,
+            Unresolved::Unavailable | Unresolved::Busy => 1,
+        };
+        self.counts.borrow_mut().origin_unresolved[index] += 1;
     }
 
     /// The gateway, or the node, adopted a ring.
@@ -586,34 +590,6 @@ fn render_node(out: &mut Out, counts: &Counts) {
     );
     out.histogram("events_lag_seconds", "", &counts.events_lag);
     out.family(
-        "origin_lookups_total",
-        "counter",
-        "Lookups of buckets' origins in the metadata service.",
-    );
-    for (result, count) in ["found", "unknown", "failed"]
-        .iter()
-        .zip(counts.origin_lookups)
-    {
-        let labels = format!("result=\"{result}\"");
-        out.sample("origin_lookups_total", &labels, count);
-    }
-    out.family(
-        "origin_invalidations_total",
-        "counter",
-        "Invalidations the node took.",
-    );
-    out.sample(
-        "origin_invalidations_total",
-        "",
-        counts.origin_invalidations,
-    );
-    out.family(
-        "origin_stale_total",
-        "counter",
-        "Requests sent with an entry past its TTL while lookups failed.",
-    );
-    out.sample("origin_stale_total", "", counts.origin_stale);
-    out.family(
         "origin_unresolved_total",
         "counter",
         "Requests answered without an origin: 404 for an unknown bucket, 503 for one with no usable entry.",
@@ -628,6 +604,37 @@ fn render_node(out: &mut Out, counts: &Counts) {
 }
 
 fn render_process(out: &mut Out, counts: &Counts, view: &View) {
+    const KINDS: [&str; 2] = ["origin", "client"];
+    out.family(
+        "metadata_lookups_total",
+        "counter",
+        "Lookups in the metadata service, and those refused at the cap on lookups in flight.",
+    );
+    for (kind, results) in KINDS.iter().zip(counts.metadata_lookups) {
+        let names = ["found", "unknown", "failed", "refused"];
+        for (result, count) in names.iter().zip(results) {
+            let labels = format!("kind=\"{kind}\",result=\"{result}\"");
+            out.sample("metadata_lookups_total", &labels, count);
+        }
+    }
+    out.family(
+        "metadata_invalidations_total",
+        "counter",
+        "Invalidations the process took.",
+    );
+    for (kind, count) in KINDS.iter().zip(counts.metadata_invalidations) {
+        let labels = format!("kind=\"{kind}\"");
+        out.sample("metadata_invalidations_total", &labels, count);
+    }
+    out.family(
+        "metadata_stale_total",
+        "counter",
+        "Requests that used an entry past its TTL while lookups failed.",
+    );
+    for (kind, count) in KINDS.iter().zip(counts.metadata_stale) {
+        let labels = format!("kind=\"{kind}\"");
+        out.sample("metadata_stale_total", &labels, count);
+    }
     out.family(
         "ring_changes_total",
         "counter",

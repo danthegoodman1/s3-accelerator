@@ -7,7 +7,7 @@ cargo build --release -p s3-accelerator -p s3-accelerator-bench
 target/release/s3-accelerator-bench
 ```
 
-With `--origins service`, the node looks up the bucket's origin in the reference metadata service rather than its config's `[origin]`.
+With `--metadata on`, the node looks up the bucket's origin, and the gateway the client, in the reference metadata service rather than their configs.
 
 Both processes serve their admin listener. Between workloads, the benchmark waits until the node's metrics show no fills in progress and it has written nothing for half a second, so each workload starts after the last one's blocks are durable. `--scrape-ms MS` also scrapes each process's `/metrics` every `MS` milliseconds during the workloads.
 
@@ -81,7 +81,7 @@ The low ends after Phase 7 of the range hits and the high end of "Hits" come fro
 - **Small range hits** cost the node half the CPU and reach four times the throughput from one client: a run the page cache holds goes out with `sendfile` from the event loop, and a small reply leaves in one write (7E).
 - **Range misses** cost the node about twice the CPU, as each S3 request now crosses to a worker thread and back. Their p99 reached 64 ms in one run of three before Phase 7 and in every run at its end, with some misses waiting 25 to 80 ms longer than S3 took to answer. Once the journal thread (7I) and reads before the sync (7J) landed, four runs put the p99 at 23.2 to 23.7 ms, S3's 20 ms and a few more.
 
-## Origins from the metadata service
+## Origins and clients from the metadata service
 
 Six runs each of the hits section, with the bucket's origin in the node's config and in the reference metadata service: first alternating, then two of one and two of the other. Every range overlaps. The node looked the bucket up once per run with the service, and finding a fresh entry costs a request 46 ns on the node's thread, against 15 ns from the config (`origins::tests::cost_of_finding_an_origin`).
 
@@ -93,6 +93,8 @@ Six runs each of the hits section, with the bucket's origin in the node's config
 | 64 KiB range hits | 2.30–2.46 | 2.18–2.49 | 1.28–1.81 ms | 1.45–21.50 ms | 0.24–0.31 | 0.22–0.48 |
 | 64 KiB range hits, 1 client | 0.67–1.03 | 0.27–1.19 | 0.37–0.60 ms | 0.27–0.79 ms | 0.16–0.66 | 0.33–0.49 |
 | 64 KiB range misses, 1 client | | | 23.2–23.8 ms | 23.2–23.7 ms | 11.47–14.75 | 10.65–13.11 |
+
+With the gateway's client from the service too, four more runs, with the service, without, without and with, looked the bucket and the key up once each per run, and finding a fresh key costs a request 38 ns on the gateway's thread, against 29 ns from the config (`clients::tests::cost_of_finding_a_client`). Single-client page-cache hits ran at 8.50 and 8.94 GiB/s with the service and 9.73 and 8.16 without, and 64 KiB range misses' p99 at 23.6 and 23.9 ms against 23.5 and 23.3. The drive turned away most fills in three of the four, which then read S3 and the drive on hits.
 
 The wide ranges come from the drive. The node wrote 7.4 to 9.4 GiB while filling in eight runs, and 0.6 to 3.2 GiB in the other four, two of each mode. In those four, the drive's writes trailed S3's bodies so far that the fill budget turned most blocks away (13,706 and 15,401 refusals in the last run of each mode, against 2,999 in a run that stored 9.3 GiB), so fills ran faster with longer tails, and later hits went to S3. The alternating runs made it look like the service's doing: three service runs in a row wrote less. With two of each in a row, the second run of each mode wrote less.
 

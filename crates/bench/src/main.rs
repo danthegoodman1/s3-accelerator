@@ -17,14 +17,15 @@
 //! ```console
 //! cargo build --release -p s3-accelerator -p s3-accelerator-bench
 //! target/release/s3-accelerator-bench [--scale X] [--clients N] [--origin-latency-ms MS] [--dir DIR]
-//!     [--origins config|service]
+//!     [--metadata on|off]
 //! ```
 //!
 //! Both processes serve their admin listener. Between runs, the benchmark
 //! waits for the node's metrics to show no fills in progress; with
 //! `--scrape-ms MS`, a thread also scrapes each process's `/metrics` every
-//! `MS` milliseconds during runs. With `--origins service`, the node looks
-//! up the bucket's origin in the reference metadata service.
+//! `MS` milliseconds during runs. With `--metadata on`, the node looks up
+//! the bucket's origin, and the gateway the client, in the reference
+//! metadata service.
 
 mod client;
 mod cluster;
@@ -57,7 +58,8 @@ struct Args {
     only: Option<String>,
     /// How often to scrape each process's metrics, if at all.
     scrape: Option<Duration>,
-    /// Nodes look up the bucket's origin in the reference metadata service.
+    /// The node looks up the bucket's origin, and the gateway the client, in
+    /// the reference metadata service.
     metadata: bool,
 }
 
@@ -89,11 +91,11 @@ fn args() -> Args {
             "--scrape-ms" => {
                 args.scrape = Some(Duration::from_millis(value.parse().unwrap()));
             }
-            "--origins" => {
+            "--metadata" => {
                 args.metadata = match value.as_str() {
-                    "service" => true,
-                    "config" => false,
-                    _ => panic!("--origins takes service or config"),
+                    "on" => true,
+                    "off" => false,
+                    _ => panic!("--metadata takes on or off"),
                 };
             }
             "--origin-latency-ms" => {

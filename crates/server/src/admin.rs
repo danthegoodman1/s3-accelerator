@@ -2,13 +2,16 @@
 //! service's invalidations over plaintext HTTP/1.1, on an address of its
 //! own.
 
+use crate::clients::Clients;
 use crate::gateway_engine::{GatewayEngine, SharedGateway};
 use crate::http::{self, RequestHead, Response};
+use crate::lookups::Invalidated;
 use crate::metrics::{Metrics, View};
 use crate::node_engine::{NodeEngine, SharedNode};
-use crate::origins::{Invalidated, Origins};
+use crate::origins::Origins;
 use crate::sigv4;
 use bytes::Bytes;
+use percent_encoding::percent_decode_str;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use tokio::net::TcpListener;
@@ -21,8 +24,10 @@ pub struct Admin {
     /// recovered.
     runs_node: bool,
     node: RefCell<Option<SharedNode>>,
-    /// The node's origins, which invalidations reach.
+    /// The node's origins and the gateway's clients, which invalidations
+    /// reach.
     origins: RefCell<Option<Rc<Origins>>>,
+    clients: RefCell<Option<Rc<Clients>>>,
     /// The node took a ring from a seed, or found none answering.
     joined: Cell<bool>,
     gateway: RefCell<Option<SharedGateway>>,
@@ -37,6 +42,7 @@ impl Admin {
             runs_node,
             node: RefCell::new(None),
             origins: RefCell::new(None),
+            clients: RefCell::new(None),
             joined: Cell::new(false),
             gateway: RefCell::new(None),
             stopping: Cell::new(false),
@@ -52,6 +58,11 @@ impl Admin {
     /// The node's origins, which take invalidations from its start.
     pub fn origins(&self, origins: Rc<Origins>) {
         *self.origins.borrow_mut() = Some(origins);
+    }
+
+    /// The gateway's clients, which take invalidations once it serves.
+    pub fn clients(&self, clients: Rc<Clients>) {
+        *self.clients.borrow_mut() = Some(clients);
     }
 
     /// The node joined the cluster.
@@ -115,20 +126,36 @@ impl Admin {
         }
     }
 
-    /// `POST /origins/<bucket>/invalidate`, from the metadata service.
+    /// `POST /origins/<bucket>/invalidate` or `POST /clients/<access key
+    /// ID>/invalidate`, from the metadata service.
     fn invalidate(&self, head: &RequestHead) -> Response {
-        let bucket = head
-            .path
-            .strip_prefix("/origins/")
-            .and_then(|rest| rest.strip_suffix("/invalidate"))
-            .filter(|bucket| is_bucket_name(bucket));
-        let origins = self.origins.borrow().clone();
-        let (Some(bucket), Some(origins)) = (bucket, origins) else {
+        let Some(named) = head.path.strip_suffix("/invalidate") else {
             return Response::text(404, "not found\n");
         };
         let time = head.header("x-accel-time").unwrap_or_default();
         let signature = head.header("x-accel-signature").unwrap_or_default();
-        match origins.invalidate(bucket, time, signature, sigv4::unix_now()) {
+        let (path, now) = (head.path.as_str(), sigv4::unix_now());
+        let origins = self.origins.borrow().clone();
+        let clients = self.clients.borrow().clone();
+        // The name comes percent-encoded, as the service signed it.
+        let decoded = |segment: &str| {
+            let name = percent_decode_str(segment).decode_utf8().ok()?;
+            (!name.is_empty() && !name.contains('/')).then(|| name.into_owned())
+        };
+        let origin = named.strip_prefix("/origins/").and_then(decoded);
+        let client = named.strip_prefix("/clients/").and_then(decoded);
+        let invalidated = match (origin, client) {
+            (Some(bucket), _) => match origins {
+                Some(origins) => origins.invalidate(&bucket, path, time, signature, now),
+                None => Invalidated::NoService,
+            },
+            (_, Some(id)) => match clients {
+                Some(clients) => clients.invalidate(&id, path, time, signature, now),
+                None => Invalidated::NoService,
+            },
+            _ => return Response::text(404, "not found\n"),
+        };
+        match invalidated {
             Invalidated::Dropped => Response {
                 status: 204,
                 headers: Vec::new(),
@@ -136,7 +163,9 @@ impl Admin {
                 body: Bytes::new(),
             },
             Invalidated::Refused => Response::text(403, "forbidden\n"),
-            Invalidated::NoService => Response::text(404, "the node has no metadata service\n"),
+            Invalidated::NoService => {
+                Response::text(404, "the process takes these from its config\n")
+            }
         }
     }
 
@@ -155,16 +184,6 @@ impl Admin {
             _ => Response::text(404, "not found\n"),
         }
     }
-}
-
-/// Whether `name` could name a bucket: S3's letters, digits, dots and
-/// hyphens, or the underscores and capitals some origins allow.
-fn is_bucket_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 255
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
 /// How far a process has come toward serving.

@@ -40,8 +40,9 @@ pub struct Setup<'a> {
     pub transport: Transport,
     /// How often to scrape each process's metrics during runs, if at all.
     pub scrape: Option<Duration>,
-    /// The node looks up the bucket's origin in the reference metadata
-    /// service, in place of its config's `[origin]`.
+    /// The node looks up the bucket's origin, and the gateway the client,
+    /// in the reference metadata service, in place of `[origin]` and
+    /// `[[clients]]`.
     pub metadata: bool,
 }
 
@@ -50,8 +51,9 @@ pub struct Cluster {
     gateway: Child,
     metadata: Option<Child>,
     pub gateway_port: u16,
-    /// Where the node serves its metrics.
+    /// Where the node and the gateway serve their metrics.
     node_admin_port: u16,
+    gateway_admin_port: u16,
     pub slabs: PathBuf,
     /// A client config that trusts the gateway, when it serves TLS.
     pub tls: Option<Arc<ClientConfig>>,
@@ -114,13 +116,16 @@ impl Cluster {
         let node_admin = admin_table(node_admin_port);
         let gateway_admin = admin_table(gateway_admin_port);
         let extents = cache / extent;
+        let clients = match setup.metadata {
+            true => String::new(),
+            false => format!(
+                "[[clients]]\naccess_key_id = \"{ACCESS_KEY_ID}\"\n\
+                 secret_access_key = \"{SECRET_ACCESS_KEY}\"\ngrants = [{{ bucket = \"bench\" }}]\n"
+            ),
+        };
         let shared = format!(
             r#"
-[[clients]]
-access_key_id = "{ACCESS_KEY_ID}"
-secret_access_key = "{SECRET_ACCESS_KEY}"
-grants = [{{ bucket = "bench" }}]
-
+{clients}
 [cache]
 block_size = 1048576
 chunk_blocks = 16
@@ -141,11 +146,12 @@ nodes = [{{ id = 0, address = "127.0.0.1:{node_port}" }}]
              access_key_id = \"origin\"\nsecret_access_key = \"origin-secret\"\n"
         );
         let (metadata_port, metadata_reservation) = reserve_port();
-        let origins = match setup.metadata {
-            true => format!(
-                "[metadata]\nurl = \"http://127.0.0.1:{metadata_port}\"\ntoken = \"bench-token\"\n"
-            ),
-            false => format!("[origin]\n{origin}"),
+        let metadata_table = format!(
+            "[metadata]\nurl = \"http://127.0.0.1:{metadata_port}\"\ntoken = \"bench-token\"\n"
+        );
+        let (origins, gateway_metadata) = match setup.metadata {
+            true => (metadata_table.clone(), metadata_table),
+            false => (format!("[origin]\n{origin}"), String::new()),
         };
         let metadata = setup.metadata.then(|| {
             let config = dir.join("metadata.toml");
@@ -153,7 +159,10 @@ nodes = [{{ id = 0, address = "127.0.0.1:{node_port}" }}]
                 &config,
                 format!(
                     "listen = \"127.0.0.1:{metadata_port}\"\ntoken = \"bench-token\"\n\
-                     nodes = [\"127.0.0.1:{node_admin_port}\"]\n[default]\n{origin}"
+                     nodes = [\"127.0.0.1:{node_admin_port}\"]\n\
+                     gateways = [\"127.0.0.1:{gateway_admin_port}\"]\n[default]\n{origin}\n\
+                     [clients.{ACCESS_KEY_ID}]\nsecret_access_key = \"{SECRET_ACCESS_KEY}\"\n\
+                     grants = [{{ bucket = \"bench\" }}]\n"
                 ),
             )
             .unwrap();
@@ -188,7 +197,7 @@ data_dir = "{}"
         std::fs::write(
             &gateway_config,
             format!(
-                "{shared}\n[gateway]\nlisten = \"127.0.0.1:{gateway_port}\"\n{client_tls}{member_tls}{gateway_admin}"
+                "{gateway_metadata}{shared}\n[gateway]\nlisten = \"127.0.0.1:{gateway_port}\"\n{client_tls}{member_tls}{gateway_admin}"
             ),
         )
         .unwrap();
@@ -222,6 +231,7 @@ data_dir = "{}"
             metadata,
             gateway_port,
             node_admin_port,
+            gateway_admin_port,
             slabs: data.join("slabs"),
             tls,
             scraping,
@@ -264,17 +274,28 @@ data_dir = "{}"
         self.node_sample("s3accel_node_fill_bytes ")
     }
 
-    /// Lookups of the bucket's origin the node has made, when it asks the
-    /// metadata service.
-    pub fn lookups(&self) -> Option<u64> {
+    /// Lookups of the bucket's origin the node has made, and of the client
+    /// the gateway has, when they ask the metadata service.
+    pub fn lookups(&self) -> Option<(u64, u64)> {
         self.metadata.as_ref()?;
-        self.node_sample("s3accel_origin_lookups_total{result=\"found\"} ")
+        let found = |kind: &str| {
+            format!("s3accel_metadata_lookups_total{{kind=\"{kind}\",result=\"found\"}} ")
+        };
+        let origins = self.sample(self.node_admin_port, &found("origin"))?;
+        let clients = self.sample(self.gateway_admin_port, &found("client"))?;
+        Some((origins, clients))
     }
 
     /// The value of the node's metric sample that starts `series`.
     fn node_sample(&self, series: &str) -> Option<u64> {
+        self.sample(self.node_admin_port, series)
+    }
+
+    /// The value of the metric sample that starts `series` at the admin
+    /// listener on `port`.
+    fn sample(&self, port: u16, series: &str) -> Option<u64> {
         use std::io::{Read, Write};
-        let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.node_admin_port)).ok()?;
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
         let request = "GET /metrics HTTP/1.1\r\nhost: bench\r\nconnection: close\r\n\r\n";
         stream.write_all(request.as_bytes()).ok()?;
         let mut answer = String::new();
@@ -297,8 +318,10 @@ data_dir = "{}"
 
     /// Stops every process cleanly.
     pub fn stop(mut self) {
-        if let Some(lookups) = self.lookups() {
-            eprintln!("the node looked up the bucket's origin {lookups} times");
+        if let Some((origins, clients)) = self.lookups() {
+            eprintln!(
+                "the node looked up the bucket's origin {origins} times, and the gateway the client {clients}"
+            );
         }
         let metadata = self.metadata.as_mut();
         for child in [&mut self.gateway, &mut self.node]

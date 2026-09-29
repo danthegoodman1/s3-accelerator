@@ -7,8 +7,8 @@ use common::{
     Metadata, Server, admin, data_dir, invalidate, post_invalidation, sample, send, start_metadata,
     start_origin, start_queue,
 };
+use s3_accelerator::lookups::invalidation_signature;
 use s3_accelerator::metadata_service::{self, MetadataService, ServiceConfig};
-use s3_accelerator::origins::invalidation_signature;
 use s3_accelerator::sigv4;
 use std::time::{Duration, Instant};
 use tokio::task::LocalSet;
@@ -23,8 +23,8 @@ async fn get(server: &Server, path: &str) -> (u16, Vec<u8>) {
 /// Starts a server that asks the fake metadata service at `port`, whose
 /// `[metadata]` table also holds `settings`.
 async fn start_asking(port: u16, settings: &str) -> Server {
-    let origins = Metadata::table(port, settings);
-    Server::start_origins(&origins, &data_dir(), EVERY_BUCKET, "", CACHE).await
+    let tables = Metadata::table(port, settings);
+    Server::start_config(&tables, &data_dir(), "", CACHE).await
 }
 
 async fn scrape(server: &Server, name: &str, labels: &str) -> f64 {
@@ -127,7 +127,11 @@ async fn requests_waiting_on_a_bucket_share_one_lookup() {
             assert_eq!(metadata.lookups.get(), 1);
             assert_eq!(origin.requests.get(), 10);
             assert!(origin.keys.borrow().iter().all(|key| key == "looked-up"));
-            let found = scrape(&server, "s3accel_origin_lookups_total", "result=\"found\"");
+            let found = scrape(
+                &server,
+                "s3accel_metadata_lookups_total",
+                "kind=\"origin\",result=\"found\"",
+            );
             assert_eq!(found.await, 1.0);
         })
         .await;
@@ -175,19 +179,50 @@ async fn a_failing_service_leaves_requests_on_the_old_entry_until_the_grace_ends
             let lookups = metadata.lookups.get();
             assert_eq!(get(&server, "/bucket/k2").await.0, 200);
             assert_eq!(metadata.lookups.get(), lookups);
-            let stale = scrape(&server, "s3accel_origin_stale_total", "");
+            let stale = scrape(&server, "s3accel_metadata_stale_total", "kind=\"origin\"");
             assert_eq!(stale.await, 2.0);
             // Past the TTL and the grace, the bucket has no usable entry.
             tokio::time::sleep(Duration::from_millis(2_000)).await;
             assert_eq!(get(&server, "/bucket/k3").await.0, 503);
             let (status, _) = send(server.port, "PUT", "/bucket/k", "", &[], b"x".to_vec()).await;
             assert_eq!(status, 503);
-            let failed = scrape(&server, "s3accel_origin_lookups_total", "result=\"failed\"");
+            let failed = scrape(
+                &server,
+                "s3accel_metadata_lookups_total",
+                "kind=\"origin\",result=\"failed\"",
+            );
             assert!(failed.await >= 2.0);
             // Once the service answers again, so does the bucket.
             metadata.failing.set(false);
             tokio::time::sleep(Duration::from_secs(1)).await;
             assert_eq!(get(&server, "/bucket/k4").await.0, 200);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reads_past_the_cap_on_origin_lookups_get_503() {
+    LocalSet::new()
+        .run_until(async {
+            let (port, metadata) = start_metadata().await;
+            metadata.delay.set(Duration::from_millis(1_000));
+            let server = start_asking(port, "").await;
+            let over = 4;
+            let reads = (0..s3_accelerator::lookups::MAX_IN_FLIGHT + over).map(|index| {
+                let port = server.port;
+                tokio::task::spawn_local(async move {
+                    let path = format!("/missing-{index}/k");
+                    send(port, "GET", &path, "", &[], Vec::new()).await.0
+                })
+            });
+            let mut answers = Vec::new();
+            for read in reads.collect::<Vec<_>>() {
+                answers.push(read.await.unwrap());
+            }
+            let refused = answers.iter().filter(|status| **status == 503);
+            assert_eq!(refused.count(), over);
+            let unknown = answers.iter().filter(|status| **status == 404);
+            assert_eq!(unknown.count(), s3_accelerator::lookups::MAX_IN_FLIGHT);
         })
         .await;
 }
@@ -223,7 +258,7 @@ async fn a_bucket_the_service_stops_serving_stops_serving_its_cached_objects() {
             let origins = Metadata::table(port, "");
             let admit = "[cache.buckets.bucket]\nadmit_on_first_read = true";
             let dir = data_dir();
-            let server = Server::start_origins(&origins, &dir, EVERY_BUCKET, admit, CACHE).await;
+            let server = Server::start_config(&origins, &dir, admit, CACHE).await;
             assert_eq!(get(&server, "/bucket/k").await.0, 200);
             assert_eq!(get(&server, "/bucket/k").await.0, 200);
             assert_eq!(origin.requests.get(), 1);
@@ -311,7 +346,11 @@ async fn an_invalidation_moves_the_next_request_to_the_new_origin() {
             assert_eq!(second.requests.get(), 1);
             assert_eq!(*second.keys.borrow(), ["second"]);
             assert_eq!(metadata.lookups.get(), 2);
-            let taken = scrape(&server, "s3accel_origin_invalidations_total", "");
+            let taken = scrape(
+                &server,
+                "s3accel_metadata_invalidations_total",
+                "kind=\"origin\"",
+            );
             assert_eq!(taken.await, 1.0);
         })
         .await;
@@ -355,20 +394,22 @@ async fn a_forged_or_stale_invalidation_changes_nothing() {
             let server = start_asking(port, "").await;
             assert_eq!(get(&server, "/bucket/k0").await.0, 200);
             let now = sigv4::unix_now();
-            let forged = invalidation_signature("another-token", "bucket", now);
+            let path = "/origins/bucket/invalidate";
+            let forged = invalidation_signature("another-token", path, now);
             assert_eq!(
-                post_invalidation(server.admin_port, "bucket", now, &forged).await,
+                post_invalidation(server.admin_port, path, now, &forged).await,
                 403
             );
             let old = now - 301;
-            let stale = invalidation_signature(common::METADATA_TOKEN, "bucket", old);
+            let stale = invalidation_signature(common::METADATA_TOKEN, path, old);
             assert_eq!(
-                post_invalidation(server.admin_port, "bucket", old, &stale).await,
+                post_invalidation(server.admin_port, path, old, &stale).await,
                 403
             );
-            let other = invalidation_signature(common::METADATA_TOKEN, "other", now);
+            let other = "/origins/other/invalidate";
+            let other = invalidation_signature(common::METADATA_TOKEN, other, now);
             assert_eq!(
-                post_invalidation(server.admin_port, "bucket", now, &other).await,
+                post_invalidation(server.admin_port, path, now, &other).await,
                 403
             );
             assert_eq!(get(&server, "/bucket/k1").await.0, 200);
@@ -410,8 +451,7 @@ async fn the_event_queue_signs_with_its_own_credentials() {
                 "#,
                 Metadata::table(port, "")
             );
-            let _server =
-                Server::start_origins(&origins, &data_dir(), EVERY_BUCKET, "", CACHE).await;
+            let _server = Server::start_config(&origins, &data_dir(), "", CACHE).await;
             common::eventually(|| !queue.keys.borrow().is_empty()).await;
             assert!(queue.keys.borrow().iter().all(|key| key == "queue-key"));
         })
@@ -440,6 +480,9 @@ async fn a_reload_leaves_a_node_that_takes_no_invalidation_after_three_tries() {
                     region = "us-east-1"
                     access_key_id = "default"
                     secret_access_key = "default-secret"
+                    [clients.reader]
+                    secret_access_key = "reader-secret"
+                    grants = [{{ bucket = "*" }}]
                     "#,
                     common::METADATA_TOKEN
                 ))
@@ -454,7 +497,7 @@ async fn a_reload_leaves_a_node_that_takes_no_invalidation_after_three_tries() {
             let (other_port, _other) = start_origin().await;
             let reloading = Instant::now();
             let changed = service.reload(config(other_port)).await.unwrap();
-            assert_eq!(changed, ["a", "b", "c"]);
+            assert_eq!(changed.buckets, ["a", "b", "c"]);
             // Two pauses between three tries, for the first bucket alone.
             assert!(reloading.elapsed() < Duration::from_secs(3));
         })
@@ -487,6 +530,9 @@ async fn a_reload_moves_a_bucket_to_another_origin_before_its_ttl_ends() {
                     region = "us-east-1"
                     access_key_id = "bucket"
                     secret_access_key = "bucket-secret"
+                    [clients.reader]
+                    secret_access_key = "reader-secret"
+                    grants = [{{ bucket = "*" }}]
                     "#,
                     common::METADATA_TOKEN
                 ))
@@ -502,7 +548,7 @@ async fn a_reload_moves_a_bucket_to_another_origin_before_its_ttl_ends() {
                 .reload(config(second_port, server.admin_port))
                 .await
                 .unwrap();
-            assert_eq!(changed, ["bucket"]);
+            assert_eq!(changed.buckets, ["bucket"]);
             assert_eq!(get(&server, "/bucket/k1").await.0, 200);
             assert_eq!(*second.keys.borrow(), ["bucket"]);
             assert_eq!(get(&server, "/elsewhere/k1").await.0, 200);

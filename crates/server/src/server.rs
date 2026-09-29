@@ -3,12 +3,14 @@
 //! through a storage node, which signs them for S3.
 
 use crate::admin::{self, Admin};
-use crate::config::{Access, Client, Config};
+use crate::clients::{Clients, Credential};
+use crate::config::{Access, Config};
 use crate::disk::Disk;
 use crate::gateway_engine::{Event, GatewayEngine, SharedGateway};
 use crate::http::{Connection, Framing, RequestHead, Response};
 use crate::http::{etag_condition, format_content_range, header, parse_range, split_path};
 use crate::log;
+use crate::lookups::Unresolved;
 use crate::membership_engine::{self, GossipKey};
 use crate::metrics::{Link, Metrics, NodeFailure, Operation, Side};
 use crate::node_engine::{self, NodeEngine};
@@ -44,7 +46,7 @@ struct Context {
     metrics: Rc<Metrics>,
     /// The state that gives each client request a random ID.
     request_ids: Cell<u64>,
-    clients: Vec<Client>,
+    clients: Rc<Clients>,
     /// Domains the gateway takes virtual-hosted-style requests for.
     domains: Vec<String>,
 }
@@ -144,6 +146,8 @@ pub async fn run_with(
     };
     let peers = Peers::new(config.addresses(), secret.clone(), connector);
     let admin = Admin::new(config.node.is_some());
+    // One connection pool for origins and the metadata service.
+    let http = origin::client();
     let metrics = admin.metrics.clone();
     let admin_listener = listeners
         .admin
@@ -189,7 +193,7 @@ pub async fn run_with(
                 }
                 None => None,
             };
-            let origins = Rc::new(Origins::new(&config, metrics.clone()));
+            let origins = Rc::new(Origins::new(&config, http.clone(), metrics.clone()));
             admin.origins(origins.clone());
             let node_config = config.cache.node_config();
             let opening = Instant::now();
@@ -310,11 +314,13 @@ pub async fn run_with(
             .as_ref()
             .map(|gateway| gateway.domains.clone())
             .unwrap_or_default();
+        let credentials = Rc::new(Clients::new(&config, http.clone(), metrics.clone()));
+        admin.clients(credentials.clone());
         let context = Rc::new(Context {
             gateway,
             metrics,
             request_ids: Cell::new(random_seed()),
-            clients: config.clients,
+            clients: credentials,
             domains,
         });
         serve_clients(listener, context, clients, stopped_signal(stopped)).await?;
@@ -464,9 +470,9 @@ async fn serve_request(
     // The signature covers the head, so a request is authenticated and
     // authorized before its body is read. A request answered before its
     // body is read closes the connection.
-    let authorized = authenticate(head, context).and_then(|client| {
+    let authorized = authenticate(head, context).await.and_then(|client| {
         let head = normalize(head, &context.domains);
-        authorize(&head, client).map(|()| (head, client))
+        authorize(&head, &client).map(|()| (head, client))
     });
     let reusable = match authorized {
         Err(response) => {
@@ -475,7 +481,7 @@ async fn serve_request(
             keep_alive
         }
         Ok((normal, client)) => {
-            handle(connection, &normal, client, len, context).await? && head.keep_alive
+            handle(connection, &normal, &client, len, context).await? && head.keep_alive
         }
     };
     // The client may still be sending a body; draining it lets the client
@@ -488,7 +494,7 @@ async fn serve_request(
 
 /// The client that signed the request's head, in its `Authorization`
 /// header or, for a presigned URL, its query.
-fn authenticate<'c>(head: &RequestHead, context: &'c Context) -> Result<&'c Client, Response> {
+async fn authenticate(head: &RequestHead, context: &Context) -> Result<Rc<Credential>, Response> {
     let signed_header = header(&head.headers, "authorization").is_some();
     if !signed_header && !sigv4::is_presigned(&head.query) {
         return Err(auth_error(AuthError::Missing));
@@ -509,14 +515,22 @@ fn authenticate<'c>(head: &RequestHead, context: &'c Context) -> Result<&'c Clie
         headers: &head.headers,
         payload_hash,
     };
-    let lookup = |id: &str| {
-        let client = context
-            .clients
-            .iter()
-            .find(|client| client.access_key_id == id)?;
-        Some((client, client.secret_access_key.as_str()))
+    // The request's form, time and scope pass before its client is looked
+    // up, so one that fails them costs no lookup.
+    let signed = sigv4::signed(&signable, sigv4::unix_now()).map_err(auth_error)?;
+    let client = match context.clients.find(signed.access_key_id()).await {
+        Ok(client) => client,
+        Err(Unresolved::Unknown) => return Err(auth_error(AuthError::UnknownAccessKey)),
+        Err(Unresolved::Unavailable) => {
+            let message = "The metadata service is unavailable. Please try again.";
+            return Err(error(503, "ServiceUnavailable", message));
+        }
+        Err(Unresolved::Busy) => {
+            return Err(error(503, "SlowDown", "Please reduce your request rate."));
+        }
     };
-    sigv4::verify(&signable, sigv4::unix_now(), lookup).map_err(auth_error)
+    signed.check(&*client).map_err(auth_error)?;
+    Ok(client)
 }
 
 /// The request as the gateway serves it once its signature checks out:
@@ -637,7 +651,7 @@ fn need(head: &RequestHead, key: &str) -> Need {
 
 /// Whether the client's grants cover what the request does, and a copy's
 /// source.
-fn authorize(head: &RequestHead, client: &Client) -> Result<(), Response> {
+fn authorize(head: &RequestHead, client: &Credential) -> Result<(), Response> {
     let (bucket, key) = split_path(&head.path);
     let allowed = match need(head, &key) {
         Need::Invalid(reason) => return Err(error(400, "InvalidArgument", reason)),
@@ -664,7 +678,7 @@ fn authorize(head: &RequestHead, client: &Client) -> Result<(), Response> {
 async fn handle(
     connection: &mut Connection,
     head: &RequestHead,
-    client: &Client,
+    client: &Credential,
     len: u64,
     context: &Context,
 ) -> io::Result<bool> {
@@ -1002,7 +1016,7 @@ impl Presenting {
 /// A request the gateway passes to S3 through a storage node.
 struct Passing<'a> {
     head: &'a RequestHead,
-    client: &'a Client,
+    client: &'a Credential,
     payload_hash: &'a str,
     /// The body's SHA-256, when the client signed it.
     digest: Option<String>,

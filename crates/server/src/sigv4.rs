@@ -180,67 +180,129 @@ fn decoded_query(query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Checks a client's signed request: its `Authorization` header, or a
-/// presigned URL's query. `lookup` finds the client with an access key,
-/// and its secret; `now` is Unix seconds.
-pub fn verify<'c, C: ?Sized>(
-    request: &Signable,
-    now: i64,
-    lookup: impl Fn(&str) -> Option<(&'c C, &'c str)>,
-) -> Result<&'c C, AuthError> {
-    if let Some(value) = header(request.headers, "authorization") {
-        let authorization = Authorization::parse(value)?;
-        let amz_date =
-            header(request.headers, "x-amz-date").ok_or(AuthError::Malformed("x-amz-date"))?;
-        let signed_at = parse_amz_date(amz_date).ok_or(AuthError::Malformed("x-amz-date"))?;
-        if (now - signed_at).abs() > MAX_SKEW {
-            return Err(AuthError::Expired);
-        }
-        return check(request, &authorization, amz_date, lookup);
-    }
-    if !is_presigned(request.query) {
-        return Err(AuthError::Missing);
-    }
-    let authorization = Authorization::from_query(request.query)?;
-    let parameters = decoded_query(request.query);
-    let get = |name: &str| {
-        parameters
-            .iter()
-            .find(|(parameter, _)| parameter == name)
-            .map(|(_, value)| value.as_str())
-    };
-    let amz_date = get("X-Amz-Date").ok_or(AuthError::Malformed("X-Amz-Date"))?;
-    let signed_at = parse_amz_date(amz_date).ok_or(AuthError::Malformed("X-Amz-Date"))?;
-    let expires = get("X-Amz-Expires")
-        .and_then(|expires| expires.parse::<i64>().ok())
-        .filter(|expires| (1..=MAX_EXPIRES).contains(expires))
-        .ok_or(AuthError::Malformed("X-Amz-Expires"))?;
-    // Valid from its signing, give or take the skew, until it expires.
-    if now + MAX_SKEW < signed_at || now > signed_at + expires {
-        return Err(AuthError::Expired);
-    }
-    // The signature covers every parameter but itself, and not the body.
-    let query: Vec<&str> = request
-        .query
-        .split('&')
-        .filter(|pair| pair.split('=').next() != Some("X-Amz-Signature"))
-        .collect();
-    let unsigned = Signable {
-        query: &query.join("&"),
-        payload_hash: UNSIGNED_PAYLOAD,
-        ..*request
-    };
-    check(&unsigned, &authorization, amz_date, lookup)
+/// What checks a client's signatures: the key of each date it signs on,
+/// from which SigV4 derives the rest.
+pub trait DateKeys {
+    fn date_key(&self, date: &str) -> Option<Vec<u8>>;
 }
 
-/// Checks `request`'s signature against the one `authorization` names.
-fn check<'c, C: ?Sized>(
-    request: &Signable,
-    authorization: &Authorization,
-    amz_date: &str,
-    lookup: impl Fn(&str) -> Option<(&'c C, &'c str)>,
-) -> Result<&'c C, AuthError> {
-    if !amz_date.starts_with(&authorization.date) || authorization.service != "s3" {
+/// A secret derives every date's key.
+impl DateKeys for str {
+    fn date_key(&self, date: &str) -> Option<Vec<u8>> {
+        Some(date_key(self, date))
+    }
+}
+
+/// The key of `date`, `YYYYMMDD`: the HMAC-SHA256 of the date under
+/// `AWS4` and the secret.
+pub fn date_key(secret: &str, date: &str) -> Vec<u8> {
+    hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes())
+}
+
+/// A signed request whose form, time and scope check out, which only its
+/// client's key has left to check.
+pub struct Signed<'r> {
+    request: &'r Signable<'r>,
+    /// A presigned URL's query without its signature, which is what the
+    /// signature covers.
+    presigned_query: Option<String>,
+    authorization: Authorization,
+    amz_date: String,
+}
+
+impl Signed<'_> {
+    pub fn access_key_id(&self) -> &str {
+        &self.authorization.access_key_id
+    }
+
+    /// Checks the signature with the key of its date. A client whose keys
+    /// stop short of that date can't have signed it.
+    pub fn check<C: DateKeys + ?Sized>(&self, client: &C) -> Result<(), AuthError> {
+        let authorization = &self.authorization;
+        let key = client
+            .date_key(&authorization.date)
+            .ok_or(AuthError::SignatureMismatch)?;
+        let request = match &self.presigned_query {
+            Some(query) => Signable {
+                query,
+                payload_hash: UNSIGNED_PAYLOAD,
+                ..*self.request
+            },
+            None => Signable { ..*self.request },
+        };
+        let signed_headers: Vec<&str> = authorization
+            .signed_headers
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let expected = keyed_signature(
+            &request,
+            &signed_headers,
+            &self.amz_date,
+            (&authorization.region, "s3"),
+            &key,
+        );
+        if !constant_time_eq(expected.as_bytes(), authorization.signature.as_bytes()) {
+            return Err(AuthError::SignatureMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Checks everything of a client's signed request but its signature: its
+/// `Authorization` header, or a presigned URL's query, its time against
+/// `now`, in Unix seconds, and its scope, so a request that fails them
+/// costs no lookup of its client.
+pub fn signed<'r>(request: &'r Signable<'r>, now: i64) -> Result<Signed<'r>, AuthError> {
+    let (authorization, amz_date, presigned_query) = match header(request.headers, "authorization")
+    {
+        Some(value) => {
+            let authorization = Authorization::parse(value)?;
+            let amz_date =
+                header(request.headers, "x-amz-date").ok_or(AuthError::Malformed("x-amz-date"))?;
+            let signed_at = parse_amz_date(amz_date).ok_or(AuthError::Malformed("x-amz-date"))?;
+            if (now - signed_at).abs() > MAX_SKEW {
+                return Err(AuthError::Expired);
+            }
+            (authorization, amz_date.to_string(), None)
+        }
+        None if is_presigned(request.query) => {
+            let authorization = Authorization::from_query(request.query)?;
+            let parameters = decoded_query(request.query);
+            let get = |name: &str| {
+                parameters
+                    .iter()
+                    .find(|(parameter, _)| parameter == name)
+                    .map(|(_, value)| value.as_str())
+            };
+            let amz_date = get("X-Amz-Date").ok_or(AuthError::Malformed("X-Amz-Date"))?;
+            let signed_at = parse_amz_date(amz_date).ok_or(AuthError::Malformed("X-Amz-Date"))?;
+            let expires = get("X-Amz-Expires")
+                .and_then(|expires| expires.parse::<i64>().ok())
+                .filter(|expires| (1..=MAX_EXPIRES).contains(expires))
+                .ok_or(AuthError::Malformed("X-Amz-Expires"))?;
+            // Valid from its signing, give or take the skew, until it
+            // expires.
+            if now + MAX_SKEW < signed_at || now > signed_at + expires {
+                return Err(AuthError::Expired);
+            }
+            // The signature covers every parameter but itself, and not the
+            // body.
+            let query: Vec<&str> = request
+                .query
+                .split('&')
+                .filter(|pair| pair.split('=').next() != Some("X-Amz-Signature"))
+                .collect();
+            (authorization, amz_date.to_string(), Some(query.join("&")))
+        }
+        None => return Err(AuthError::Missing),
+    };
+    // The key and the string to sign both take the scope's date, which is
+    // the signature's.
+    let dated = authorization.date.len() == 8
+        && authorization.date.bytes().all(|byte| byte.is_ascii_digit())
+        && amz_date.starts_with(&authorization.date);
+    if !dated || authorization.service != "s3" {
         return Err(AuthError::Malformed("Credential"));
     }
     if !authorization
@@ -257,23 +319,25 @@ fn check<'c, C: ?Sized>(
     }) {
         return Err(AuthError::UnsignedHeader(name.to_ascii_lowercase()));
     }
-    let (client, secret) =
-        lookup(&authorization.access_key_id).ok_or(AuthError::UnknownAccessKey)?;
-    let signed_headers: Vec<&str> = authorization
-        .signed_headers
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let expected = signature(
+    Ok(Signed {
         request,
-        &signed_headers,
+        presigned_query,
+        authorization,
         amz_date,
-        (&authorization.region, "s3"),
-        secret,
-    );
-    if !constant_time_eq(expected.as_bytes(), authorization.signature.as_bytes()) {
-        return Err(AuthError::SignatureMismatch);
-    }
+    })
+}
+
+/// Checks a client's signed request: its `Authorization` header, or a
+/// presigned URL's query. `lookup` finds the client with an access key;
+/// `now` is Unix seconds.
+pub fn verify<'c, C: DateKeys + ?Sized>(
+    request: &Signable,
+    now: i64,
+    lookup: impl Fn(&str) -> Option<&'c C>,
+) -> Result<&'c C, AuthError> {
+    let signed = signed(request, now)?;
+    let client = lookup(signed.access_key_id()).ok_or(AuthError::UnknownAccessKey)?;
+    signed.check(client)?;
     Ok(client)
 }
 
@@ -399,8 +463,21 @@ fn signature(
     request: &Signable,
     signed_headers: &[&str],
     amz_date: &str,
-    (region, service): (&str, &str),
+    scope: (&str, &str),
     secret: &str,
+) -> String {
+    let date = &amz_date[..amz_date.len().min(8)];
+    let key = date_key(secret, date);
+    keyed_signature(request, signed_headers, amz_date, scope, &key)
+}
+
+/// The signature of `request` from the key of its date.
+fn keyed_signature(
+    request: &Signable,
+    signed_headers: &[&str],
+    amz_date: &str,
+    (region, service): (&str, &str),
+    date_key: &[u8],
 ) -> String {
     let canonical = canonical_request(request, signed_headers);
     let date = &amz_date[..amz_date.len().min(8)];
@@ -409,7 +486,7 @@ fn signature(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         hex::encode(Sha256::digest(canonical.as_bytes()))
     );
-    let mut key = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+    let mut key = date_key.to_vec();
     for part in [region, service, "aws4_request"] {
         key = hmac(&key, part.as_bytes());
     }
@@ -598,8 +675,60 @@ mod tests {
             headers: &headers,
             payload_hash: UNSIGNED_PAYLOAD,
         };
-        let lookup = |id: &str| (id == "AKIAIOSFODNN7EXAMPLE").then_some((&(), SECRET));
+        let lookup = |id: &str| (id == "AKIAIOSFODNN7EXAMPLE").then_some(SECRET);
         verify(&request, now, lookup).map(|_| ())
+    }
+
+    /// Keys of their dates alone check signatures: the AWS examples' date
+    /// checks out, and another fails.
+    struct Dates(Vec<(&'static str, Vec<u8>)>);
+
+    impl DateKeys for Dates {
+        fn date_key(&self, date: &str) -> Option<Vec<u8>> {
+            let key = self.0.iter().find(|(held, _)| *held == date)?;
+            Some(key.1.clone())
+        }
+    }
+
+    #[test]
+    fn a_dates_key_checks_its_signatures_without_the_secret() {
+        let headers = headers(&[("Host", "examplebucket.s3.amazonaws.com")]);
+        let request = Signable {
+            method: "GET",
+            path: "/test.txt",
+            query: PRESIGNED,
+            headers: &headers,
+            payload_hash: UNSIGNED_PAYLOAD,
+        };
+        let now = parse_amz_date("20130524T000000Z").unwrap() + 60;
+        let held = Dates(vec![("20130524", date_key(SECRET, "20130524"))]);
+        let lookup = |id: &str| (id == "AKIAIOSFODNN7EXAMPLE").then_some(&held);
+        assert!(verify(&request, now, lookup).is_ok());
+        let other = Dates(vec![("20130523", date_key(SECRET, "20130523"))]);
+        let lookup = |id: &str| (id == "AKIAIOSFODNN7EXAMPLE").then_some(&other);
+        assert_eq!(
+            verify(&request, now, lookup).map(|_| ()),
+            Err(AuthError::SignatureMismatch)
+        );
+        let signed = signed(&request, now).unwrap();
+        assert_eq!(signed.access_key_id(), "AKIAIOSFODNN7EXAMPLE");
+    }
+
+    #[test]
+    fn a_scope_without_a_whole_date_is_malformed() {
+        let headers = headers(&[("Host", "examplebucket.s3.amazonaws.com")]);
+        let request = Signable {
+            method: "GET",
+            path: "/test.txt",
+            query: &PRESIGNED.replace("%2F20130524%2F", "%2F2013%2F"),
+            headers: &headers,
+            payload_hash: UNSIGNED_PAYLOAD,
+        };
+        let now = parse_amz_date("20130524T000000Z").unwrap() + 60;
+        assert_eq!(
+            signed(&request, now).map(|_| ()),
+            Err(AuthError::Malformed("Credential"))
+        );
     }
 
     #[test]
@@ -636,7 +765,7 @@ mod tests {
             headers: &headers,
             payload_hash: UNSIGNED_PAYLOAD,
         };
-        let lookup = |id: &str| (id == "AKIAIOSFODNN7EXAMPLE").then_some((&(), SECRET));
+        let lookup = |id: &str| (id == "AKIAIOSFODNN7EXAMPLE").then_some(SECRET);
         let signed = parse_amz_date("20130524T000000Z").unwrap();
         assert_eq!(
             verify(&request, signed + 60, lookup).map(|_| ()),
@@ -725,8 +854,8 @@ mod tests {
             headers: &headers,
             payload_hash: UNSIGNED_PAYLOAD,
         };
-        let lookup = |key: &str| (key == "AKID").then_some(("AKID", SECRET));
-        assert_eq!(verify(&request, now, lookup), Ok("AKID"));
+        let lookup = |key: &str| (key == "AKID").then_some(SECRET);
+        assert_eq!(verify(&request, now, lookup), Ok(SECRET));
         assert_eq!(
             verify(&request, now + 16 * 60, lookup),
             Err(AuthError::Expired)
@@ -740,7 +869,7 @@ mod tests {
             Err(AuthError::SignatureMismatch)
         );
         assert_eq!(
-            verify(&request, now, |_| None::<(&str, &str)>),
+            verify(&request, now, |_| None::<&str>),
             Err(AuthError::UnknownAccessKey)
         );
     }

@@ -12,9 +12,10 @@
 use crate::disk::{Disk, Entry};
 use crate::http::{Connection, Framing, Response, header, split_path};
 use crate::log;
+use crate::lookups::Unresolved;
 use crate::metrics::{Link, Metrics, S3Kind};
 use crate::origin::{self, OriginBody};
-use crate::origins::{Origins, Unresolved};
+use crate::origins::Origins;
 use crate::passthrough;
 use crate::peers::{Exchanged, Peers};
 use crate::protocol::{self, Forward, Hint, NodeAnswer, NodeRequest, Versions};
@@ -1047,7 +1048,9 @@ async fn fetch(engine: SharedNode, origin: OriginRequestId, request: Request, st
             (client.read(&request, hold).await, true)
         }
         Err(Unresolved::Unknown) => (origin::Reply::no_such_bucket(), false),
-        Err(Unresolved::Unavailable) => (origin::Reply::failed(), false),
+        // A gateway takes any 5xx from a node as the node's failure, and
+        // answers its client 503 itself.
+        Err(Unresolved::Unavailable | Unresolved::Busy) => (origin::Reply::failed(), false),
     };
     let (work, passing) = {
         let mut this = engine.borrow_mut();
@@ -1692,6 +1695,7 @@ async fn forward_to_s3(
         false => origins.of(&bucket).await.map_err(|reason| match reason {
             Unresolved::Unknown => (404, "NoSuchBucket"),
             Unresolved::Unavailable => (503, "ServiceUnavailable"),
+            Unresolved::Busy => (503, "SlowDown"),
         }),
     };
     let origin = match origin {

@@ -24,7 +24,7 @@ access_key_id = "..."
 secret_access_key = "..."
 ```
 
-Or nodes look up each bucket's origin in a metadata service, which answers `GET /buckets/<bucket>` with the origin and how long to keep it, and pushes changes to each node's admin listener:
+Or a metadata service names every bucket's origin and every client's grants: nodes look up origins, gateways look up clients by access key ID, and the service pushes changes to each process's admin listener. Gateways then check signatures with keys the service derives for each date, and hold no client's secret:
 
 ```toml
 [metadata]
@@ -32,7 +32,7 @@ url = "https://metadata.example.com"
 token = "..."
 ```
 
-`s3-accelerator-metadata CONFIG` runs a reference service that serves origins from a TOML file and sends nodes the buckets whose origins change when it reloads the file on `SIGHUP`; `scripts/cluster start --metadata` runs one. [spec.md](spec.md) describes the service's API.
+`s3-accelerator-metadata CONFIG` runs a reference service that serves origins and clients from a TOML file, and pushes each bucket and client that changes when it reloads the file on `SIGHUP`; `scripts/cluster start --metadata` runs one. [spec.md](spec.md) describes the service's API.
 
 To have S3 tell the cache of changes made elsewhere, send the bucket's event notifications to an SQS queue, directly or through SNS, and name the queue in each node's `[events]` table:
 
@@ -83,7 +83,7 @@ cargo run -p s3-accelerator -- config/local.toml &
 CONFORMANCE_ENDPOINT=http://127.0.0.1:9000 cargo test -p s3-accelerator-conformance -- --ignored
 ```
 
-`scripts/cluster start [NODES]` runs a gateway and nodes as separate processes in front of the same s3proxy, with the gateway on the same port; `scripts/cluster stop` shuts them down. With `--metadata`, nodes look up every bucket's origin in the reference metadata service. With `--tls`, the gateway serves HTTPS with a self-signed certificate, and every process reaches nodes over mutual TLS:
+`scripts/cluster start [NODES]` runs a gateway and nodes as separate processes in front of the same s3proxy, with the gateway on the same port; `scripts/cluster stop` shuts them down. With `--metadata`, nodes look up every bucket's origin, and the gateway every client, in the reference metadata service. With `--tls`, the gateway serves HTTPS with a self-signed certificate, and every process reaches nodes over mutual TLS:
 
 ```console
 scripts/cluster start 3 --tls

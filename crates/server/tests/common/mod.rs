@@ -510,16 +510,26 @@ pub fn sample(scrape: &str, name: &str, labels: &str) -> f64 {
 /// The token the fake metadata service takes, which signs invalidations.
 pub const METADATA_TOKEN: &str = "metadata-token";
 
-/// A fake metadata service, which answers each lookup from `buckets`.
+/// A fake metadata service, which answers each lookup from `buckets` and
+/// `clients`. It serves the `reader` key the harness signs with, with
+/// write access to every bucket.
 pub struct Metadata {
+    /// Lookups of buckets.
     pub lookups: Cell<u64>,
     /// Each bucket's origin port and access key.
     pub buckets: RefCell<BTreeMap<String, (u16, String)>>,
     pub ttl_ms: Cell<u64>,
-    /// Answer every lookup 503.
+    /// Answer every bucket's lookup 503.
     pub failing: Cell<bool>,
-    /// How long it waits before each answer, which it settles on arrival.
+    /// How long it waits before each bucket's answer, which it settles on
+    /// arrival.
     pub delay: Cell<Duration>,
+    /// The same for clients: each one's secret and grants, as JSON.
+    pub client_lookups: Cell<u64>,
+    pub clients: RefCell<BTreeMap<String, (String, serde_json::Value)>>,
+    pub client_ttl_ms: Cell<u64>,
+    pub clients_failing: Cell<bool>,
+    pub client_delay: Cell<Duration>,
 }
 
 impl Metadata {
@@ -530,11 +540,65 @@ impl Metadata {
             .insert(bucket.to_string(), (port, key.to_string()));
     }
 
-    /// The `[metadata]` table of a node that asks this service.
+    /// Serves the client `id` with `secret` and `grants`, a JSON list.
+    pub fn serve_client(&self, id: &str, secret: &str, grants: serde_json::Value) {
+        self.clients
+            .borrow_mut()
+            .insert(id.to_string(), (secret.to_string(), grants));
+    }
+
+    /// The `[metadata]` table of a process that asks this service.
     pub fn table(port: u16, extra: &str) -> String {
         format!(
             "[metadata]\nurl = \"http://127.0.0.1:{port}\"\ntoken = \"{METADATA_TOKEN}\"\n{extra}\n"
         )
+    }
+
+    /// Its answer at `path`, and how long it waits before sending it.
+    fn answer(&self, path: &str) -> (u16, String, Duration) {
+        let (kind, name) = s3_accelerator::http::split_path(path);
+        if kind == "buckets" {
+            self.lookups.set(self.lookups.get() + 1);
+            let served = self.buckets.borrow().get(&name).cloned();
+            let (status, body) = match (self.failing.get(), served) {
+                (true, _) => (503, String::new()),
+                (false, None) => (404, String::new()),
+                (false, Some((port, key))) => {
+                    let answer = serde_json::json!({
+                        "endpoint": format!("http://127.0.0.1:{port}"),
+                        "region": "us-east-1",
+                        "access_key_id": key,
+                        "secret_access_key": format!("{key}-secret"),
+                        "ttl_ms": self.ttl_ms.get(),
+                    });
+                    (200, answer.to_string())
+                }
+            };
+            return (status, body, self.delay.get());
+        }
+        self.client_lookups.set(self.client_lookups.get() + 1);
+        let served = self.clients.borrow().get(&name).cloned();
+        let (status, body) = match (self.clients_failing.get(), served) {
+            (true, _) => (503, String::new()),
+            (false, None) => (404, String::new()),
+            (false, Some((secret, grants))) => {
+                let now = sigv4::unix_now();
+                let keys: serde_json::Map<String, serde_json::Value> = (-7..=1)
+                    .map(|days: i64| {
+                        let date = sigv4::format_amz_date(now + days * 86_400)[..8].to_string();
+                        let key = hex::encode(sigv4::date_key(&secret, &date));
+                        (date, serde_json::Value::String(key))
+                    })
+                    .collect();
+                let answer = serde_json::json!({
+                    "grants": grants,
+                    "signing_keys": keys,
+                    "ttl_ms": self.client_ttl_ms.get(),
+                });
+                (200, answer.to_string())
+            }
+        };
+        (status, body, self.client_delay.get())
     }
 }
 
@@ -549,7 +613,17 @@ pub async fn start_metadata() -> (u16, Rc<Metadata>) {
         ttl_ms: Cell::new(60_000),
         failing: Cell::default(),
         delay: Cell::default(),
+        client_lookups: Cell::default(),
+        clients: RefCell::default(),
+        client_ttl_ms: Cell::new(60_000),
+        clients_failing: Cell::default(),
+        client_delay: Cell::default(),
     });
+    metadata.serve_client(
+        "reader",
+        "reader-secret",
+        serde_json::json!([{ "bucket": "*" }]),
+    );
     let service = metadata.clone();
     tokio::task::spawn_local(async move {
         loop {
@@ -558,27 +632,13 @@ pub async fn start_metadata() -> (u16, Rc<Metadata>) {
             tokio::task::spawn_local(async move {
                 let mut connection = Connection::new(stream);
                 while let Ok(Some(head)) = connection.read_head().await {
-                    service.lookups.set(service.lookups.get() + 1);
                     let authorized = head.header("authorization")
                         == Some(format!("Bearer {METADATA_TOKEN}").as_str());
-                    let bucket = head.path.strip_prefix("/buckets/").unwrap_or_default();
-                    let served = service.buckets.borrow().get(bucket).cloned();
-                    let (status, body) = match (authorized, service.failing.get(), served) {
-                        (false, _, _) => (401, String::new()),
-                        (true, true, _) => (503, String::new()),
-                        (true, false, None) => (404, String::new()),
-                        (true, false, Some((port, key))) => {
-                            let answer = serde_json::json!({
-                                "endpoint": format!("http://127.0.0.1:{port}"),
-                                "region": "us-east-1",
-                                "access_key_id": key,
-                                "secret_access_key": format!("{key}-secret"),
-                                "ttl_ms": service.ttl_ms.get(),
-                            });
-                            (200, answer.to_string())
-                        }
+                    let (status, body, delay) = match authorized {
+                        true => service.answer(&head.path),
+                        false => (401, String::new(), Duration::ZERO),
                     };
-                    tokio::time::sleep(service.delay.get()).await;
+                    tokio::time::sleep(delay).await;
                     let response = Response {
                         status,
                         headers: vec![("content-type".into(), "application/json".into())],
@@ -595,13 +655,11 @@ pub async fn start_metadata() -> (u16, Rc<Metadata>) {
     (port, metadata)
 }
 
-/// Sends the admin listener at `port` an invalidation of `bucket` stamped
+/// Sends the admin listener at `port` an invalidation at `path`, stamped
 /// `time`, with `signature`, and returns its status.
-pub async fn post_invalidation(port: u16, bucket: &str, time: i64, signature: &str) -> u16 {
+pub async fn post_invalidation(port: u16, path: &str, time: i64, signature: &str) -> u16 {
     reqwest::Client::new()
-        .post(format!(
-            "http://127.0.0.1:{port}/origins/{bucket}/invalidate"
-        ))
+        .post(format!("http://127.0.0.1:{port}{path}"))
         .header("x-accel-time", time.to_string())
         .header("x-accel-signature", signature)
         .send()
@@ -611,12 +669,24 @@ pub async fn post_invalidation(port: u16, bucket: &str, time: i64, signature: &s
         .as_u16()
 }
 
-/// Sends a signed invalidation of `bucket`, stamped now, and returns the
-/// status.
+/// Sends a signed invalidation of `bucket`'s origin, stamped now, and
+/// returns the status.
 pub async fn invalidate(port: u16, bucket: &str) -> u16 {
+    let bucket = sigv4::encode(bucket);
+    signed_invalidation(port, &format!("/origins/{bucket}/invalidate")).await
+}
+
+/// Sends a signed invalidation of the client `id`, stamped now, and
+/// returns the status.
+pub async fn invalidate_client(port: u16, id: &str) -> u16 {
+    let id = sigv4::encode(id);
+    signed_invalidation(port, &format!("/clients/{id}/invalidate")).await
+}
+
+async fn signed_invalidation(port: u16, path: &str) -> u16 {
     let time = sigv4::unix_now();
-    let signature = s3_accelerator::origins::invalidation_signature(METADATA_TOKEN, bucket, time);
-    post_invalidation(port, bucket, time, &signature).await
+    let signature = s3_accelerator::lookups::invalidation_signature(METADATA_TOKEN, path, time);
+    post_invalidation(port, path, time, &signature).await
 }
 
 /// A server running on this `LocalSet`.
@@ -656,8 +726,8 @@ impl Server {
         Server::start_origins(&origins, dir, grants, extra, cache).await
     }
 
-    /// Starts a server whose origins `origins` names: its `[origin]`,
-    /// `[origins]` or `[metadata]` tables.
+    /// Starts a server whose origins `origins` names, `[origin]` or
+    /// `[origins]` tables, for the `reader` client with `grants`.
     pub async fn start_origins(
         origins: &str,
         dir: &Path,
@@ -665,17 +735,22 @@ impl Server {
         extra: &str,
         cache: &str,
     ) -> Server {
+        let clients = format!(
+            "[[clients]]\naccess_key_id = \"reader\"\nsecret_access_key = \"reader-secret\"\n\
+             grants = [{grants}]\n"
+        );
+        Server::start_config(&format!("{origins}\n{clients}"), dir, extra, cache).await
+    }
+
+    /// Starts a server whose origins and clients `tables` name.
+    pub async fn start_config(tables: &str, dir: &Path, extra: &str, cache: &str) -> Server {
         let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let node = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let node_address = node.local_addr().unwrap();
         let config: Config = toml::from_str(&format!(
             r#"
             {extra}
-            {origins}
-            [[clients]]
-            access_key_id = "reader"
-            secret_access_key = "reader-secret"
-            grants = [{grants}]
+            {tables}
             [cache]
             {cache}
             [cache.default_policy]
@@ -793,6 +868,44 @@ pub fn presigned(
     let now = sigv4::unix_now() - age;
     let query = signer.presign((method, path, query), host, expires, now);
     format!("http://127.0.0.1:{port}{path}?{query}")
+}
+
+/// Sends a request that the access key `id` signed with `secret`, and
+/// returns the status and body.
+pub async fn send_as(
+    port: u16,
+    (id, secret): (&str, &str),
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> (u16, Vec<u8>) {
+    let signer = Signer {
+        credentials: Credentials {
+            access_key_id: id.into(),
+            secret_access_key: secret.into(),
+        },
+        region: "us-east-1".into(),
+        service: "s3",
+    };
+    let mut headers = vec![("host".to_string(), format!("127.0.0.1:{port}"))];
+    signer.sign(
+        method,
+        path,
+        "",
+        &mut headers,
+        UNSIGNED_PAYLOAD,
+        sigv4::unix_now(),
+    );
+    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+    let mut request = reqwest::Client::new()
+        .request(method, format!("http://127.0.0.1:{port}{path}"))
+        .body(body);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    (status, response.bytes().await.unwrap().to_vec())
 }
 
 /// Sends a signed request and returns the status and body.

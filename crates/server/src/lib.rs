@@ -3,11 +3,13 @@
 //! runs either or both.
 
 pub mod admin;
+pub mod clients;
 pub mod config;
 pub mod disk;
 pub mod gateway_engine;
 pub mod http;
 pub mod log;
+pub mod lookups;
 pub mod membership_engine;
 pub mod metadata_service;
 pub mod metrics;
