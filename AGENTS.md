@@ -12,7 +12,7 @@
 
 ## Testing
 
-- Every behavior the spec names needs a simulator property or a scripted simulator scenario, and a planted bug in `scripts/mutants` that one of them catches.
+- Every behavior the spec names needs a test and a planted bug in `scripts/mutants` that the test catches. A behavior the core decides needs a simulator property or a scripted simulator scenario. A behavior only the server carries out, such as auth, origins or metrics, needs a server test or a unit test in `crates/server`.
 - The simulator checks responses against its model of S3, never against the core's own state.
 - A seed replays its run exactly. The simulator draws from its own PRNG; give each new source of randomness its own `Prng::stream`, so it leaves existing draws unchanged.
 - A bug the simulator finds becomes a regression test in `crates/sim/tests` that runs its seed. The commit message records the seed and the commit that failed.
