@@ -4,6 +4,7 @@
 //! so no count is shared between threads.
 
 use crate::http::RequestHead;
+use crate::origins::{Lookup, Unresolved};
 use s3_accelerator_core::node::{Stats, Usage};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -168,6 +169,12 @@ struct Counts {
     syncs: Histogram,
     events: u64,
     events_lag: Histogram,
+    /// Lookups in the metadata service, by `Lookup`.
+    origin_lookups: [u64; 3],
+    origin_invalidations: u64,
+    origin_stale: u64,
+    /// Requests answered without an origin, by `Unresolved`.
+    origin_unresolved: [u64; 2],
     /// Rings the gateway adopted, and the node.
     ring_changes: [u64; 2],
     /// By link and whether the kernel carries the session.
@@ -240,6 +247,23 @@ impl Metrics {
         if let Some(lag) = lag {
             counts.events_lag.observe(lag);
         }
+    }
+
+    pub fn origin_lookup(&self, result: Lookup) {
+        self.counts.borrow_mut().origin_lookups[result as usize] += 1;
+    }
+
+    pub fn origin_invalidated(&self) {
+        self.counts.borrow_mut().origin_invalidations += 1;
+    }
+
+    /// `requests` went out with an entry past its TTL.
+    pub fn origin_stale(&self, requests: u64) {
+        self.counts.borrow_mut().origin_stale += requests;
+    }
+
+    pub fn origin_unresolved(&self, reason: Unresolved) {
+        self.counts.borrow_mut().origin_unresolved[reason as usize] += 1;
     }
 
     /// The gateway, or the node, adopted a ring.
@@ -561,6 +585,46 @@ fn render_node(out: &mut Out, counts: &Counts) {
         "From S3's event time to the node taking the message.",
     );
     out.histogram("events_lag_seconds", "", &counts.events_lag);
+    out.family(
+        "origin_lookups_total",
+        "counter",
+        "Lookups of buckets' origins in the metadata service.",
+    );
+    for (result, count) in ["found", "unknown", "failed"]
+        .iter()
+        .zip(counts.origin_lookups)
+    {
+        let labels = format!("result=\"{result}\"");
+        out.sample("origin_lookups_total", &labels, count);
+    }
+    out.family(
+        "origin_invalidations_total",
+        "counter",
+        "Invalidations the node took.",
+    );
+    out.sample(
+        "origin_invalidations_total",
+        "",
+        counts.origin_invalidations,
+    );
+    out.family(
+        "origin_stale_total",
+        "counter",
+        "Requests sent with an entry past its TTL while lookups failed.",
+    );
+    out.sample("origin_stale_total", "", counts.origin_stale);
+    out.family(
+        "origin_unresolved_total",
+        "counter",
+        "Requests answered without an origin: 404 for an unknown bucket, 503 for one with no usable entry.",
+    );
+    for (reason, count) in ["unknown", "unavailable"]
+        .iter()
+        .zip(counts.origin_unresolved)
+    {
+        let labels = format!("reason=\"{reason}\"");
+        out.sample("origin_unresolved_total", &labels, count);
+    }
 }
 
 fn render_process(out: &mut Out, counts: &Counts, view: &View) {

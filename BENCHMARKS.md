@@ -7,6 +7,8 @@ cargo build --release -p s3-accelerator -p s3-accelerator-bench
 target/release/s3-accelerator-bench
 ```
 
+With `--origins service`, the node looks up the bucket's origin in the reference metadata service rather than its config's `[origin]`.
+
 Both processes serve their admin listener. Between workloads, the benchmark waits until the node's metrics show no fills in progress and it has written nothing for half a second, so each workload starts after the last one's blocks are durable. `--scrape-ms MS` also scrapes each process's `/metrics` every `MS` milliseconds during the workloads.
 
 ## Results
@@ -77,7 +79,22 @@ The low ends after Phase 7 of the range hits and the high end of "Hits" come fro
 - **Fills** run 1.6 to 2 times as fast: S3's bodies arrive on worker threads (7C), off the event loop that used to receive and relay every byte.
 - **Hits while objects fill** keep their first byte: p99 fell from about a second to a few hundred milliseconds, since fills no longer occupy the event loop.
 - **Small range hits** cost the node half the CPU and reach four times the throughput from one client: a run the page cache holds goes out with `sendfile` from the event loop, and a small reply leaves in one write (7E).
-- **Range misses** cost the node about twice the CPU, as each S3 request now crosses to a worker thread and back. Their p99 reached 64 ms in one run of three before Phase 7 and in every run after: some misses wait 25 to 80 ms longer than S3 took to answer, though S3 answered each within 25 ms and the event loops show no long stalls then. 7I, below, may explain it.
+- **Range misses** cost the node about twice the CPU, as each S3 request now crosses to a worker thread and back. Their p99 reached 64 ms in one run of three before Phase 7 and in every run at its end, with some misses waiting 25 to 80 ms longer than S3 took to answer. Once the journal thread (7I) and reads before the sync (7J) landed, four runs put the p99 at 23.2 to 23.7 ms, S3's 20 ms and a few more.
+
+## Origins from the metadata service
+
+Six runs each of the hits section, with the bucket's origin in the node's config and in the reference metadata service: first alternating, then two of one and two of the other. Every range overlaps. The node looked the bucket up once per run with the service, and finding a fresh entry costs a request 46 ns on the node's thread, against 15 ns from the config (`origins::tests::cost_of_finding_an_origin`).
+
+| Workload | Config: GiB/s | Service: GiB/s | Config: first byte p99 | Service: first byte p99 | Config: node CPU s/GiB | Service: node CPU s/GiB |
+|---|--:|--:|--:|--:|--:|--:|
+| First reads (fills) | 3.52–4.16 | 3.49–4.22 | 58–161 ms | 55–197 ms | 1.44–1.92 | 1.34–1.95 |
+| Hits | 2.62–7.53 | 3.68–7.26 | 189–349 ms | 229–357 ms | 0.55–2.19 | 0.59–2.17 |
+| Hits from the page cache, 1 client | 7.97–9.28 | 8.23–8.91 | 0.60–0.89 ms | 0.70–1.73 ms | 0.07–0.11 | 0.07–0.09 |
+| 64 KiB range hits | 2.30–2.46 | 2.18–2.49 | 1.28–1.81 ms | 1.45–21.50 ms | 0.24–0.31 | 0.22–0.48 |
+| 64 KiB range hits, 1 client | 0.67–1.03 | 0.27–1.19 | 0.37–0.60 ms | 0.27–0.79 ms | 0.16–0.66 | 0.33–0.49 |
+| 64 KiB range misses, 1 client | | | 23.2–23.8 ms | 23.2–23.7 ms | 11.47–14.75 | 10.65–13.11 |
+
+The wide ranges come from the drive. The node wrote 7.4 to 9.4 GiB while filling in eight runs, and 0.6 to 3.2 GiB in the other four, two of each mode. In those four, the drive's writes trailed S3's bodies so far that the fill budget turned most blocks away (13,706 and 15,401 refusals in the last run of each mode, against 2,999 in a run that stored 9.3 GiB), so fills ran faster with longer tails, and later hits went to S3. The alternating runs made it look like the service's doing: three service runs in a row wrote less. With two of each in a row, the second run of each mode wrote less.
 
 ## Where the time goes
 
@@ -117,5 +134,5 @@ The spec left the layout open until benchmarks tested its three risks. It stays:
 
 - **Fills.** A node fills at 3.4 to 4.4 GiB/s, with S3's bodies received on worker threads. The drive's writes trail S3's bodies, so under 32 clients' sustained first reads a 4 GiB fill budget still fills up, and the rest streams from S3 without admission, as the fill budget intends.
 - **Fill budget.** A gateway asks for a response's chunks up to `read_ahead` bytes ahead of the part it forwards (64 MiB by default), so a concurrent miss holds at most that much of its owners' budgets, and the default budget, 256 MiB, admits four such misses at once.
-- **Stalls when the drive syncs slowly (7I).** The node's event loop writes each slot record and metadata entry itself. When the drive takes seconds to sync, the kernel throttles those small writes, and the loop, which owns the core, stalls with every read it serves: in about a third of scan runs, the hot set's reads ran at 0.7 to 0.9 GiB/s against 4.3 to 4.9, as the loop ran its 100 ms timer up to a second late and slab-file syncs took up to 5 seconds. Moving those writes to a thread of their own is 7I.
+- **Slow drive syncs.** The drive takes seconds to sync after heavy writes. A journal thread writes slot records and metadata entries (7I), and readers take a block once its bytes reach the slab file, before the sync (7J), so neither the event loop nor a block's readers wait on a sync. Before them, about a third of scan runs read the hot set at 0.7 to 0.9 GiB/s; in six runs since, it held 2.1 to 4.7 GiB/s.
 - **TLS.** Kernel TLS served hits at 7.9 to 8.1 GiB/s against 20.9 to 21.9 in plaintext. The node encrypts toward the gateway, and the gateway decrypts and encrypts again toward the client: 0.66 to 0.71 and 1.22 to 1.25 CPU seconds per GiB. Userspace TLS served 0.9 GiB/s.

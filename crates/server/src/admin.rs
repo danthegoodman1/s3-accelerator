@@ -1,15 +1,16 @@
-//! The admin listener: metrics, health and readiness over plaintext
-//! HTTP/1.1, on an address of its own.
+//! The admin listener: metrics, health, readiness and the metadata
+//! service's invalidations over plaintext HTTP/1.1, on an address of its
+//! own.
 
 use crate::gateway_engine::{GatewayEngine, SharedGateway};
-use crate::http::{Connection, Response};
-use crate::log;
+use crate::http::{self, RequestHead, Response};
 use crate::metrics::{Metrics, View};
 use crate::node_engine::{NodeEngine, SharedNode};
+use crate::origins::{Invalidated, Origins};
+use crate::sigv4;
 use bytes::Bytes;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
 use tokio::net::TcpListener;
 
 /// What the admin listener reports on: the process's roles as they start,
@@ -20,6 +21,8 @@ pub struct Admin {
     /// recovered.
     runs_node: bool,
     node: RefCell<Option<SharedNode>>,
+    /// The node's origins, which invalidations reach.
+    origins: RefCell<Option<Rc<Origins>>>,
     /// The node took a ring from a seed, or found none answering.
     joined: Cell<bool>,
     gateway: RefCell<Option<SharedGateway>>,
@@ -33,6 +36,7 @@ impl Admin {
             metrics: Rc::new(Metrics::default()),
             runs_node,
             node: RefCell::new(None),
+            origins: RefCell::new(None),
             joined: Cell::new(false),
             gateway: RefCell::new(None),
             stopping: Cell::new(false),
@@ -43,6 +47,11 @@ impl Admin {
     /// The node recovered its store.
     pub fn recovered(&self, node: SharedNode) {
         *self.node.borrow_mut() = Some(node);
+    }
+
+    /// The node's origins, which take invalidations from its start.
+    pub fn origins(&self, origins: Rc<Origins>) {
+        *self.origins.borrow_mut() = Some(origins);
     }
 
     /// The node joined the cluster.
@@ -98,30 +107,64 @@ impl Admin {
         }
     }
 
-    fn answer(&self, path: &str) -> Response {
-        let text = |status, body: String| Response {
-            status,
-            headers: vec![(
-                "Content-Type".to_string(),
-                "text/plain; charset=utf-8".to_string(),
-            )],
-            content_length: body.len() as u64,
-            body: Bytes::from(body),
+    fn answer(&self, head: &RequestHead) -> Response {
+        match head.method.as_str() {
+            "GET" | "HEAD" => self.report(&head.path),
+            "POST" => self.invalidate(head),
+            _ => Response::text(405, "method not allowed\n"),
+        }
+    }
+
+    /// `POST /origins/<bucket>/invalidate`, from the metadata service.
+    fn invalidate(&self, head: &RequestHead) -> Response {
+        let bucket = head
+            .path
+            .strip_prefix("/origins/")
+            .and_then(|rest| rest.strip_suffix("/invalidate"))
+            .filter(|bucket| is_bucket_name(bucket));
+        let origins = self.origins.borrow().clone();
+        let (Some(bucket), Some(origins)) = (bucket, origins) else {
+            return Response::text(404, "not found\n");
         };
+        let time = head.header("x-accel-time").unwrap_or_default();
+        let signature = head.header("x-accel-signature").unwrap_or_default();
+        match origins.invalidate(bucket, time, signature, sigv4::unix_now()) {
+            Invalidated::Dropped => Response {
+                status: 204,
+                headers: Vec::new(),
+                content_length: 0,
+                body: Bytes::new(),
+            },
+            Invalidated::Refused => Response::text(403, "forbidden\n"),
+            Invalidated::NoService => Response::text(404, "the node has no metadata service\n"),
+        }
+    }
+
+    fn report(&self, path: &str) -> Response {
         match path {
             "/metrics" => {
-                let mut response = text(200, self.metrics.render(&self.view()));
+                let mut response = Response::text(200, self.metrics.render(&self.view()));
                 response.headers[0].1 = "text/plain; version=0.0.4; charset=utf-8".to_string();
                 response
             }
-            "/healthz" => text(200, "ok\n".to_string()),
+            "/healthz" => Response::text(200, "ok\n"),
             "/readyz" => match self.waiting_for().as_slice() {
-                [] => text(200, "ready\n".to_string()),
-                waiting => text(503, format!("{}\n", waiting.join("\n"))),
+                [] => Response::text(200, "ready\n"),
+                waiting => Response::text(503, format!("{}\n", waiting.join("\n"))),
             },
-            _ => text(404, "not found\n".to_string()),
+            _ => Response::text(404, "not found\n"),
         }
     }
+}
+
+/// Whether `name` could name a bucket: S3's letters, digits, dots and
+/// hyphens, or the underscores and capitals some origins allow.
+fn is_bucket_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
 /// How far a process has come toward serving.
@@ -155,44 +198,9 @@ impl Progress {
     }
 }
 
-/// How long the admin listener waits after failing to accept.
-const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
-
 /// Serves the admin listener for as long as the process runs.
 pub async fn serve(listener: TcpListener, admin: Rc<Admin>) {
-    loop {
-        let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
-            // An error such as running out of descriptors lasts a while;
-            // the pause keeps the event loop free for the node and gateway.
-            Err(error) => {
-                log!(Warn, "the admin listener failed to accept", error = error);
-                tokio::time::sleep(ACCEPT_PAUSE).await;
-                continue;
-            }
-        };
-        let admin = admin.clone();
-        tokio::task::spawn_local(async move {
-            let mut connection = Connection::new(stream);
-            while let Ok(Some(head)) = connection.read_head().await {
-                let mut response = match head.method.as_str() {
-                    "GET" | "HEAD" => admin.answer(&head.path),
-                    _ => admin.answer(""),
-                };
-                if head.method == "HEAD" {
-                    response.body = Bytes::new();
-                }
-                if connection
-                    .write_response(&response, head.keep_alive)
-                    .await
-                    .is_err()
-                    || !head.keep_alive
-                {
-                    return;
-                }
-            }
-        });
-    }
+    http::serve_heads(listener, "admin", Rc::new(move |head| admin.answer(head))).await;
 }
 
 #[cfg(test)]

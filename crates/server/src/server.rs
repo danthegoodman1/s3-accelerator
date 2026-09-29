@@ -12,7 +12,8 @@ use crate::log;
 use crate::membership_engine::{self, GossipKey};
 use crate::metrics::{Link, Metrics, NodeFailure, Operation, Side};
 use crate::node_engine::{self, NodeEngine};
-use crate::origin::{self, Origin};
+use crate::origin;
+use crate::origins::Origins;
 use crate::passthrough::{self, ToNode};
 use crate::peers::{Exchanged, Peers};
 use crate::protocol::{self, NodeAnswer, NodeRequest, RequestId};
@@ -159,24 +160,37 @@ pub async fn run_with(
     });
     let node = match (&config.node, listeners.node) {
         (Some(node), Some(listener)) => {
-            let origin = config
-                .origin
-                .as_ref()
-                .expect("checked: a node has an origin");
-            let credentials = || Credentials {
-                access_key_id: origin.access_key_id.clone(),
-                secret_access_key: origin.secret_access_key.clone(),
-            };
             let queue = match &config.events {
                 Some(events) => {
-                    let region = events.region.as_ref().unwrap_or(&origin.region);
-                    let queue = Queue::new(&events.queue_url, region, credentials())?;
+                    // Checked: the queue has credentials and a region of
+                    // its own, or the default origin's.
+                    let origin = config.origin.as_ref();
+                    let region = events
+                        .region
+                        .as_ref()
+                        .or(origin.map(|origin| &origin.region))
+                        .expect("checked: the queue has a region");
+                    let credentials = match (&events.access_key_id, &events.secret_access_key) {
+                        (Some(id), Some(secret)) => Credentials {
+                            access_key_id: id.clone(),
+                            secret_access_key: secret.clone(),
+                        },
+                        _ => {
+                            let origin = origin.expect("checked: the queue has credentials");
+                            Credentials {
+                                access_key_id: origin.access_key_id.clone(),
+                                secret_access_key: origin.secret_access_key.clone(),
+                            }
+                        }
+                    };
+                    let queue = Queue::new(&events.queue_url, region, credentials)?;
                     let visibility = Duration::from_secs(events.visibility_timeout_s);
                     Some((Rc::new(queue), visibility))
                 }
                 None => None,
             };
-            let origin = Arc::new(Origin::new(&origin.endpoint, &origin.region, credentials()));
+            let origins = Rc::new(Origins::new(&config, metrics.clone()));
+            admin.origins(origins.clone());
             let node_config = config.cache.node_config();
             let opening = Instant::now();
             // Recovery reads the slot table off the event loop, which
@@ -221,7 +235,7 @@ pub async fn run_with(
             disk.start_journal();
             let engine = NodeEngine::new(
                 recovered,
-                origin,
+                origins,
                 peers.clone(),
                 disk,
                 config.addresses(),

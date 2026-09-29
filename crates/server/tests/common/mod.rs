@@ -77,6 +77,17 @@ pub struct Origin {
     pub trickle: Cell<Duration>,
     /// Answer bucket listings chunked, with no `Content-Length`.
     pub chunked: Cell<bool>,
+    /// The access key that signed each request.
+    pub keys: RefCell<Vec<String>>,
+}
+
+/// The access key ID a request's SigV4 `Authorization` names.
+pub fn signing_key(headers: &[(String, String)]) -> String {
+    s3_accelerator::http::header(headers, "authorization")
+        .and_then(|value| value.split("Credential=").nth(1))
+        .and_then(|credential| credential.split('/').next())
+        .unwrap_or_default()
+        .to_string()
 }
 
 impl Default for Origin {
@@ -96,6 +107,7 @@ impl Default for Origin {
             refuse_writes: Cell::default(),
             trickle: Cell::default(),
             chunked: Cell::default(),
+            keys: RefCell::default(),
         }
     }
 }
@@ -155,6 +167,7 @@ async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
                 origin.requests.set(origin.requests.get() + 1);
                 origin.paths.borrow_mut().push(head.path.clone());
                 origin.queries.borrow_mut().push(head.query.clone());
+                origin.keys.borrow_mut().push(signing_key(&head.headers));
                 let mut headers = vec![("x-amz-request-id".to_string(), S3_REQUEST_ID.to_string())];
                 if head.method == "PUT" {
                     let etag = format!("\"written-{}\"", origin.uploads.borrow().len());
@@ -302,6 +315,8 @@ pub struct Queue {
     /// Each message's receipt, body, and when it becomes visible again.
     messages: RefCell<Vec<(String, String, Option<std::time::Instant>)>>,
     sent: Cell<u64>,
+    /// The access key that signed each request.
+    pub keys: RefCell<Vec<String>>,
 }
 
 impl Queue {
@@ -368,6 +383,7 @@ async fn fake_queue(listener: TcpListener, queue: Rc<Queue>) {
                     return;
                 };
                 let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                queue.keys.borrow_mut().push(signing_key(&head.headers));
                 let signed_for_sqs = head
                     .header("authorization")
                     .is_some_and(|value| value.contains("/sqs/aws4_request"));
@@ -457,6 +473,17 @@ pub async fn wait_recorded(path: &Path, count: usize) {
     panic!("the table holds {} records, not {count}", recorded(path));
 }
 
+/// Waits up to ten seconds for `done` to hold.
+pub async fn eventually(done: impl Fn() -> bool) {
+    for _ in 0..1_000 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the condition never held");
+}
+
 /// The admin listener's answer at `path`: its status and body.
 pub async fn admin(port: u16, path: &str) -> (u16, String) {
     let response = reqwest::get(format!("http://127.0.0.1:{port}{path}"))
@@ -478,6 +505,118 @@ pub fn sample(scrape: &str, name: &str, labels: &str) -> f64 {
         .lines()
         .find_map(|line| line.strip_prefix(series.as_str()))
         .map_or(0.0, |value| value.parse().unwrap())
+}
+
+/// The token the fake metadata service takes, which signs invalidations.
+pub const METADATA_TOKEN: &str = "metadata-token";
+
+/// A fake metadata service, which answers each lookup from `buckets`.
+pub struct Metadata {
+    pub lookups: Cell<u64>,
+    /// Each bucket's origin port and access key.
+    pub buckets: RefCell<BTreeMap<String, (u16, String)>>,
+    pub ttl_ms: Cell<u64>,
+    /// Answer every lookup 503.
+    pub failing: Cell<bool>,
+    /// How long it waits before each answer, which it settles on arrival.
+    pub delay: Cell<Duration>,
+}
+
+impl Metadata {
+    /// Serves `bucket` from the S3 at `port`, with the access key `key`.
+    pub fn serve(&self, bucket: &str, port: u16, key: &str) {
+        self.buckets
+            .borrow_mut()
+            .insert(bucket.to_string(), (port, key.to_string()));
+    }
+
+    /// The `[metadata]` table of a node that asks this service.
+    pub fn table(port: u16, extra: &str) -> String {
+        format!(
+            "[metadata]\nurl = \"http://127.0.0.1:{port}\"\ntoken = \"{METADATA_TOKEN}\"\n{extra}\n"
+        )
+    }
+}
+
+/// Starts the fake metadata service on this `LocalSet`, and returns its
+/// port.
+pub async fn start_metadata() -> (u16, Rc<Metadata>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let metadata = Rc::new(Metadata {
+        lookups: Cell::default(),
+        buckets: RefCell::default(),
+        ttl_ms: Cell::new(60_000),
+        failing: Cell::default(),
+        delay: Cell::default(),
+    });
+    let service = metadata.clone();
+    tokio::task::spawn_local(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service.clone();
+            tokio::task::spawn_local(async move {
+                let mut connection = Connection::new(stream);
+                while let Ok(Some(head)) = connection.read_head().await {
+                    service.lookups.set(service.lookups.get() + 1);
+                    let authorized = head.header("authorization")
+                        == Some(format!("Bearer {METADATA_TOKEN}").as_str());
+                    let bucket = head.path.strip_prefix("/buckets/").unwrap_or_default();
+                    let served = service.buckets.borrow().get(bucket).cloned();
+                    let (status, body) = match (authorized, service.failing.get(), served) {
+                        (false, _, _) => (401, String::new()),
+                        (true, true, _) => (503, String::new()),
+                        (true, false, None) => (404, String::new()),
+                        (true, false, Some((port, key))) => {
+                            let answer = serde_json::json!({
+                                "endpoint": format!("http://127.0.0.1:{port}"),
+                                "region": "us-east-1",
+                                "access_key_id": key,
+                                "secret_access_key": format!("{key}-secret"),
+                                "ttl_ms": service.ttl_ms.get(),
+                            });
+                            (200, answer.to_string())
+                        }
+                    };
+                    tokio::time::sleep(service.delay.get()).await;
+                    let response = Response {
+                        status,
+                        headers: vec![("content-type".into(), "application/json".into())],
+                        content_length: body.len() as u64,
+                        body: body.into(),
+                    };
+                    if connection.write_response(&response, true).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (port, metadata)
+}
+
+/// Sends the admin listener at `port` an invalidation of `bucket` stamped
+/// `time`, with `signature`, and returns its status.
+pub async fn post_invalidation(port: u16, bucket: &str, time: i64, signature: &str) -> u16 {
+    reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/origins/{bucket}/invalidate"
+        ))
+        .header("x-accel-time", time.to_string())
+        .header("x-accel-signature", signature)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// Sends a signed invalidation of `bucket`, stamped now, and returns the
+/// status.
+pub async fn invalidate(port: u16, bucket: &str) -> u16 {
+    let time = sigv4::unix_now();
+    let signature = s3_accelerator::origins::invalidation_signature(METADATA_TOKEN, bucket, time);
+    post_invalidation(port, bucket, time, &signature).await
 }
 
 /// A server running on this `LocalSet`.
@@ -505,17 +644,34 @@ impl Server {
         extra: &str,
         cache: &str,
     ) -> Server {
+        let origins = format!(
+            r#"
+            [origin]
+            endpoint = "http://127.0.0.1:{origin_port}"
+            region = "us-east-1"
+            access_key_id = "origin"
+            secret_access_key = "origin-secret"
+            "#
+        );
+        Server::start_origins(&origins, dir, grants, extra, cache).await
+    }
+
+    /// Starts a server whose origins `origins` names: its `[origin]`,
+    /// `[origins]` or `[metadata]` tables.
+    pub async fn start_origins(
+        origins: &str,
+        dir: &Path,
+        grants: &str,
+        extra: &str,
+        cache: &str,
+    ) -> Server {
         let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let node = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let node_address = node.local_addr().unwrap();
         let config: Config = toml::from_str(&format!(
             r#"
             {extra}
-            [origin]
-            endpoint = "http://127.0.0.1:{origin_port}"
-            region = "us-east-1"
-            access_key_id = "origin"
-            secret_access_key = "origin-secret"
+            {origins}
             [[clients]]
             access_key_id = "reader"
             secret_access_key = "reader-secret"

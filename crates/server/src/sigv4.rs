@@ -471,7 +471,7 @@ pub fn encode(text: &str) -> String {
     utf8_percent_encode(text, ENCODE).to_string()
 }
 
-fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+pub fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()

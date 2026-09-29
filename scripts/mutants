@@ -48,6 +48,8 @@ METRICS = "crates/server/src/metrics.rs"
 ADMIN = "crates/server/src/admin.rs"
 LOG = "crates/server/src/log.rs"
 SIGV4 = "crates/server/src/sigv4.rs"
+ORIGINS = "crates/server/src/origins.rs"
+METADATA_SERVICE = "crates/server/src/metadata_service.rs"
 STEP_TIMEOUT = 600
 
 MUTANTS = [
@@ -1057,6 +1059,104 @@ MUTANTS = [
         "a disowned block's eviction is counted as cold",
         [(STORE, "Some(_) => return Some(self.evict(key, true).extent),",
                  "Some(_) => return Some(self.evict(key, false).extent),")],
+    ),
+    (
+        "every request looks up its bucket's origin",
+        [(ORIGINS, "let known = self.known.as_ref().filter(|known| now < known.expires)?;",
+                   "let known = self.known.as_ref().filter(|_| false)?;")],
+    ),
+    (
+        "requests waiting on a bucket each look it up",
+        [(ORIGINS, "let start = entry.lookup.is_none();", "let start = true;")],
+    ),
+    (
+        "every request past half the TTL looks the bucket up",
+        [(ORIGINS, "let refresh = now >= known.refresh && self.lookup.is_none() && !self.failed_recently(now);",
+                   "let refresh = now >= known.refresh && !self.failed_recently(now);")],
+    ),
+    (
+        "an entry serves past its TTL while the service answers",
+        [(ORIGINS, "let known = self.known.as_ref().filter(|known| now < known.expires)?;",
+                   "let known = self.known.as_ref().filter(|known| now < known.expires + Duration::from_secs(3600))?;")],
+    ),
+    (
+        "an entry serves past its grace",
+        [
+            (ORIGINS, "&& entry.failed.is_some()\n            && now < known.expires + self.grace\n        {",
+                      "&& entry.failed.is_some()\n        {"),
+            (ORIGINS, "Some(known) if now < known.expires + self.grace => {",
+                      "Some(known) => {"),
+        ],
+    ),
+    (
+        "the TTL has no floor",
+        [(ORIGINS, "let ttl = ttl.max(MIN_TTL);", "let ttl = ttl;")],
+    ),
+    (
+        "an unknown bucket is forgotten at once",
+        [(ORIGINS, "entry.unknown_until = Some(now + self.unknown_ttl);", "entry.unknown_until = Some(now);")],
+    ),
+    (
+        "an unknown bucket is remembered forever",
+        [(ORIGINS, "if now < until {\n                return Found::Ready {", "if true {\n                return Found::Ready {")],
+    ),
+    (
+        "unknown buckets past their time keep their places",
+        [(ORIGINS, "if self.unknown >= MAX_UNKNOWN {\n            self.forget_expired(now, bucket);\n        }", "")],
+    ),
+    (
+        "failed lookups are retried by every request",
+        [(ORIGINS, "self.failed.is_some_and(|at| now < at + RETRY)", "false")],
+    ),
+    (
+        "an invalidation leaves a lookup under way standing",
+        [(ORIGINS, "Some(pending) => pending.again = true,", "Some(_) => {}")],
+    ),
+    (
+        "an invalidation leaves the entry in use during a refresh",
+        [(ORIGINS, "return;\n        };\n        entry.known = None;\n        entry.failed = None;\n        if entry.unknown_until.take().is_some() {",
+                   "return;\n        };\n        entry.failed = None;\n        if entry.unknown_until.take().is_some() {")],
+    ),
+    (
+        "a forged invalidation is taken",
+        [(ORIGINS, "if !signed || now.abs_diff(stamped) > INVALIDATION_SKEW {",
+                   "if now.abs_diff(stamped) > INVALIDATION_SKEW {")],
+    ),
+    (
+        "a stale invalidation is taken",
+        [(ORIGINS, "if !signed || now.abs_diff(stamped) > INVALIDATION_SKEW {", "if !signed {")],
+    ),
+    (
+        "every bucket goes to the default origin",
+        [(ORIGINS, ".buckets\n                .get(bucket)\n                .or(self.default.as_ref())", ".default\n                .as_ref()")],
+    ),
+    (
+        "a failing service holds up every request once its second passes",
+        [(ORIGINS, "&& entry.failed.is_some()\n            && now < known.expires + self.grace",
+                   "&& entry.failed_recently(now)\n            && now < known.expires + self.grace")],
+    ),
+    (
+        "spent entries are never swept",
+        [(ORIGINS, "if self.entries.len() >= self.sweep_at {", "if false {")],
+    ),
+    (
+        "a bucket no origin serves serves its cached objects",
+        [(NODE_ENGINE, "Some(bucket) => !origins.serves(bucket).await,", "Some(_) => false,")],
+    ),
+    (
+        "a reload takes a new token",
+        [(METADATA_SERVICE, "if old.token != config.token || old.listen != config.listen {",
+                            "if old.listen != config.listen {")],
+    ),
+    (
+        "a reload tries a node that takes no invalidation for every bucket",
+        [(METADATA_SERVICE, "error = error\n                        );\n                        return;",
+                            "error = error\n                        );\n                        break;")],
+    ),
+    (
+        "the event queue signs with the default origin's key",
+        [(SERVER, "match (&events.access_key_id, &events.secret_access_key) {",
+                  "match (&None::<String>, &events.secret_access_key) {")],
     ),
 ]
 

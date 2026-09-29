@@ -40,11 +40,15 @@ pub struct Setup<'a> {
     pub transport: Transport,
     /// How often to scrape each process's metrics during runs, if at all.
     pub scrape: Option<Duration>,
+    /// The node looks up the bucket's origin in the reference metadata
+    /// service, in place of its config's `[origin]`.
+    pub metadata: bool,
 }
 
 pub struct Cluster {
     node: Child,
     gateway: Child,
+    metadata: Option<Child>,
     pub gateway_port: u16,
     /// Where the node serves its metrics.
     node_admin_port: u16,
@@ -132,16 +136,45 @@ secret = "bench-secret"
 nodes = [{{ id = 0, address = "127.0.0.1:{node_port}" }}]
 "#
         );
+        let origin = format!(
+            "endpoint = \"http://127.0.0.1:{origin_port}\"\nregion = \"us-east-1\"\n\
+             access_key_id = \"origin\"\nsecret_access_key = \"origin-secret\"\n"
+        );
+        let (metadata_port, metadata_reservation) = reserve_port();
+        let origins = match setup.metadata {
+            true => format!(
+                "[metadata]\nurl = \"http://127.0.0.1:{metadata_port}\"\ntoken = \"bench-token\"\n"
+            ),
+            false => format!("[origin]\n{origin}"),
+        };
+        let metadata = setup.metadata.then(|| {
+            let config = dir.join("metadata.toml");
+            std::fs::write(
+                &config,
+                format!(
+                    "listen = \"127.0.0.1:{metadata_port}\"\ntoken = \"bench-token\"\n\
+                     nodes = [\"127.0.0.1:{node_admin_port}\"]\n[default]\n{origin}"
+                ),
+            )
+            .unwrap();
+            let log = std::fs::File::create(dir.join("metadata.log")).unwrap();
+            let service = binary.with_file_name("s3-accelerator-metadata");
+            Command::new(&service)
+                .arg(&config)
+                .stdout(Stdio::null())
+                .stderr(log)
+                .spawn()
+                .unwrap_or_else(|error| panic!("{}: {error}", service.display()))
+        });
+        if metadata.is_some() {
+            listening(metadata_port);
+        }
         let node_config = dir.join("node.toml");
         let data = dir.join("node");
         std::fs::write(
             &node_config,
             format!(
-                r#"[origin]
-endpoint = "http://127.0.0.1:{origin_port}"
-region = "us-east-1"
-access_key_id = "origin"
-secret_access_key = "origin-secret"
+                r#"{origins}
 {shared}
 [node]
 id = 0
@@ -186,6 +219,7 @@ data_dir = "{}"
         Cluster {
             node,
             gateway,
+            metadata,
             gateway_port,
             node_admin_port,
             slabs: data.join("slabs"),
@@ -196,6 +230,7 @@ data_dir = "{}"
                 gateway_reservation,
                 node_admin_reservation,
                 gateway_admin_reservation,
+                metadata_reservation,
             ],
         }
     }
@@ -226,6 +261,18 @@ data_dir = "{}"
     /// Bytes of blocks the node is filling, which it has yet to make
     /// durable, as its metrics say.
     fn filling(&self) -> Option<u64> {
+        self.node_sample("s3accel_node_fill_bytes ")
+    }
+
+    /// Lookups of the bucket's origin the node has made, when it asks the
+    /// metadata service.
+    pub fn lookups(&self) -> Option<u64> {
+        self.metadata.as_ref()?;
+        self.node_sample("s3accel_origin_lookups_total{result=\"found\"} ")
+    }
+
+    /// The value of the node's metric sample that starts `series`.
+    fn node_sample(&self, series: &str) -> Option<u64> {
         use std::io::{Read, Write};
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.node_admin_port)).ok()?;
         let request = "GET /metrics HTTP/1.1\r\nhost: bench\r\nconnection: close\r\n\r\n";
@@ -234,7 +281,7 @@ data_dir = "{}"
         stream.read_to_string(&mut answer).ok()?;
         answer
             .lines()
-            .find_map(|line| line.strip_prefix("s3accel_node_fill_bytes "))?
+            .find_map(|line| line.strip_prefix(series))?
             .trim()
             .parse()
             .ok()
@@ -248,9 +295,16 @@ data_dir = "{}"
         rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed).unwrap();
     }
 
-    /// Stops both processes cleanly.
+    /// Stops every process cleanly.
     pub fn stop(mut self) {
-        for child in [&mut self.gateway, &mut self.node] {
+        if let Some(lookups) = self.lookups() {
+            eprintln!("the node looked up the bucket's origin {lookups} times");
+        }
+        let metadata = self.metadata.as_mut();
+        for child in [&mut self.gateway, &mut self.node]
+            .into_iter()
+            .chain(metadata)
+        {
             let _ = Command::new("kill")
                 .args(["-TERM", &child.id().to_string()])
                 .status();
@@ -266,6 +320,9 @@ impl Drop for Cluster {
         }
         let _ = self.gateway.kill();
         let _ = self.node.kill();
+        if let Some(metadata) = &mut self.metadata {
+            let _ = metadata.kill();
+        }
     }
 }
 

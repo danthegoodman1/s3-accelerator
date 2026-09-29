@@ -44,14 +44,14 @@ jobs:
           CONFORMANCE_ENDPOINT=http://127.0.0.1:9000 cargo test -p s3-accelerator-conformance -- --ignored
           kill -TERM "$server"
           wait "$server"
-      - name: Conformance through a multi-process cluster
+      - name: Conformance through a multi-process cluster, with origins from the metadata service
         run: |
-          scripts/cluster start 3
+          scripts/cluster start 3 --metadata
           CONFORMANCE_ENDPOINT=http://127.0.0.1:9000 cargo test -p s3-accelerator-conformance -- --ignored
           scripts/cluster stop
-      - name: Conformance over kernel TLS through a multi-process cluster
+      - name: Conformance over kernel TLS through a multi-process cluster, with origins from the metadata service
         run: |
-          scripts/cluster start 3 --tls
+          scripts/cluster start 3 --tls --metadata
           before=$(awk '/^TlsTxSw/ { print $2 }' /proc/net/tls_stat)
           CONFORMANCE_ENDPOINT=https://127.0.0.1:9000 SSL_CERT_FILE=$PWD/target/cluster/tls/cert.pem \
             cargo test -p s3-accelerator-conformance -- --ignored

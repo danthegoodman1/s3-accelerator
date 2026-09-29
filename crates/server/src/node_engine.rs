@@ -10,10 +10,11 @@
 //! cluster protocol, and holds those bodies like fills.
 
 use crate::disk::{Disk, Entry};
-use crate::http::{Connection, Framing, Response, header};
+use crate::http::{Connection, Framing, Response, header, split_path};
 use crate::log;
 use crate::metrics::{Link, Metrics, S3Kind};
-use crate::origin::{self, Origin, OriginBody};
+use crate::origin::{self, OriginBody};
+use crate::origins::{Origins, Unresolved};
 use crate::passthrough;
 use crate::peers::{Exchanged, Peers};
 use crate::protocol::{self, Forward, Hint, NodeAnswer, NodeRequest, Versions};
@@ -111,7 +112,7 @@ const PAGES_RECHECK: Duration = Duration::from_millis(10);
 pub struct NodeEngine {
     started: Instant,
     metrics: Rc<Metrics>,
-    origin: Arc<Origin>,
+    origins: Rc<Origins>,
     peers: Rc<Peers>,
     disk: Arc<Disk>,
     node: Node,
@@ -192,7 +193,7 @@ impl NodeEngine {
     /// first ring are reached.
     pub fn new(
         node: Node,
-        origin: Arc<Origin>,
+        origins: Rc<Origins>,
         peers: Rc<Peers>,
         disk: Arc<Disk>,
         addresses: BTreeMap<NodeId, String>,
@@ -203,7 +204,7 @@ impl NodeEngine {
             down: Vec::new(),
             started: Instant::now(),
             metrics,
-            origin,
+            origins,
             peers,
             disk,
             node,
@@ -1039,15 +1040,23 @@ fn start(engine: &SharedNode, work: Work) {
 /// Sends a request to S3 and gives the node its answer. A body that
 /// streams is then passed to the readers the node gave it.
 async fn fetch(engine: SharedNode, origin: OriginRequestId, request: Request, streams: bool) {
-    let client = engine.borrow().origin.clone();
-    let hold = (!streams).then(|| fill_limit(&request));
-    let reply = client.read(&request, hold).await;
+    let origins = engine.borrow().origins.clone();
+    let (reply, sent) = match origins.of(&request.key.bucket).await {
+        Ok(client) => {
+            let hold = (!streams).then(|| fill_limit(&request));
+            (client.read(&request, hold).await, true)
+        }
+        Err(Unresolved::Unknown) => (origin::Reply::no_such_bucket(), false),
+        Err(Unresolved::Unavailable) => (origin::Reply::failed(), false),
+    };
     let (work, passing) = {
         let mut this = engine.borrow_mut();
         this.tasks.remove(&origin);
-        this.metrics.s3_request(S3Kind::Read, reply.answered);
+        if sent {
+            this.metrics.s3_request(S3Kind::Read, reply.answered);
+        }
         let status = reply.answered.map(|(status, _)| status);
-        if status.is_none_or(|status| status >= 500) {
+        if sent && status.is_none_or(|status| status >= 500) {
             let status = status.map_or("none".to_string(), |status| status.to_string());
             let (s3_request, s3_id2) = reply.ids.clone().unwrap_or_default();
             log!(
@@ -1509,7 +1518,24 @@ async fn serve_connection(
             NodeRequest::Read(read) => {
                 let head_only =
                     matches!(&read, Read::Object { request, .. } if request.method == Method::Head);
-                let Ok(mut reply) = NodeEngine::read(engine, read).await else {
+                // A bucket no origin serves has nothing to read, whatever
+                // the cache holds of it. A gateway's reads name the bucket;
+                // other nodes' ask for what this one took over.
+                let bucket = match &read {
+                    Read::Object { request, .. } => Some(&request.key.bucket),
+                    Read::Range(range) => Some(&range.key.bucket),
+                    Read::Stored(_) | Read::Known(_) => None,
+                };
+                let origins = engine.borrow().origins.clone();
+                let unknown = match bucket {
+                    Some(bucket) => !origins.serves(bucket).await,
+                    None => false,
+                };
+                let reply = match unknown {
+                    true => Ok(no_such_bucket()),
+                    false => NodeEngine::read(engine, read).await,
+                };
+                let Ok(mut reply) = reply else {
                     return Err(io::Error::other("the node dropped a read"));
                 };
                 if head_only {
@@ -1576,6 +1602,61 @@ async fn serve_connection(
     Ok(())
 }
 
+/// A read's answer for a bucket no origin serves.
+fn no_such_bucket() -> Reply {
+    let body = Bytes::from_static(origin::NO_SUCH_BUCKET.as_bytes());
+    let len = body.len() as u64;
+    let head = ResponseHead {
+        content_length: len,
+        ..ResponseHead::status(404)
+    };
+    Reply {
+        answer: NodeAnswer::Respond {
+            head,
+            meta: None,
+            hot: Vec::new(),
+        },
+        body: vec![Part::Held { bytes: body, len }],
+        len,
+        sending: None,
+    }
+}
+
+/// Answers a forwarded request whose bucket has no origin with S3's error
+/// `code`, closing the connection unless `keep_alive`.
+async fn answer_unresolved(
+    connection: &mut Connection,
+    engine: &SharedNode,
+    method: &str,
+    status: u16,
+    code: &str,
+    keep_alive: bool,
+) -> io::Result<()> {
+    let message = match status {
+        404 => "The specified bucket does not exist",
+        501 => "The request names no bucket, and the node has no default origin.",
+        _ => "The bucket's origin is unavailable. Please try again.",
+    };
+    let body = match method {
+        "HEAD" => String::new(),
+        _ => format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{code}</Code><Message>{message}</Message></Error>"
+        ),
+    };
+    let answer = NodeAnswer::Forwarded {
+        status,
+        headers: vec![("content-type".to_string(), "application/xml".to_string())],
+        length: Some(body.len() as u64),
+    };
+    let versions = NodeEngine::versions(engine);
+    let (status, headers) = protocol::encode_answer(&answer, versions);
+    let framing = Framing::Length(body.len() as u64);
+    connection
+        .write_response_head(status, &headers, framing, keep_alive)
+        .await?;
+    connection.write_body(body.as_bytes()).await
+}
+
 /// Answers `status` without reading the request's `len`-byte body, and
 /// closes the connection.
 async fn refuse(connection: &mut Connection, status: u16, len: u64) -> io::Result<()> {
@@ -1604,7 +1685,29 @@ async fn forward_to_s3(
     keep_alive: bool,
     request_id: &str,
 ) -> io::Result<bool> {
-    let origin = engine.borrow().origin.clone();
+    let origins = engine.borrow().origins.clone();
+    let (bucket, _) = split_path(&forward.path);
+    let origin = match bucket.is_empty() {
+        true => origins.default().ok_or((501, "NotImplemented")),
+        false => origins.of(&bucket).await.map_err(|reason| match reason {
+            Unresolved::Unknown => (404, "NoSuchBucket"),
+            Unresolved::Unavailable => (503, "ServiceUnavailable"),
+        }),
+    };
+    let origin = match origin {
+        Ok(origin) => origin,
+        Err((status, code)) => {
+            // The body goes unread, so only a request without one leaves
+            // the connection open.
+            let keep_alive = keep_alive && forward.len == 0;
+            let method = &forward.method;
+            answer_unresolved(connection, engine, method, status, code, keep_alive).await?;
+            if forward.len > 0 {
+                connection.linger().await;
+            }
+            return Ok(keep_alive);
+        }
+    };
     let key = passthrough::written_key(&forward.method, &forward.path);
     // The home keeps the region it holds of an upload, to store once S3
     // takes it.

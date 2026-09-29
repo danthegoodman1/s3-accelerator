@@ -66,6 +66,76 @@ pub struct Response {
     pub body: Bytes,
 }
 
+impl Response {
+    /// A plain-text response.
+    pub fn text(status: u16, body: impl Into<String>) -> Response {
+        let body = body.into();
+        Response {
+            status,
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            )],
+            content_length: body.len() as u64,
+            body: Bytes::from(body),
+        }
+    }
+}
+
+/// How long a plaintext listener waits after failing to accept.
+const ACCEPT_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Serves `listener`, named `name` in logs, over plaintext HTTP/1.1 for as
+/// long as the process runs, answering each request from its head alone.
+/// It reads no bodies, so a request that sends one ends its connection
+/// after the answer, and a `HEAD`'s answer carries none.
+pub async fn serve_heads(
+    listener: tokio::net::TcpListener,
+    name: &'static str,
+    answer: std::rc::Rc<dyn Fn(&RequestHead) -> Response>,
+) {
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            // An error such as running out of descriptors lasts a while;
+            // the pause keeps the event loop free for the rest.
+            Err(error) => {
+                crate::log!(
+                    Warn,
+                    "a listener failed to accept",
+                    listener = name,
+                    error = error
+                );
+                tokio::time::sleep(ACCEPT_PAUSE).await;
+                continue;
+            }
+        };
+        let answer = answer.clone();
+        tokio::task::spawn_local(async move {
+            let mut connection = Connection::new(stream);
+            while let Ok(Some(head)) = connection.read_head().await {
+                let mut response = answer(&head);
+                if head.method == "HEAD" {
+                    response.body = Bytes::new();
+                }
+                let bodiless = head
+                    .header("content-length")
+                    .is_none_or(|length| length.trim() == "0")
+                    && head.header("transfer-encoding").is_none();
+                let keep_alive = head.keep_alive && bodiless;
+                if connection
+                    .write_response(&response, keep_alive)
+                    .await
+                    .is_err()
+                    || !keep_alive
+                {
+                    return;
+                }
+            }
+        });
+    }
+}
+
 /// How a response's body is framed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Framing {

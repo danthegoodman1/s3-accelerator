@@ -1,4 +1,4 @@
-//! The S3 origin: signed requests from this node, with the cluster's
+//! A bucket's origin: signed requests from this node, with the origin's
 //! credentials. Paths go out exactly as written, so keys with `.` and `..`
 //! segments reach S3 as the keys they name, and bodies stream both ways.
 
@@ -28,8 +28,11 @@ const HELD_LIMIT: u64 = 1 << 20;
 /// A request body sent to S3.
 pub type RequestBody = BoxBody<Bytes, io::Error>;
 
+/// An HTTP client whose connection pool every origin shares.
+pub type HttpClient = Client<HttpsConnector<HttpConnector>, RequestBody>;
+
 pub struct Origin {
-    client: Client<HttpsConnector<HttpConnector>, RequestBody>,
+    client: HttpClient,
     /// Scheme and authority, such as `http://127.0.0.1:8080`.
     endpoint: String,
     authority: String,
@@ -49,7 +52,8 @@ pub struct Reply {
 }
 
 impl Reply {
-    fn failed() -> Reply {
+    /// The node's answer when S3 sent none.
+    pub fn failed() -> Reply {
         Reply {
             head: ResponseHead::status(503),
             body: OriginBody::Held(Bytes::new()),
@@ -57,7 +61,24 @@ impl Reply {
             ids: None,
         }
     }
+
+    /// The node's answer for a bucket that has no origin.
+    pub fn no_such_bucket() -> Reply {
+        let body = Bytes::from(NO_SUCH_BUCKET);
+        Reply {
+            head: ResponseHead {
+                content_length: body.len() as u64,
+                ..ResponseHead::status(404)
+            },
+            body: OriginBody::Held(body),
+            answered: None,
+            ids: None,
+        }
+    }
 }
+
+/// S3's error body for a bucket that doesn't exist.
+pub const NO_SUCH_BUCKET: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>";
 
 /// S3's response body to a read.
 pub enum OriginBody {
@@ -88,14 +109,19 @@ pub fn is_hop_header(name: &str) -> bool {
 }
 
 impl Origin {
-    pub fn new(endpoint: &str, region: &str, credentials: Credentials) -> Origin {
+    pub fn new(
+        client: HttpClient,
+        endpoint: &str,
+        region: &str,
+        credentials: Credentials,
+    ) -> Origin {
         let endpoint = endpoint.trim_end_matches('/').to_string();
         let authority = endpoint
             .split_once("://")
             .map_or(endpoint.as_str(), |(_, rest)| rest)
             .to_string();
         Origin {
-            client: client(),
+            client,
             endpoint,
             authority,
             signer: Signer {
@@ -246,7 +272,7 @@ impl<T> Drop for Cancelling<T> {
 
 /// An HTTP/1.1 client for AWS, over TLS or plaintext, that keeps idle
 /// connections for reuse.
-pub fn client() -> Client<HttpsConnector<HttpConnector>, RequestBody> {
+pub fn client() -> HttpClient {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
     http.set_nodelay(true);
@@ -265,7 +291,7 @@ fn object_path(key: &ObjectKey) -> String {
     format!("/{}/{}", sigv4::encode(&key.bucket), segments.join("/"))
 }
 
-fn empty() -> RequestBody {
+pub fn empty() -> RequestBody {
     Empty::new().map_err(|never| match never {}).boxed()
 }
 

@@ -13,10 +13,17 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// S3, which only storage nodes reach.
+    /// The origin of every bucket `origins` doesn't name, and of requests
+    /// naming no bucket. Only storage nodes reach origins.
     pub origin: Option<OriginConfig>,
+    /// Origins of single buckets, by bucket name.
+    #[serde(default)]
+    pub origins: BTreeMap<String, OriginConfig>,
+    /// The metadata service, which names each bucket's origin in place of
+    /// `origin` and `origins`.
+    pub metadata: Option<MetadataConfig>,
     /// The SQS queue S3 sends its event notifications to, which storage
-    /// nodes poll with the origin's credentials.
+    /// nodes poll.
     pub events: Option<EventsConfig>,
     #[serde(default)]
     pub clients: Vec<Client>,
@@ -190,12 +197,24 @@ impl Config {
                 return Err(format!("node {} has weight 0", node.id));
             }
         }
-        if self.events.is_some() && self.origin.is_none() {
-            return Err("[events] needs [origin]'s credentials".into());
+        if let Some(events) = &self.events {
+            let own = events.access_key_id.is_some() && events.secret_access_key.is_some();
+            if events.access_key_id.is_some() != events.secret_access_key.is_some() {
+                return Err("[events] names half a credential".into());
+            }
+            if !own && self.origin.is_none() {
+                return Err("[events] needs credentials of its own without [origin]".into());
+            }
+            if events.region.is_none() && self.origin.is_none() {
+                return Err("[events] needs a region without [origin]".into());
+            }
+        }
+        if self.metadata.is_some() && (self.origin.is_some() || !self.origins.is_empty()) {
+            return Err("[metadata] names origins in place of [origin] and [origins]".into());
         }
         if let Some(node) = &self.node {
-            if self.origin.is_none() {
-                return Err("a node needs [origin]".into());
+            if self.origin.is_none() && self.origins.is_empty() && self.metadata.is_none() {
+                return Err("a node needs [origin], [origins] or [metadata]".into());
             }
             if !ids.contains(&node.id) {
                 return Err(format!("node {} is not in cluster.nodes", node.id));
@@ -246,8 +265,11 @@ impl Config {
 pub struct EventsConfig {
     /// Such as `https://sqs.us-east-1.amazonaws.com/123456789012/events`.
     pub queue_url: String,
-    /// The queue's region, if other than the origin's.
+    /// The queue's region, if other than `origin`'s.
     pub region: Option<String>,
+    /// Credentials for the queue, if other than `origin`'s.
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
     /// How long a message stays hidden from other nodes once one takes it.
     #[serde(default = "default_visibility_timeout")]
     pub visibility_timeout_s: u64,
@@ -257,13 +279,38 @@ fn default_visibility_timeout() -> u64 {
     30
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OriginConfig {
     pub endpoint: String,
     pub region: String,
     pub access_key_id: String,
     pub secret_access_key: String,
+}
+
+/// Where nodes look up buckets' origins.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataConfig {
+    /// Such as `https://metadata.example.com`; a lookup asks
+    /// `<url>/buckets/<bucket>`.
+    pub url: String,
+    /// Sent with each lookup, and the key that signs invalidations.
+    pub token: String,
+    /// How long past its TTL a node uses an entry while lookups fail.
+    #[serde(default = "default_grace")]
+    pub grace_ms: u64,
+    /// How long a node remembers that the service doesn't serve a bucket.
+    #[serde(default = "default_unknown_ttl")]
+    pub unknown_ttl_ms: u64,
+}
+
+fn default_grace() -> u64 {
+    15 * 60 * 1000
+}
+
+fn default_unknown_ttl() -> u64 {
+    10_000
 }
 
 /// A client credential and the buckets and prefixes it may use.

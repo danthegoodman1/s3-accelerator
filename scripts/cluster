@@ -5,23 +5,27 @@
 # s3proxy's credentials from clients, so the conformance suite runs
 # unchanged. Configs, disks and logs go in target/cluster.
 #
-#   scripts/cluster start [NODES] [--tls]   # build, start, and wait until it answers
-#   scripts/cluster stop                    # shut every process down cleanly
+#   scripts/cluster start [NODES] [--tls] [--metadata]   # build, start, and wait until it answers
+#   scripts/cluster stop                                 # shut every process down cleanly
 #
 # With --tls, the gateway serves HTTPS with a self-signed certificate in
 # target/cluster/tls, which clients trust through SSL_CERT_FILE, and every
 # process reaches nodes over mutual TLS with a certificate a CA made there
 # signed.
+#
+# With --metadata, nodes look up every bucket's origin in the reference
+# metadata service on 127.0.0.1:9200, which names s3proxy as each one's.
 set -euo pipefail
 
 dir=target/cluster
 binary=target/debug/s3-accelerator
 
-origin='[origin]
-endpoint = "http://localhost:'"${S3PROXY_PORT:-8080}"'"
+s3proxy='endpoint = "http://localhost:'"${S3PROXY_PORT:-8080}"'"
 region = "us-east-1"
 access_key_id = "local-identity"
 secret_access_key = "local-credential"'
+origin="[origin]
+$s3proxy"
 
 config() {
   local nodes=$1 role=$2
@@ -61,15 +65,33 @@ case "${1:-}" in
   start)
     nodes=3
     tls=
+    metadata=
     for arg in "${@:2}"; do
       case "$arg" in
         --tls) tls=--tls ;;
+        --metadata) metadata=--metadata ;;
         *) nodes=$arg ;;
       esac
     done
     cargo build -q -p s3-accelerator
     rm -rf "$dir"
     mkdir -p "$dir"
+    if [ "$metadata" = --metadata ]; then
+      cat >"$dir/metadata.toml" <<TOML
+listen = "127.0.0.1:9200"
+token = "metadata-token"
+nodes = [$(for id in $(seq 0 $((nodes - 1))); do printf '"127.0.0.1:%d", ' $((9091 + id)); done)]
+
+[default]
+$s3proxy
+TOML
+      target/debug/s3-accelerator-metadata "$dir/metadata.toml" >"$dir/metadata.log" 2>&1 &
+      echo $! >"$dir/metadata.pid"
+      wait_for 9200
+      origin='[metadata]
+url = "http://127.0.0.1:9200"
+token = "metadata-token"'
+    fi
     members=
     if [ "$tls" = --tls ]; then
       tls_dir="$dir/tls"
@@ -139,7 +161,7 @@ $members"
     done
     ;;
   *)
-    echo "usage: $0 start [NODES] [--tls]|stop" >&2
+    echo "usage: $0 start [NODES] [--tls] [--metadata]|stop" >&2
     exit 2
     ;;
 esac

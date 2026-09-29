@@ -17,12 +17,14 @@
 //! ```console
 //! cargo build --release -p s3-accelerator -p s3-accelerator-bench
 //! target/release/s3-accelerator-bench [--scale X] [--clients N] [--origin-latency-ms MS] [--dir DIR]
+//!     [--origins config|service]
 //! ```
 //!
 //! Both processes serve their admin listener. Between runs, the benchmark
 //! waits for the node's metrics to show no fills in progress; with
 //! `--scrape-ms MS`, a thread also scrapes each process's `/metrics` every
-//! `MS` milliseconds during runs.
+//! `MS` milliseconds during runs. With `--origins service`, the node looks
+//! up the bucket's origin in the reference metadata service.
 
 mod client;
 mod cluster;
@@ -55,6 +57,8 @@ struct Args {
     only: Option<String>,
     /// How often to scrape each process's metrics, if at all.
     scrape: Option<Duration>,
+    /// Nodes look up the bucket's origin in the reference metadata service.
+    metadata: bool,
 }
 
 fn args() -> Args {
@@ -68,6 +72,7 @@ fn args() -> Args {
         extent: MIB,
         only: None,
         scrape: None,
+        metadata: false,
     };
     let mut given = std::env::args().skip(1);
     while let Some(flag) = given.next() {
@@ -83,6 +88,13 @@ fn args() -> Args {
             "--only" => args.only = Some(value),
             "--scrape-ms" => {
                 args.scrape = Some(Duration::from_millis(value.parse().unwrap()));
+            }
+            "--origins" => {
+                args.metadata = match value.as_str() {
+                    "service" => true,
+                    "config" => false,
+                    _ => panic!("--origins takes service or config"),
+                };
             }
             "--origin-latency-ms" => {
                 args.latency = Duration::from_millis(value.parse().unwrap());
@@ -191,6 +203,7 @@ impl Bench {
             policy,
             transport,
             scrape: self.args.scrape,
+            metadata: self.args.metadata,
         };
         Cluster::start(
             &self.args.server,
