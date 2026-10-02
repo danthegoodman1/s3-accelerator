@@ -40,7 +40,7 @@ Ten c8in.16xlarge client hosts (64 vCPUs, 100 Gb/s each) read one dataset from S
 
 - **Small objects and ranges:** 79 to 89 times S3's request rate at the same connections, with p99 under a millisecond. At 6 million ranges a second the client hosts, each running a gateway and the load generator, were 80% busy and the storage hosts 18%: the clients set the limit.
 - **Large objects:** the cache fills the clients' 1 Tb/s of network at 16 connections per host, with first byte under 2 ms; S3 needs 256 connections to come close, at 34 ms. At 256 connections the clients' network cards drop packets past their allowance, and the cluster's [TCP timers](#tuning) keep the cost of each loss to milliseconds.
-- **Runs:** the S3 figures and the one-connection row come from the first scale run; the cache's other figures from a rerun on fresh hosts with the current defaults. The first run's cache was slower, with tails to 20 ms at 64 connections, and the rerun's was not; [BENCHMARKS.md](BENCHMARKS.md) has both and what differed.
+- **Runs, and how much hosts vary:** the S3 figures and the one-connection row come from the first scale run; the cache's other figures from a rerun on fresh hosts with the current defaults. The two fleets had the same instance types, zone, layout and settings, were launched the same day, and ran code that differed only in timers the rerun's comparison pass left at Linux's. Yet the first served small objects at a quarter of the rerun's rate (373,341 a second against 1,472,009), with p99 at 20 ms against 0.70 ms, and its 256 MiB reads fell to 13.5 GiB/s at 256 connections, with reads timing out, against 112.6. Every process's event loop ran on time in both. [Tuning](#tuning) says how to check a fleet.
 - **Errors:** S3 answered 67 of the 4.0 million direct requests with a 500, and one timed out. The cache answered every request of the rerun.
 
 `loadtest/plans/scale.toml` reruns it.
@@ -364,6 +364,8 @@ delack_max_us = 5000   # the most time an acknowledgement waits
 - Skip values in between: a 20 ms floor resends as much as 5 ms and recovers more slowly.
 - Small requests lose almost no packets, and saw no difference.
 - `ss -ti` shows each link's `rto:`, and the load test's report counts each host's resent segments, timeouts and dropped packets. The socket options need Linux 6.15 or later; an older kernel keeps its own timers.
+
+**Hosts vary.** Two fleets of the same instance types in one zone can perform very differently: the scale test's first fleet served a quarter of the second's small-request rate, with p99 at 20 ms against 0.70 ms, and its large reads collapsed at high concurrency, with the same code and settings. That fleet predates the load test's TCP and network card counters, so the cause is unknown. Load-test a new fleet before trusting its numbers, compare its hosts with one another, and replace hosts that stand out: the report gives each host's CPU, network, resent segments, retransmission timeouts and network card drops, and `ethtool -S` shows a card's `allowance_exceeded` counters on a live host.
 
 **Node processes per host.** A node process runs its core on one thread, so small-request rates grow with processes. The scale test ran 32 on each 128-vCPU storage host: 6 million 4 KiB reads a second with those hosts 18% busy, and large reads at the clients' network limit.
 
