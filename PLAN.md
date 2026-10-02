@@ -12,7 +12,7 @@ Non-goals until a phase names them: POSIX access, multipart-upload warming, SSE-
 - The core does no I/O, reads no clocks and starts no threads (`AGENTS.md`). It handles block locations and response heads; the server and simulator move bytes.
 - Every core feature ships with its simulator model, a property that fails on a wrong answer, and a planted bug that the simulator catches.
 - Build the smallest implementation that meets the phase gate. Add abstraction when a later phase needs it.
-- Execution order: Phase 1, S1, Phase 2, Phase 3, S2, Phase 4, Phase 5, S3, Phase 6, Phase 7, Phase 8, Phase 9, Phase 10, Phase 11, Phase 12.
+- Execution order: Phase 1, S1, Phase 2, Phase 3, S2, Phase 4, Phase 5, S3, Phase 6, Phase 7, Phase 8, Phase 9, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14.
 
 ## Testing Strategy
 
@@ -637,3 +637,57 @@ Status ledger:
 | Complete | Work | 12D Per-request cost | Done: an idle node connection goes back to the pool with tokio's readiness cleared, so the next request waits for its answer without a read that finds nothing, and a read takes it without the peek unless the event loop has seen it turn readable (writes, which can't be sent again, still peek); a node's head goes out with `MSG_MORE` when stored or held bytes follow at once. One loop's small hits went from 25,146 to 36,533 a second at one core, and one connection's from 8,928 to 11,429. The skipped peek of idle connections went back after review. Left for a later phase, since 4 KiB requests are now limited by the clients' CPU: a small answer's head and body read and written together, allocations and formatting per request, and the SigV4 key derived on each request. |
 | Complete | Gate | 12E Reruns on AWS | Request rate, `rate-20261001-211850`, on Phase 11's hardware (4 i4i.4xlarge nodes with four node processes each, 4 c6in.8xlarge clients whose gateways ran 32 loops), 211 million requests, every one answered: small hits of 4-256 KiB, 195,660 to 196,886 a second at 64 to 1,024 connections per host, 11.3 GiB/s, with every node host sending 2.89 GiB/s, its 25 Gb/s burst, at 15-18% CPU, against Phase 11's 66,562 a second and 3.85 GiB/s; first byte 0.55 ms p50 and 4.3 ms p99 at 64. One connection per host: 0.33 ms p50, 0.46 ms p99 to first byte, where Phase 11 reported 1.34 ms with the generator's millisecond. 4 KiB range hits: 566,777 to 597,916 a second with four nodes per host, and 813,561 with eight (`rate8`), where the client hosts, each running its gateway (about 19 cores) and the load generator on 16 physical cores, reached 79-85% CPU while the node hosts ran at 31-34%. Line rate, `bandwidth-20261001-215017`, on 2 m8idn.32xlarge nodes (200 Gb/s each) and 5 c6in.16xlarge clients, every request answered: S3 directly gave the clients 27.4 GiB/s; large hits from the page cache 42.7 GiB/s at 16 connections per client, then 45.6 and 45.3 GiB/s at 64 and 128, each node sending 22.9 to 23.5 GiB/s, its 200 Gb/s, at 1-2% CPU, while the NIC counted 126 million packets held back (`bw_out_allowance_exceeded`); 8 MiB ranges 46.1 GiB/s at 5,895 a second; with the page cache dropped first, 40.0 GiB/s while each node read its 64 GiB share from the drives once. So small objects and large ones are limited by the nodes' network, and 4 KiB requests by the client hosts' CPU. |
 | Complete | Gate | Code review, tests, conformance, seeds, planted bugs | `/code-review high` found 9 issues, all fixed. A revalidation that S3 answered with a 5xx passed the HEAD's `Content-Length` to its waiting reads as a body the node never had (from Phase 11); they now get the status with no body, and the simulator's S3 gives a throttled HEAD the length its GET would have, which caught the old code (`a_throttled_revalidation_keeps_the_metadata`: "node 0 sent past the end"). A shared ring could replace a newer one, since versions are hashes: a loop takes a shared ring only in place of the ring the sharer left, and takes the nodes down that come with the ring it holds (`a_loop_takes_a_siblings_ring_in_place_of_the_one_it_left`). A read skipped the peek of its idle connection when the loop had seen nothing arrive, which let a stray byte reach the next answer; every idle connection is peeked again, and only the read that found nothing is gone. The acceptor dropped a connection whose loop had stopped, and a connection task that panicked kept its loop's count; the next loop takes it, and a guard counts each connection down when it ends. A scrape named the largest ring version among loops, an arbitrary hash; it names the ring most loops hold (`a_gateway_reports_the_ring_most_loops_hold`). The `MSG_MORE` head had no test (`a_hits_head_shares_its_bodys_first_packet`, under `strace`). The rest: a doc comment on the wrong item, two copies of the write loop, and writes copied per loop. Then: clippy clean; `cargo test --workspace -- --include-ignored`, 37 binaries with kernel TLS and conformance against s3proxy, all pass; conformance through `config/local.toml` and through `scripts/cluster start 3 --tls --metadata`, 17 tests each, with gateways of a loop per core; 0 of 100,000 seeds failed, in 315 s. Planted bugs, over the final tree from a copy on disk, after a baseline that passed every layer: all 21 caught, Phase 12's 13 and 8 older ones repointed at its code: the generator's by its tests, the two revalidation bugs by the simulator, member sessions in userspace by the kernel TLS tests, and the rest by the server tests. A first sweep ran from a copy on tmpfs, where the disk tests fail whatever the bug, and counted nothing. |
+
+## Phase 13: The Gateway's Request Path
+
+Goal:
+Requests of a few KiB cost a gateway less CPU. Phase 12 left them limited by the client hosts' CPU: about 50 µs of a core per 4 KiB request on c6in, in syscalls, allocations and formatting.
+
+Scope:
+- 13A Read-ahead: a gateway reads a node's answer with up to 16 KiB of its body. A body that arrives whole goes out in the same write as the client's response head, and `splice` moves the rest of a larger one; over a kernel TLS link to the node, workers splice and so decrypt the rest. For a kernel TLS client, one worker task writes the held bytes and splices the rest.
+- 13B Allocations: header checks that don't lowercase, heads written into one string, the node request head encoded whole, the client's headers borrowed from the node's head, a request head copied only when normalizing changes it, log fields formatted only for a line written.
+- 13C SigV4: a client keeps the signing key of the date, region and service it last checked; the canonical request is built in one string.
+- 13D Rerun on AWS: 4 KiB range hits on Phase 12's hardware.
+
+Out of scope, for a later phase:
+- A request head parsed without owned strings, fewer tokio tasks and channels per read, and allocations in the core.
+
+Completion gate:
+4 KiB range hits cost a gateway less CPU per request on AWS than in Phase 12; tests, conformance and planted bugs pass; `/code-review` findings are resolved.
+
+Testing plan:
+- Server tests: a 4 KiB range hit leaves the gateway in one write and no `splice` (`strace`); hits leave by `splice` but for at most 16 KiB per answer; a kernel TLS client gets held bytes from a worker, none from an event loop; the kernel TLS test counts every gateway loop as an event loop.
+- Unit tests: a node request's head written whole matches its parts; a credential keeps its signing key only for one date, region and service.
+- Planted bugs: an answer read without its first body bytes; held bytes to a kernel TLS client from an event loop; a signing key kept across days.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 13A Read-ahead | `Connection::read_answer_head`, `NodeBody::held`, `zero_copy::relay_on_workers`; locally, one loop: 4 KiB range hits 42,700 to 46,200 a second. `a_small_hit_leaves_the_gateway_in_one_write` sees a 4 KiB range leave in one write with its head; `a_kernel_tls_client_takes_held_bytes_from_a_worker` and `kernel_tls_node_answers_are_decrypted_on_workers`, under `strace`, see held bytes reach a kernel TLS client from a worker and the rest of a kernel TLS node's answer spliced on workers. A test that read ahead only over plaintext node links found no difference over kernel TLS: reading the head already decrypts its record on the event loop, so every link reads ahead. Planted bugs: the answer read without its first body bytes, held bytes written from an event loop, and relays under kernel TLS on the event loop, each caught. |
+| Complete | Work | 13B Allocations | Locally, one loop: 4 KiB range hits to 59,800 a second, 40% above where the phase began; a 4 KiB request cost about 106 `malloc` calls before this item. Seven planted bugs moved to the rewritten code (response overrides, checksums in the metadata, uncounted relayed bytes, request IDs to nodes and to clients, `.` segments, the protocol's error mark), each caught by the server tests. |
+| Complete | Work | 13C SigV4 | `DateKeys::signing_key`, `Credential`'s `Signing`; `a_credential_keeps_its_signing_key_for_its_day`. Planted bugs: a key kept across days, a signature checked with today's key, a service key checking every date, each caught. |
+| Complete | Gate | 13D Rerun on AWS | `rate13`, on `rate8`'s hardware and layout: 4 KiB range hits 691,839 a second at 64 connections per client, 911,555 at 256 (`rate8`: 813,561) and 944,692 at 1,024, with each gateway at about 20 vCPUs, the client hosts at 72-76% and the node hosts at 32-41%. A request cost the gateway 86 µs of a vCPU against 93 µs, 8% less; the 40% a workstation loop gained lies mostly in work c6in spends elsewhere, likely the kernel's TCP and the network driver. One connection's first byte 0.28 ms p50 (0.33 ms), small hits 196,148 a second at the nodes' network. S3 answered 25 of the million cold reads with a 5xx, which the gateways passed on; every other request of 276 million was answered. |
+| Complete | Gate | Tests, conformance, planted bugs, code review | All 37 test binaries pass with `--include-ignored`, kernel TLS among them; conformance passes through `config/local.toml` and `scripts/cluster start 3 --tls --metadata`. The `/code-review` found nine issues, all fixed: read-ahead past 16 KiB on a grown buffer, two worker trips for a kernel TLS client, a missing planted bug, and six of duplication and dead code. The planted-bug sweep caught 20 of 22 at first; the two misses needed a plaintext client in front of kernel TLS node links, which `kernel_tls_node_answers_are_decrypted_on_workers` now covers. |
+| Complete | Gate | Scale test | `scale`, `scale-2` and `scale-1proc` (`loadtest/plans/scale.toml`): 10 c8in.16xlarge clients against S3 directly and through 6 m8idn.32xlarge nodes. Small objects 373,341 a second against S3's 17,595 at 64 connections per client; 4 KiB ranges 1,642,343 against 20,694, and 3,696,502 at 1,024; 256 MiB objects 114.7 GiB/s against 54.3 at 64 connections, the clients' network. Large reads with 32 node processes per host fell from 43 GiB/s at 16 connections to 13.5 GiB/s at 256, with 667 timeouts: Phase 14. `loadtest/chart` draws it (`docs/scale-test.png`). |
+
+## Phase 14: Large Reads Across Many Ring Members
+
+Goal:
+A large read through the gateway keeps its throughput however many node processes the ring holds. With 32 node processes on each of 6 hosts (192 members), 256 MiB hits fell from 43 GiB/s at 16 connections per client to 13.5 GiB/s at 256, with clients timing out, while clients and nodes ran under 10% CPU. With one process per host the same reads filled the clients' network at every concurrency.
+
+Scope:
+- 14A Find where the time goes: per-part waits in the gateway, its pools of node connections per loop (a gateway held 35,744 of them), and TCP state on parts sent to rarely used connections.
+- 14B Fix it, and show it with a simulator or server test that fails before the fix.
+- 14C Rerun the scale test's large reads with 32 node processes per host.
+
+Completion gate:
+256 MiB hits with 32 node processes per host match one process per host within 10% at 16, 64 and 256 connections per client; tests, conformance and planted bugs pass.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+|---|---|---|---|
+| Not started | Work | 14A Find where the time goes | |
+| Not started | Work | 14B Fix | |
+| Not started | Gate | 14C Rerun on AWS | |

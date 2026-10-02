@@ -96,7 +96,10 @@ Storage nodes stripe their instance-store drives into one ext4 filesystem at `/m
 - **The processes' own counts:** S3 requests, bytes by source, block hits, admissions, evictions, leases, gateway errors, and each process's CPU, memory, open files and event loop delay.
 - **Hosts:** CPU, network and cache-drive traffic from `/proc`.
 - **Faults**, with when each took effect and how long a started node took to become ready.
+- **Latency:** first and last byte at p50, p75, p90, p95, p99, p99.9, p99.99 and the maximum; `latency/STEP.csv` has every percentile from 1 to 99 and the tail, for charts.
 - **A timeline** by 10-second windows; `timelines/STEP.csv` has it by the second.
+
+While a run lasts, every host records its processes' counters and its network cards' bytes every 5 seconds, which `run` saves in `samples/`. `loadtest/chart OUTPUT.png RUN [RUN...]` draws them over time, with matplotlib: each storage node host's throughput, requests a second and block hit rate, and each client host's time to first byte.
 
 ## Choosing targets
 

@@ -224,6 +224,59 @@ fn millis(micros: u64) -> String {
     }
 }
 
+/// Percentiles the report's distribution table shows.
+const SHOWN: [(&str, f64); 7] = [
+    ("p50", 0.5),
+    ("p75", 0.75),
+    ("p90", 0.9),
+    ("p95", 0.95),
+    ("p99", 0.99),
+    ("p99.9", 0.999),
+    ("p99.99", 0.9999),
+];
+
+/// Writes a step's latency distribution, over every host and class: a table
+/// in the report, and `latency/<step>.csv` with the first byte's and the
+/// last byte's microseconds at each percentile from 1 to 99, then 99.5,
+/// 99.9, 99.95, 99.99 and the maximum, for charts.
+fn latency(out: &mut String, run: &Path, step: &str, all: &ClassResult) -> Result<(), String> {
+    if all.successes() == 0 {
+        return Ok(());
+    }
+    let header: Vec<&str> = SHOWN.iter().map(|(name, _)| *name).collect();
+    let _ = writeln!(
+        out,
+        "\nLatency of answered requests:\n\n| | {} | max |\n|---|{}--:|",
+        header.join(" | "),
+        "--:|".repeat(SHOWN.len())
+    );
+    for (name, histogram) in [("First byte", &all.first_byte), ("Last byte", &all.total)] {
+        let shown: Vec<String> = SHOWN
+            .iter()
+            .map(|(_, share)| millis(histogram.percentile(*share)))
+            .collect();
+        let max = millis(histogram.max());
+        let _ = writeln!(out, "| {name} | {} | {max} |", shown.join(" | "));
+    }
+    let mut csv = String::from("percentile,first_byte_us,last_byte_us\n");
+    let percents = (1..100)
+        .map(|percent| percent.to_string())
+        .chain(["99.5", "99.9", "99.95", "99.99"].map(String::from));
+    for percent in percents {
+        let share = percent.parse::<f64>().unwrap_or_default() / 100.0;
+        let _ = writeln!(
+            csv,
+            "{percent},{},{}",
+            all.first_byte.percentile(share),
+            all.total.percentile(share)
+        );
+    }
+    let _ = writeln!(csv, "100,{},{}", all.first_byte.max(), all.total.max());
+    let dir = run.join("latency");
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    fs::write(dir.join(format!("{step}.csv")), csv).map_err(|error| error.to_string())
+}
+
 fn section(
     out: &mut String,
     run: &Path,
@@ -284,6 +337,7 @@ fn section(
     if !errors.is_empty() {
         let _ = writeln!(out, "\nErrors: {}.", errors.join(", "));
     }
+    latency(out, run, step, all)?;
     if let Some(cloudwatch) = CloudWatch::read(&run.join("cloudwatch").join(format!("{step}.json")))
     {
         let _ = writeln!(

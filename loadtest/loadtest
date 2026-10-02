@@ -193,6 +193,19 @@ def target(setup, host):
     return f"{setup.inventory.get('ssh_user', 'ubuntu')}@{host.public_ip}"
 
 
+# sshd opens at most 10 sessions on one multiplexed connection
+# (`MaxSessions`), so each host takes a few commands at a time.
+SESSIONS_PER_HOST = 8
+sessions = {}
+sessions_lock = threading.Lock()
+
+
+def session(host):
+    """A slot for one ssh session to `host`, held with `with`."""
+    with sessions_lock:
+        return sessions.setdefault(host.public_ip, threading.BoundedSemaphore(SESSIONS_PER_HOST))
+
+
 def remote(setup, host, command, check=True, log=None, stdin=None):
     """Runs `command` on `host` through bash, returning its standard output.
     With `log`, output goes to that file instead."""
@@ -202,11 +215,12 @@ def remote(setup, host, command, check=True, log=None, stdin=None):
     ssh = ["ssh", *ssh_options(setup), target(setup, host), f"bash -c {shlex.quote(command)}"]
     if log:
         log.parent.mkdir(parents=True, exist_ok=True)
-        with open(log, "w") as out:
+        with open(log, "w") as out, session(host):
             done = subprocess.run(ssh, stdout=out, stderr=subprocess.STDOUT, input=stdin, text=True)
         output = ""
     else:
-        done = subprocess.run(ssh, capture_output=True, input=stdin, text=True)
+        with session(host):
+            done = subprocess.run(ssh, capture_output=True, input=stdin, text=True)
         output = done.stdout
     if check and done.returncode != 0:
         detail = f"; see {log}" if log else f": {done.stderr.strip()[-2000:]}"
@@ -222,8 +236,9 @@ def upload(setup, host, files, directory, mode="600", owner="root"):
         return
     staging = f"/tmp/s3accel-upload-{tokens.token_hex(4)}"
     remote(setup, host, f"mkdir -p {staging}")
-    subprocess.run(["scp", "-q", *ssh_options(setup), *map(str, files), f"{target(setup, host)}:{staging}/"],
-                   check=True)
+    with session(host):
+        subprocess.run(["scp", "-q", *ssh_options(setup), *map(str, files), f"{target(setup, host)}:{staging}/"],
+                       check=True)
     names = " ".join(shlex.quote(f"{staging}/{Path(f).name}") for f in files)
     remote(setup, host, f"sudo mkdir -p {directory} && sudo install -o {owner} -m {mode} {names} {directory}/ "
                         f"&& rm -rf {staging}")
@@ -234,7 +249,8 @@ def download(setup, host, path, local):
         say(f"[{host.name}] fetch {path} -> {local}")
         return
     local.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["scp", "-q", *ssh_options(setup), f"{target(setup, host)}:{path}", str(local)], check=True)
+    with session(host):
+        subprocess.run(["scp", "-q", *ssh_options(setup), f"{target(setup, host)}:{path}", str(local)], check=True)
 
 
 def parallel(items, work):
@@ -730,6 +746,45 @@ def cmd_seed(args):
     parallel(setup.clients, seed)
 
 
+# What the samplers keep of each scrape: the counters `loadtest/chart` draws.
+SAMPLED = ("^s3accel_(node_reads_total|node_block_reads_total|node_body_bytes_total|gateway_requests_total"
+           "|gateway_response_bytes_total|gateway_first_byte_seconds_bucket)")
+
+
+# Matches a sampler's command line, and never the shell that runs pkill.
+SAMPLER = "'^/bin/bash /tmp/sampler[.]sh'"
+
+
+def start_samplers(setup):
+    """Starts a loop on every host that records, every 5 seconds, its
+    processes' counters and its network cards' bytes in /tmp/samples.txt."""
+    def start(host):
+        pairs = " ".join(f"{process.admin}={process.name}" for process in setup.processes()
+                         if process.host.name == host.name)
+        script = f"""#!/bin/bash
+while true; do
+  t=$(date +%s.%N)
+  for pair in {pairs}; do
+    curl -s --max-time 2 "http://${{pair%%=*}}/metrics" | grep -E '{SAMPLED}' | sed "s/^/$t ${{pair#*=}} /"
+  done
+  awk -v t="$t" 'NR > 2 {{ sub(":", ": "); print t, "nic", $1, $2, $10 }}' /proc/net/dev
+  sleep 5
+done >> /tmp/samples.txt
+"""
+        remote(setup, host, f"pkill -f {SAMPLER}; cat > /tmp/sampler.sh && chmod +x /tmp/sampler.sh && "
+                            "rm -f /tmp/samples.txt && (setsid /tmp/sampler.sh >/dev/null 2>&1 < /dev/null &)",
+               check=False, stdin=script)
+    parallel(setup.hosts, start)
+
+
+def fetch_samples(setup, run):
+    """Stops the samplers and saves what each recorded in RUN/samples."""
+    def fetch(host):
+        remote(setup, host, f"pkill -f {SAMPLER}", check=False)
+        download(setup, host, "/tmp/samples.txt", run / "samples" / f"{host.name}.txt")
+    parallel(setup.hosts, fetch)
+
+
 def snapshot(setup, run, step, moment):
     """Saves every process's /metrics and every host's kernel counters."""
     counters = ("echo '== time'; date +%s.%N; echo '== cpu'; head -1 /proc/stat; echo '== net'; cat /proc/net/dev; "
@@ -809,6 +864,17 @@ def cmd_run(args):
     (run / "run.json").write_text(json.dumps(info, indent=2) + "\n")
     hosts = len(setup.clients)
     tls = settings["topology"].get("tls", False)
+    start_samplers(setup)
+    try:
+        run_steps(setup, run, name, steps, info, remote_plan, hosts, tls)
+    finally:
+        fetch_samples(setup, run)
+    report(run)
+    say(f"results in {run}; S3's own request counts arrive in CloudWatch within minutes: "
+        f"`loadtest cloudwatch {name}` then `loadtest report {name}`; `loadtest/chart` draws it over time")
+
+
+def run_steps(setup, run, name, steps, info, remote_plan, hosts, tls):
     for step in steps:
         say(f"== {step['name']}")
         restore(setup)
@@ -857,9 +923,6 @@ def cmd_run(args):
         snapshot(setup, run, step["name"], "after")
         info["steps"].append(record)
         (run / "run.json").write_text(json.dumps(info, indent=2) + "\n")
-    report(run)
-    say(f"results in {run}; S3's own request counts arrive in CloudWatch within minutes: "
-        f"`loadtest cloudwatch {name}` then `loadtest report {name}`")
 
 
 def report(run):

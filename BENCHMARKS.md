@@ -172,10 +172,53 @@ The spec left the layout open until benchmarks tested its three risks. It stays:
 
 Each node's figure counts object bytes; TCP, IP and Ethernet headers add about 0.7% on 9,001-byte frames, which brings the nodes to 197-199 Gb/s of their 200.
 
+### Phase 13: a cheaper request path
+
+`rate13`: Phase 12's `rate8` hardware and layout (4 i4i.4xlarge nodes with eight node processes each, 4 c6in.8xlarge clients with gateways of 32 loops), after the read-ahead, the allocation cuts and the cached signing key. 276 million requests; S3 answered 25 of the million cold reads in `warm-small` with a 5xx, which the gateways passed on, and every other request was answered.
+
+| Workload | Requests/s | GiB/s | First byte p50 | p90 | p99 | p99.9 | Gateway CPU per request |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| One connection per client | 13,654 | 0.79 | 0.28 ms | 0.33 ms | 0.38 ms | 0.44 ms | |
+| Small hits, 256 connections per client | 196,148 | 11.33 | 0.80 ms | 4.93 ms | 29 ms | 55 ms | |
+| 4 KiB range hits, 64 connections per client | 691,839 | 2.64 | 0.35 ms | 0.45 ms | 0.59 ms | 0.81 ms | |
+| 4 KiB range hits, 256 connections per client | 911,555 | 3.48 | 0.56 ms | 1.11 ms | 16 ms | 24 ms | 86 µs of a vCPU |
+| 4 KiB range hits, 1,024 connections per client | 944,692 | 3.60 | 0.83 ms | 3.58 ms | 104 ms | 125 ms | 86 µs of a vCPU |
+
+4 KiB range hits rose 12% at 256 connections, from 813,561 a second to 911,555, and reached 944,692 at 1,024. Each gateway still took about 20 of its host's 32 vCPUs, and the client hosts ran at 72-76%, so the client hosts' CPU still set the limit; the node hosts ran at 32-41%. A request cost the gateway 86 µs of a vCPU against `rate8`'s 93 µs, 8% less, where one loop on a workstation gained 40%: the trims cut the gateway's own work, and on c6in most of a request's cost lies elsewhere, likely in the kernel's TCP and the network driver, which a profile on AWS would confirm. Small hits stayed at the nodes' network limit, and one connection's first byte fell from 0.33 ms to 0.28 ms. Past 256 connections, the client hosts queue: p99 rose to 16 ms at 256 and 104 ms at 1,024.
+
+### Scale test: the cache against S3
+
+`scale`, `scale-2` and `scale-1proc` (`loadtest/plans/scale.toml`): 10 c8in.16xlarge clients (64 vCPUs, 100 Gb/s), each running its gateway, read one dataset from S3 directly and through 6 m8idn.32xlarge nodes (128 vCPUs, 200 Gb/s, two 3.8 TB drives) with 1 TiB of cache each. Small objects and ranges ran 32 node processes per host; `scale-1proc` ran large objects with one. c6in.16xlarge and m6in.16xlarge clients were out of capacity in the zone. Connections are per client; rates are totals.
+
+| Workload | Target | Requests/s | GiB/s | First byte p50 | p90 | p99 | p99.9 |
+|---|---|--:|--:|--:|--:|--:|--:|
+| 4-256 KiB objects, 1 connection | S3 | 218 | 0.01 | 35 ms | 73 ms | 120 ms | 220 ms |
+| | Cache | 13,591 | 0.79 | 0.66 ms | 0.93 ms | 1.20 ms | 1.43 ms |
+| 4-256 KiB objects, 64 connections | S3 | 17,595 | 1.02 | 25 ms | 60 ms | 110 ms | 225 ms |
+| | Cache | 373,341 | 21.56 | 0.49 ms | 1.38 ms | 20 ms | 26 ms |
+| 4-256 KiB objects, 256 connections | Cache | 521,240 | 30.11 | 0.52 ms | 2.25 ms | 47 ms | 147 ms |
+| 4 KiB ranges, 64 connections | S3 | 20,694 | 0.08 | 26 ms | 48 ms | 98 ms | 215 ms |
+| | Cache | 1,642,343 | 6.27 | 0.38 ms | 0.51 ms | 0.65 ms | 0.79 ms |
+| 4 KiB ranges, 256 connections | Cache | 2,721,604 | 10.38 | 0.55 ms | 1.34 ms | 10 ms | 13 ms |
+| 4 KiB ranges, 1,024 connections | Cache | 3,696,502 | 14.10 | 1.00 ms | 7.23 ms | 22 ms | 42 ms |
+| 256 MiB objects, 16 connections | Cache | 416 | 103.93 | 1.22 ms | 1.98 ms | 3.26 ms | 5.12 ms |
+| 256 MiB objects, 64 connections | S3 | 217 | 54.33 | 87 ms | 130 ms | 176 ms | 229 ms |
+| | Cache | 459 | 114.73 | 2.78 ms | 5.76 ms | 11 ms | 211 ms |
+| 256 MiB objects, 256 connections | S3 | 438 | 109.45 | 34 ms | 97 ms | 143 ms | 190 ms |
+| | Cache | 452 | 112.93 | 211 ms | 219 ms | 420 ms | 745 ms |
+
+- **Small objects and ranges:** 21 times S3's request rate for small objects and 79 times for 4 KiB ranges at 64 connections, first byte under a millisecond. Nothing ran out: at 3.7 million ranges a second the client hosts were 42-44% busy and the node hosts 12%, while p99 rose to 22 ms. Small hits at 256 connections climbed from 407,000 to 632,000 a second over the step without a host near its limit. Both point at queueing in the request path, not at a resource.
+- **Large objects:** with one node process per host, the cache gave the clients 104 GiB/s at 16 connections and 115 GiB/s at 64, the clients' 1 Tb/s, each node sending about 170 Gb/s at 4% CPU; S3 gave 54 GiB/s at 64 connections and 109 at 256. At 256 connections the cache's reads queue at the clients' network cards, so its first byte waits 211 ms.
+- **Large objects across 192 ring members:** with 32 node processes per host, 256 MiB hits gave 43 GiB/s at 16 connections, 58 at 64, 50 at 128 and 13.5 at 256, where 667 reads timed out, with clients at 5-6% CPU and nodes at 1-2%. A gateway held 35,744 connections to nodes, most with receive windows near 250 KB. Phase 14 finds and fixes the cause.
+- **A cold set read three times** (`cold-medium`, about 870 GiB a pass): 20.5 GiB/s over the three passes; the block hit rate stays at zero while the first pass streams and the second admits, then holds at 100%.
+- **Errors:** S3 answered 67 of the 4.0 million direct requests with a 500, and one timed out; the cache passed on S3's 500s for 14 fills.
+
+`docs/scale-test.png` draws the runs over time with `loadtest/chart`.
+
 ### What limits each workload
 
 - **Large objects and small ones of tens of KiB:** the nodes' network cards, at line rate with a core or two to spare on a 200 Gb/s node. More throughput needs more network per node, or more nodes.
-- **Requests of a few KiB:** the gateways' CPU, at about 50 µs of a physical core per request on c6in. What's left to cut is in the gateway's request path: a small answer's head and body read and written separately, allocations and formatting per request, and the SigV4 key derived for each request. A node runs its core on one thread, so a host needs several node processes for small requests.
+- **Requests of a few KiB:** on c6in.8xlarge clients, the client hosts' CPU, where a gateway took 86 µs of a vCPU per request after Phase 13 and shared the host with the load generator. On the scale test's c8in.16xlarge clients, queueing set the limit before any CPU ran out. A node runs its core on one thread, so a host needs several node processes for small requests.
 - **Data the page cache doesn't hold:** not measured at line rate. Two drives per m8idn.32xlarge node likely read below its network's rate.
 - **Instances on burst credits:** an i4i.4xlarge sends 25 Gb/s for about an hour, then 9.375 Gb/s.
 

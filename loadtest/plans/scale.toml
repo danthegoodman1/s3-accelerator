@@ -1,0 +1,245 @@
+# Scale: the accelerator against S3 directly, from the same clients. 10
+# c8in.16xlarge clients (64 vCPUs, 100 Gb/s), each running its gateway, and
+# 6 m8idn.32xlarge nodes (128 vCPUs, 200 Gb/s) with `nodes_per_host = 32`,
+# enough nodes that the clients set the limit. Each workload runs against
+# S3 and against the cache at the same connections, and the cache's at more
+# where it has room. Reads the full plan's dataset, so seed that first.
+#
+#   loadtest/loadtest run loadtest/plans/scale.toml
+
+[dataset]
+prefix = "full/v1"
+seed = 1
+
+# Request rate: manifests, indexes, thumbnails.
+[[dataset.sets]]
+name = "small"
+count = 2_000_000
+size = { log_uniform = ["4KiB", "256KiB"] }
+
+# A working set larger than the cache.
+[[dataset.sets]]
+name = "medium"
+count = 100_000
+size = { log_uniform = ["1MiB", "32MiB"] }
+
+# Throughput: dataset shards, checkpoints.
+[[dataset.sets]]
+name = "large"
+count = 2_048
+size = "256MiB"
+
+# Analytics: a reader takes the footer, then row groups.
+[[dataset.sets]]
+name = "tables"
+count = 4_000
+size = { log_uniform = ["64MiB", "512MiB"] }
+format = "parquet"
+footer = "4MiB"
+
+[[steps]]
+name = "warm-small"
+target = "cache"
+requests = 1_000_000
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 500_000
+keys = "sequential"
+passes = 2
+window = 10_000
+
+[[steps]]
+name = "warm-large"
+target = "cache"
+requests = 2_048
+connections = 16
+verify = "edges"
+[[steps.reads]]
+set = "large"
+limit = 1_024
+keys = "sequential"
+passes = 2
+window = 64
+
+[[steps]]
+name = "s3-latency-small"
+target = "s3"
+duration = "60s"
+warmup = "10s"
+connections = 1
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 500_000
+
+[[steps]]
+name = "latency-small"
+target = "cache"
+duration = "60s"
+warmup = "10s"
+connections = 1
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 500_000
+
+[[steps]]
+name = "s3-small-c64"
+target = "s3"
+duration = "2m"
+warmup = "20s"
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 500_000
+
+[[steps]]
+name = "hits-small-c64"
+target = "cache"
+duration = "2m"
+warmup = "20s"
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 500_000
+
+[[steps]]
+name = "hits-small-c256"
+target = "cache"
+duration = "2m"
+warmup = "20s"
+connections = 256
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 500_000
+
+[[steps]]
+name = "s3-ranges-4k-c64"
+target = "s3"
+duration = "2m"
+warmup = "20s"
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 500_000
+range = { size = "4KiB" }
+
+[[steps]]
+name = "ranges-4k-c64"
+target = "cache"
+duration = "2m"
+warmup = "20s"
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 500_000
+range = { size = "4KiB" }
+
+[[steps]]
+name = "ranges-4k-c256"
+target = "cache"
+duration = "2m"
+warmup = "20s"
+connections = 256
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 500_000
+range = { size = "4KiB" }
+
+[[steps]]
+name = "ranges-4k-c1024"
+target = "cache"
+duration = "2m"
+warmup = "20s"
+connections = 1024
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 500_000
+range = { size = "4KiB" }
+
+[[steps]]
+name = "s3-large-c64"
+target = "s3"
+duration = "2m"
+warmup = "20s"
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "large"
+
+[[steps]]
+name = "s3-large-c256"
+target = "s3"
+duration = "2m"
+warmup = "20s"
+connections = 256
+verify = "edges"
+[[steps.reads]]
+set = "large"
+
+[[steps]]
+name = "hits-large-c64"
+target = "cache"
+duration = "2m"
+warmup = "20s"
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "large"
+limit = 1_024
+
+[[steps]]
+name = "hits-large-c128"
+target = "cache"
+duration = "2m"
+warmup = "20s"
+connections = 128
+verify = "edges"
+[[steps.reads]]
+set = "large"
+limit = 1_024
+
+[[steps]]
+name = "hits-large-c16"
+target = "cache"
+duration = "2m"
+warmup = "20s"
+connections = 16
+verify = "edges"
+[[steps.reads]]
+set = "large"
+limit = 1_024
+
+[[steps]]
+name = "hits-large-c256"
+target = "cache"
+duration = "2m"
+warmup = "20s"
+connections = 256
+verify = "edges"
+[[steps.reads]]
+set = "large"
+limit = 1_024
+
+# A cold set read three times, for the hit rate over time: the first pass
+# streams from S3, the second admits each block, the third hits.
+[[steps]]
+name = "cold-medium"
+target = "cache"
+requests = 300_000
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "medium"
+keys = "sequential"
+passes = 3
+window = 100_000
