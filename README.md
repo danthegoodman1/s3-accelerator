@@ -1,13 +1,13 @@
 # s3-accelerator
 
-A distributed NVMe read cache in front of S3. Clients keep their S3 SDKs and point them at the cache. S3 stays the source of truth, and the cache holds copies it can always drop. A hit's first byte arrives in under a millisecond, and every hit saves an S3 GET.
+A per-zone NVMe read cache for S3 that serves hits in under a millisecond, replicates hot objects, and stays warm when the cluster resizes.
 
-[spec.md](spec.md) is the design, [BENCHMARKS.md](BENCHMARKS.md) holds every measurement, and [PLAN.md](PLAN.md) tracks the work.
+Clients keep their S3 SDKs and point them at the cache. S3 stays the source of truth.
 
 ## Contents
 
-- [Performance](#performance)
 - [What sets it apart](#what-sets-it-apart)
+- [Performance](#performance)
 - [Quick start](#quick-start)
 - [Deployment modes](#deployment-modes)
 - [How it works](#how-it-works)
@@ -20,11 +20,19 @@ A distributed NVMe read cache in front of S3. Clients keep their S3 SDKs and poi
   - [Tuning](#tuning)
 - [Development](#development)
 
+## What sets it apart
+
+- **Resizing keeps the cache warm.** Adding or removing a node moves only that node's keys. New owners fetch what they took over from the old owners before asking S3. See [Ring changes](#ring-changes).
+- **Hot keys replicate themselves.** An overloaded key gets short-lived replicas, and gateways spread its reads across them. See [Hot-key replication](#hot-key-replication).
+- **One-time reads stay off disk.** A block reaches NVMe on its second read, so scans don't evict the hot set. See [Admission on the second read](#admission-on-the-second-read).
+- **Multi-tenant auth for any S3-compatible origin.** Gateways check SigV4 and per-credential grants on every hit. Each bucket can have its own origin, such as AWS S3, R2 or MinIO.
+- **Zero-copy bytes.** Nodes send blocks with `sendfile`, gateways relay them with `splice`, and kernel TLS encrypts inside those calls.
+
+## Performance
+
 ![Two tests over time: 256 MiB objects and 4 KiB ranges, each with every storage node host's throughput, reads per second and block hit rate, and every client host's time to first byte](docs/scale-test.png)
 
 *Top: 256 MiB objects. Each storage host sends about 170 Gb/s, and first byte stays near 1.7 ms. Bottom: 4 KiB ranges at 1.84 million reads a second, with first byte under 1 ms. Each line is one storage host, or in the latency panels, one client host.*
-
-## Performance
 
 Ten client hosts (c8in.16xlarge, 100 Gb/s each) read the same data from S3 and through six storage hosts (m8idn.32xlarge, 200 Gb/s each). Each client ran its gateway as a sidecar. Rates are totals across the clients. Latency is time to first byte, p50 / p99.
 
@@ -47,14 +55,6 @@ Small objects are 4 to 256 KiB. Connections are per client.
 - **Hosts vary.** Two identical fleets launched the same day differed up to fourfold. See [Tuning](#tuning).
 
 `loadtest/plans/scale.toml` reruns the test.
-
-## What sets it apart
-
-- **Resizing keeps the cache warm.** Adding or removing a node moves only that node's keys. New owners fetch what they took over from the old owners before asking S3. See [Ring changes](#ring-changes).
-- **Hot keys replicate themselves.** An overloaded key gets short-lived replicas, and gateways spread its reads across them. See [Hot-key replication](#hot-key-replication).
-- **One-time reads stay off disk.** A block reaches NVMe on its second read, so scans don't evict the hot set. See [Admission on the second read](#admission-on-the-second-read).
-- **Multi-tenant auth for any S3-compatible origin.** Gateways check SigV4 and per-credential grants on every hit. Each bucket can have its own origin, such as AWS S3, R2 or MinIO.
-- **Zero-copy bytes.** Nodes send blocks with `sendfile`, gateways relay them with `splice`, and kernel TLS encrypts inside those calls.
 
 ## Quick start
 
