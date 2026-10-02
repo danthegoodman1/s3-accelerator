@@ -15,6 +15,9 @@ use bytes::Bytes;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -106,16 +109,21 @@ pub struct Lookups<T> {
     service: Service,
     cache: RefCell<Cache<T>>,
     parse: Parse<T>,
-    metrics: Rc<Metrics>,
+    metrics: Arc<Metrics>,
 }
 
 impl<T: Clone + 'static> Lookups<T> {
+    /// Lookups of `kind` in the service `metadata` names. `in_flight`
+    /// counts the lookups under way for names held no record of, across
+    /// every cache of the kind in the process: a gateway has one in each
+    /// event loop.
     pub fn new(
         kind: Kind,
         metadata: &MetadataConfig,
         client: HttpClient,
         parse: Parse<T>,
-        metrics: Rc<Metrics>,
+        metrics: Arc<Metrics>,
+        in_flight: Arc<AtomicUsize>,
     ) -> Rc<Lookups<T>> {
         Rc::new(Lookups {
             kind,
@@ -127,6 +135,7 @@ impl<T: Clone + 'static> Lookups<T> {
             cache: RefCell::new(Cache::new(
                 Duration::from_millis(metadata.grace_ms),
                 Duration::from_millis(metadata.unknown_ttl_ms),
+                in_flight,
             )),
             parse,
             metrics,
@@ -219,23 +228,17 @@ impl<T: Clone + 'static> Lookups<T> {
         signature: &str,
         now: i64,
     ) -> Invalidated {
-        let Ok(stamped) = time.parse::<i64>() else {
-            return Invalidated::Refused;
-        };
-        let expected = invalidation_signature(&self.service.token, path, stamped);
-        let signed = sigv4::constant_time_eq(expected.as_bytes(), signature.as_bytes());
-        if !signed || now.abs_diff(stamped) > INVALIDATION_SKEW {
+        if !signed_invalidation(&self.service.token, path, time, signature, now) {
             return Invalidated::Refused;
         }
-        self.cache.borrow_mut().invalidate(name);
-        self.metrics.metadata_invalidated(self.kind);
-        log!(
-            Info,
-            "took an invalidation",
-            of = self.kind.noun(),
-            name = name
-        );
+        self.forget(name);
+        took_invalidation(&self.metrics, self.kind, name);
         Invalidated::Dropped
+    }
+
+    /// Drops the name's entry, for an invalidation checked elsewhere.
+    pub fn forget(&self, name: &str) {
+        self.cache.borrow_mut().invalidate(name);
     }
 
     /// Keeps `value` for `name` as though the service had answered it.
@@ -248,6 +251,24 @@ impl<T: Clone + 'static> Lookups<T> {
         };
         let _ = cache.looked_up(name, Answer::Found(value, ttl), now);
     }
+}
+
+/// Whether the metadata service, holding `token`, signed an invalidation
+/// sent to `path` stamped `time` in Unix seconds, recently enough to take.
+/// `now` is the process's Unix time.
+pub fn signed_invalidation(token: &str, path: &str, time: &str, signature: &str, now: i64) -> bool {
+    let Ok(stamped) = time.parse::<i64>() else {
+        return false;
+    };
+    let expected = invalidation_signature(token, path, stamped);
+    let signed = sigv4::constant_time_eq(expected.as_bytes(), signature.as_bytes());
+    signed && now.abs_diff(stamped) <= INVALIDATION_SKEW
+}
+
+/// Counts and logs an invalidation of `name` the process took.
+pub fn took_invalidation(metrics: &Metrics, kind: Kind, name: &str) {
+    metrics.metadata_invalidated(kind);
+    log!(Info, "took an invalidation", of = kind.noun(), name = name);
 }
 
 /// The hex HMAC-SHA256 of an invalidation's path and its time, in Unix
@@ -314,8 +335,9 @@ struct Cache<T> {
     entries: BTreeMap<String, Entry<T>>,
     /// Entries remembered as unknown.
     unknown: usize,
-    /// Lookups under way for names the cache holds no record of.
-    in_flight: usize,
+    /// Lookups under way for names held no record of, in this cache and
+    /// the others it shares the count with.
+    in_flight: Arc<AtomicUsize>,
     /// How many entries the cache holds before it next drops spent ones.
     sweep_at: usize,
     grace: Duration,
@@ -437,11 +459,11 @@ impl<T: Clone> Entry<T> {
 }
 
 impl<T: Clone> Cache<T> {
-    fn new(grace: Duration, unknown_ttl: Duration) -> Cache<T> {
+    fn new(grace: Duration, unknown_ttl: Duration, in_flight: Arc<AtomicUsize>) -> Cache<T> {
         Cache {
             entries: BTreeMap::new(),
             unknown: 0,
-            in_flight: 0,
+            in_flight,
             sweep_at: SWEEP_FLOOR,
             grace,
             unknown_ttl,
@@ -500,15 +522,13 @@ impl<T: Clone> Cache<T> {
         }
         let start = entry.lookup.is_none();
         let capped = start && entry.known.is_none();
-        if capped && self.in_flight >= MAX_IN_FLIGHT {
+        let room = |count: usize| (count < MAX_IN_FLIGHT).then_some(count + 1);
+        if capped && self.in_flight.fetch_update(Relaxed, Relaxed, room).is_err() {
             return Found::Ready {
                 value: Err(Unresolved::Busy),
                 stale: false,
                 refresh: false,
             };
-        }
-        if capped {
-            self.in_flight += 1;
         }
         let (sender, waiting) = oneshot::channel();
         let pending = entry.lookup.get_or_insert_with(|| Pending {
@@ -535,7 +555,7 @@ impl<T: Clone> Cache<T> {
         }
         let pending = entry.lookup.take().unwrap_or_default();
         if pending.capped {
-            self.in_flight -= 1;
+            self.in_flight.fetch_sub(1, Relaxed);
         }
         let waiters = pending.waiters;
         let (value, stale) = match answer {
@@ -630,7 +650,7 @@ mod tests {
     const UNKNOWN_TTL: Duration = Duration::from_secs(10);
 
     fn cache() -> Cache<u32> {
-        Cache::new(GRACE, UNKNOWN_TTL)
+        Cache::new(GRACE, UNKNOWN_TTL, Arc::default())
     }
 
     /// A request that finds its answer at once.
@@ -934,7 +954,7 @@ mod tests {
         let (_, start) = waits(cache.find("expired", now + TTL));
         assert!(start);
         let _ = done(cache.looked_up("known", Answer::Found(7, TTL), half));
-        assert_eq!(cache.in_flight, MAX_IN_FLIGHT);
+        assert_eq!(cache.in_flight.load(Relaxed), MAX_IN_FLIGHT);
         // Once a lookup of an unknown name ends, another may start.
         let _ = done(cache.looked_up("0", Answer::Unknown, now));
         let (_, start) = waits(cache.find("one-more", now));

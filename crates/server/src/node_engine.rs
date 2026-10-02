@@ -10,7 +10,7 @@
 //! cluster protocol, and holds those bodies like fills.
 
 use crate::disk::{Disk, Entry};
-use crate::http::{Connection, Framing, Response, header, split_path};
+use crate::http::{self, Connection, Framing, Response, header, split_path};
 use crate::log;
 use crate::lookups::Unresolved;
 use crate::metrics::{Link, Metrics, S3Kind};
@@ -112,7 +112,7 @@ const PAGES_RECHECK: Duration = Duration::from_millis(10);
 
 pub struct NodeEngine {
     started: Instant,
-    metrics: Rc<Metrics>,
+    metrics: Arc<Metrics>,
     origins: Rc<Origins>,
     peers: Rc<Peers>,
     disk: Arc<Disk>,
@@ -198,7 +198,7 @@ impl NodeEngine {
         peers: Rc<Peers>,
         disk: Arc<Disk>,
         addresses: BTreeMap<NodeId, String>,
-        metrics: Rc<Metrics>,
+        metrics: Arc<Metrics>,
     ) -> SharedNode {
         let engine = Rc::new(RefCell::new(NodeEngine {
             addresses,
@@ -571,11 +571,17 @@ impl NodeEngine {
                 body,
                 meta,
                 hot,
+                s3_error,
             } => {
                 let len = body.iter().map(segment_len).sum();
                 let body = self.parts(&body);
                 let hot = self.hints(hot);
-                let answer = NodeAnswer::Respond { head, meta, hot };
+                let answer = NodeAnswer::Respond {
+                    head,
+                    meta,
+                    hot,
+                    s3_error,
+                };
                 if !self.reply(request, answer, body, len, true) {
                     self.node.on_sent(request);
                 }
@@ -1048,8 +1054,8 @@ async fn fetch(engine: SharedNode, origin: OriginRequestId, request: Request, st
             (client.read(&request, hold).await, true)
         }
         Err(Unresolved::Unknown) => (origin::Reply::no_such_bucket(), false),
-        // A gateway takes any 5xx from a node as the node's failure, and
-        // answers its client 503 itself.
+        // Without the bucket's origin the node cannot ask S3: its own
+        // failure, so the gateway tries another node.
         Err(Unresolved::Unavailable | Unresolved::Busy) => (origin::Reply::failed(), false),
     };
     let (work, passing) = {
@@ -1058,6 +1064,7 @@ async fn fetch(engine: SharedNode, origin: OriginRequestId, request: Request, st
         if sent {
             this.metrics.s3_request(S3Kind::Read, reply.answered);
         }
+        let failed = reply.is_failure();
         let status = reply.answered.map(|(status, _)| status);
         if sent && status.is_none_or(|status| status >= 500) {
             let status = status.map_or("none".to_string(), |status| status.to_string());
@@ -1082,7 +1089,10 @@ async fn fetch(engine: SharedNode, origin: OriginRequestId, request: Request, st
             }
         };
         let now = this.now();
-        this.node.on_origin_response(now, origin, reply.head);
+        match failed {
+            true => this.node.on_origin_failed(now, origin),
+            false => this.node.on_origin_response(now, origin, reply.head),
+        }
         let work = this.pump();
         let readers = match this.bodies.get_mut(&origin) {
             Some(body) => match std::mem::replace(body, Body::Passing) {
@@ -1392,11 +1402,12 @@ pub async fn serve(
     });
     tokio::pin!(stop);
     loop {
-        let (stream, _) = tokio::select! {
-            accepted = listener.accept() => accepted?,
+        let stream = tokio::select! {
+            stream = http::accept(&listener, "cluster") => stream,
             () = &mut stop => break,
         };
-        stream.set_nodelay(true)?;
+        // A socket that refuses the option still serves, only slower.
+        let _ = stream.set_nodelay(true);
         let (tls, engine, secret) = (tls.clone(), engine.clone(), secret.clone());
         tokio::task::spawn_local(async move {
             let metrics = engine.borrow().metrics.clone();
@@ -1566,9 +1577,24 @@ async fn serve_connection(
                     .await?;
                 return Ok(*len);
             }
-            connection
-                .write_response_head(status, &headers, framing, head.keep_alive)
-                .await?;
+            // Stored or held bytes go out at once, so the head can wait
+            // to share their first packet.
+            let at_once = matches!(
+                reply.body.first(),
+                Some(Part::File { .. } | Part::Held { .. })
+            );
+            match at_once {
+                true => {
+                    connection
+                        .write_response_head_more(status, &headers, framing, head.keep_alive)
+                        .await?
+                }
+                false => {
+                    connection
+                        .write_response_head(status, &headers, framing, head.keep_alive)
+                        .await?
+                }
+            }
             send_body(&mut connection, engine, reply.body).await
         }
         .await;
@@ -1618,6 +1644,7 @@ fn no_such_bucket() -> Reply {
             head,
             meta: None,
             hot: Vec::new(),
+            s3_error: false,
         },
         body: vec![Part::Held { bytes: body, len }],
         len,
@@ -1828,11 +1855,14 @@ async fn send_body(
                 let disk = engine.borrow().disk.clone();
                 let total: u64 = run.iter().map(|(_, len)| len).sum();
                 // Bytes the page cache holds go out from the event loop.
-                // Kernel TLS encrypts as it sends, so its sends stay on
-                // workers.
-                let inline = !connection.kernel_tls()
-                    && total <= zero_copy::INLINE_SEND
-                    && run.iter().all(|&(offset, len)| disk.cached(offset, len));
+                // Kernel TLS encrypts as it sends, so only a run within one
+                // record does.
+                let most = match connection.kernel_tls() {
+                    true => zero_copy::INLINE_TLS,
+                    false => zero_copy::INLINE_SEND,
+                };
+                let inline =
+                    total <= most && run.iter().all(|&(offset, len)| disk.cached(offset, len));
                 if inline {
                     for (offset, len) in run {
                         disk.send_cached(connection.stream(), offset, len).await?;

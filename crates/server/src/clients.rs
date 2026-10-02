@@ -2,19 +2,32 @@
 //! service, by access key ID.
 
 use crate::config::{Access, Config, Grant};
-use crate::lookups::{Invalidated, Kind, Lookups, Unresolved};
+use crate::lookups::{Kind, Lookups, Unresolved};
 use crate::metrics::Metrics;
 use crate::origin::HttpClient;
 use crate::sigv4::{self, DateKeys};
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 /// What a client may do, and what checks its signatures.
 pub struct Credential {
     grants: Vec<Grant>,
     keys: Keys,
+    /// The last signing key derived, which the day's requests share.
+    signing: RefCell<Option<Signing>>,
+}
+
+/// A signing key, and the date, region and service it signs for.
+struct Signing {
+    date: String,
+    region: String,
+    service: String,
+    key: [u8; 32],
 }
 
 enum Keys {
@@ -25,6 +38,14 @@ enum Keys {
 }
 
 impl Credential {
+    fn new(grants: Vec<Grant>, keys: Keys) -> Credential {
+        Credential {
+            grants,
+            keys,
+            signing: RefCell::new(None),
+        }
+    }
+
     /// Whether a grant gives `access` to `key` in `bucket`. A listing
     /// passes the prefix it lists, and a request about the bucket itself
     /// an empty key, which only a grant on the whole bucket covers.
@@ -51,6 +72,26 @@ impl DateKeys for Credential {
             Keys::Dates(keys) => keys.get(date).cloned(),
         }
     }
+
+    fn signing_key(&self, date: &str, region: &str, service: &str) -> Option<[u8; 32]> {
+        if let Some(held) = &*self.signing.borrow()
+            && (
+                held.date.as_str(),
+                held.region.as_str(),
+                held.service.as_str(),
+            ) == (date, region, service)
+        {
+            return Some(held.key);
+        }
+        let key = sigv4::signing_key(&self.date_key(date)?, region, service);
+        *self.signing.borrow_mut() = Some(Signing {
+            date: date.into(),
+            region: region.into(),
+            service: service.into(),
+            key,
+        });
+        Some(key)
+    }
 }
 
 pub struct Clients {
@@ -58,26 +99,41 @@ pub struct Clients {
     configured: BTreeMap<String, Rc<Credential>>,
     /// The metadata service, which names every client when set.
     lookups: Option<Rc<Lookups<Rc<Credential>>>>,
-    metrics: Rc<Metrics>,
+    metrics: Arc<Metrics>,
 }
 
 impl Clients {
-    pub fn new(config: &Config, client: HttpClient, metrics: Rc<Metrics>) -> Clients {
+    /// The clients `config` names, or those its metadata service serves,
+    /// looked up with at most `MAX_IN_FLIGHT` lookups under way that
+    /// `in_flight` counts for the process.
+    pub fn new(
+        config: &Config,
+        client: HttpClient,
+        metrics: Arc<Metrics>,
+        in_flight: Arc<AtomicUsize>,
+    ) -> Clients {
         let configured = config
             .clients
             .iter()
             .map(|client| {
-                let credential = Credential {
-                    grants: client.grants.clone(),
-                    keys: Keys::Secret(client.secret_access_key.clone()),
-                };
+                let credential = Credential::new(
+                    client.grants.clone(),
+                    Keys::Secret(client.secret_access_key.clone()),
+                );
                 (client.access_key_id.clone(), Rc::new(credential))
             })
             .collect();
         Clients {
             configured,
             lookups: config.metadata.as_ref().map(|metadata| {
-                Lookups::new(Kind::Client, metadata, client, parse, metrics.clone())
+                Lookups::new(
+                    Kind::Client,
+                    metadata,
+                    client,
+                    parse,
+                    metrics.clone(),
+                    in_flight,
+                )
             }),
             metrics,
         }
@@ -96,19 +152,11 @@ impl Clients {
         Ok(credential)
     }
 
-    /// Checks the service's invalidation of `access_key_id`, sent to
-    /// `path`, and drops the client's entry.
-    pub fn invalidate(
-        &self,
-        access_key_id: &str,
-        path: &str,
-        time: &str,
-        signature: &str,
-        now: i64,
-    ) -> Invalidated {
-        match &self.lookups {
-            Some(lookups) => lookups.invalidate(access_key_id, path, time, signature, now),
-            None => Invalidated::NoService,
+    /// Drops the client's entry, for an invalidation the admin listener
+    /// checked.
+    pub fn forget(&self, access_key_id: &str) {
+        if let Some(lookups) = &self.lookups {
+            lookups.forget(access_key_id);
         }
     }
 }
@@ -133,10 +181,7 @@ fn parse(_: &HttpClient, body: &[u8]) -> Result<(Rc<Credential>, Duration), Stri
             _ => return Err(format!("the signing key for {date} is malformed")),
         };
     }
-    let credential = Credential {
-        grants: served.grants,
-        keys: Keys::Dates(keys),
-    };
+    let credential = Credential::new(served.grants, Keys::Dates(keys));
     Ok((Rc::new(credential), Duration::from_millis(served.ttl_ms)))
 }
 
@@ -146,10 +191,35 @@ mod tests {
 
     fn credential(grants: &str) -> Credential {
         let grants: Vec<Grant> = serde_json::from_str(grants).unwrap();
-        Credential {
-            grants,
-            keys: Keys::Secret("secret".into()),
-        }
+        Credential::new(grants, Keys::Secret("secret".into()))
+    }
+
+    /// A credential keeps the signing key of the date, region and service
+    /// it last signed for, and derives another's anew.
+    #[test]
+    fn a_credential_keeps_its_signing_key_for_its_day() {
+        let credential = credential("[]");
+        let key = |date: &str, region: &str| {
+            sigv4::signing_key(&sigv4::date_key("secret", date), region, "s3")
+        };
+        let kept = |date, region| credential.signing_key(date, region, "s3");
+        assert_eq!(
+            kept("20261001", "us-east-1"),
+            Some(key("20261001", "us-east-1"))
+        );
+        assert_eq!(
+            kept("20261001", "us-east-1"),
+            Some(key("20261001", "us-east-1"))
+        );
+        assert_eq!(
+            kept("20261002", "us-east-1"),
+            Some(key("20261002", "us-east-1"))
+        );
+        assert_eq!(
+            kept("20261002", "eu-west-1"),
+            Some(key("20261002", "eu-west-1"))
+        );
+        assert_ne!(key("20261001", "us-east-1"), key("20261002", "us-east-1"));
     }
 
     #[test]
@@ -191,14 +261,12 @@ mod tests {
             .build()
             .unwrap();
         for (name, config) in [("config", from_config), ("service", from_service)] {
-            let metrics = Rc::new(Metrics::default());
-            let clients = Clients::new(&config, crate::origin::client(), metrics);
+            let metrics = Arc::new(Metrics::default());
+            let clients = Clients::new(&config, crate::origin::client(), metrics, Arc::default());
             if let Some(lookups) = &clients.lookups {
                 for index in 0..100 {
-                    let credential = Rc::new(Credential {
-                        grants: Vec::new(),
-                        keys: Keys::Dates(BTreeMap::new()),
-                    });
+                    let credential =
+                        Rc::new(Credential::new(Vec::new(), Keys::Dates(BTreeMap::new())));
                     let ttl = Duration::from_secs(3600);
                     lookups.preload(&format!("key-{index}"), credential, ttl);
                 }

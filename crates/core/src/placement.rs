@@ -69,13 +69,24 @@ pub fn down_version(down: &[NodeId]) -> u64 {
 pub struct Ring {
     version: u64,
     members: Vec<Member>,
+    /// Whether every member has the same weight. A member's score then rises
+    /// with its hash alone, so comparing hashes ranks members as the scores
+    /// do, without a logarithm for each.
+    uniform: bool,
 }
 
 impl Ring {
     pub fn new(version: u64, mut members: Vec<Member>) -> Ring {
         members.sort_by_key(|member| member.id);
         members.dedup_by_key(|member| member.id);
-        Ring { version, members }
+        let uniform = members
+            .windows(2)
+            .all(|pair| pair[0].weight == pair[1].weight);
+        Ring {
+            version,
+            members,
+            uniform,
+        }
     }
 
     pub fn version(&self) -> u64 {
@@ -88,6 +99,13 @@ impl Ring {
 
     /// The node that owns `placement`, or `None` for an empty ring.
     pub fn owner(&self, placement: PlacementHash) -> Option<NodeId> {
+        if self.uniform {
+            let ranked = self
+                .members
+                .iter()
+                .map(|member| (draw(placement, member), member.id));
+            return ranked.max().map(|(_, id)| id);
+        }
         self.members
             .iter()
             .map(|member| (score(placement, member), member.id))
@@ -98,6 +116,15 @@ impl Ring {
     /// Every node, best candidate first. The first owns `placement`; the next
     /// ones take over when it fails and hold its hot-key replicas.
     pub fn candidates(&self, placement: PlacementHash) -> Vec<NodeId> {
+        if self.uniform {
+            let mut ranked: Vec<_> = self
+                .members
+                .iter()
+                .map(|member| (draw(placement, member), member.id))
+                .collect();
+            ranked.sort_unstable_by(|a, b| b.cmp(a));
+            return ranked.into_iter().map(|(_, id)| id).collect();
+        }
         let mut scored: Vec<_> = self
             .members
             .iter()
@@ -108,11 +135,16 @@ impl Ring {
     }
 }
 
+/// A member's draw for `placement`: 53 bits, which a score turns into a
+/// point in (0, 1).
+fn draw(placement: PlacementHash, member: &Member) -> u64 {
+    xxh3_64_with_seed(&placement.0.to_le_bytes(), member.id.0) >> 11
+}
+
 /// The logarithmic method: each node wins with probability proportional to
 /// its weight, and a membership change moves only the placements it must.
 fn score(placement: PlacementHash, member: &Member) -> f64 {
-    let hash = xxh3_64_with_seed(&placement.0.to_le_bytes(), member.id.0);
-    let unit = ((hash >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+    let unit = (draw(placement, member) as f64 + 0.5) / (1u64 << 53) as f64;
     // libm computes the same logarithm on every platform.
     f64::from(member.weight.get()) / -libm::log(unit)
 }
@@ -159,6 +191,33 @@ mod tests {
             .collect();
         assert_eq!(homes, [1, 3, 2, 3, 1, 1, 3, 3]);
         assert_eq!(chunks, [4, 3, 1, 4, 4, 3, 4, 2]);
+    }
+
+    /// A ring whose members share one weight ranks them by their draws, as
+    /// the scores would: the same owner and the same candidates, in order.
+    #[test]
+    fn uniform_rings_rank_as_the_scores_do() {
+        for weight in [1, 7, 3_800] {
+            let members: Vec<(u64, u32)> = (0..40).map(|id| (id * 37 + 5, weight)).collect();
+            let ring = ring(&members);
+            for index in 0..2_000 {
+                let key = key(index);
+                for placement in [
+                    Placement::Home(&key).hash(),
+                    Placement::Chunk(&key, index as u64).hash(),
+                ] {
+                    let mut scored: Vec<_> = ring
+                        .members()
+                        .iter()
+                        .map(|member| (score(placement, member), member.id))
+                        .collect();
+                    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1.cmp(&a.1)));
+                    let expected: Vec<NodeId> = scored.into_iter().map(|(_, id)| id).collect();
+                    assert_eq!(ring.candidates(placement), expected);
+                    assert_eq!(ring.owner(placement), Some(expected[0]));
+                }
+            }
+        }
     }
 
     #[test]

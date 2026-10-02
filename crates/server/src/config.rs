@@ -67,6 +67,31 @@ pub struct ClusterConfig {
     /// Gateways and nodes reach nodes over mutual TLS when set, and over
     /// plaintext otherwise.
     pub tls: Option<ClusterTlsConfig>,
+    #[serde(default)]
+    pub tcp: TcpConfig,
+}
+
+/// TCP timers on links among gateways and nodes, in microseconds; 0 keeps
+/// Linux's. A round trip within a zone takes well under a millisecond,
+/// while Linux waits at least 200 ms to resend a lost segment, and as long
+/// for a loss probe when an answer's last segment is lost: one lost packet
+/// would stall a read.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TcpConfig {
+    /// The least time before a lost segment is sent again.
+    pub rto_min_us: u32,
+    /// The most time an acknowledgement waits.
+    pub delack_max_us: u32,
+}
+
+impl Default for TcpConfig {
+    fn default() -> TcpConfig {
+        TcpConfig {
+            rto_min_us: 5_000,
+            delack_max_us: 5_000,
+        }
+    }
 }
 
 /// Mutual TLS among cluster members. Each presents a certificate the
@@ -153,6 +178,18 @@ pub struct GatewayConfig {
     pub domains: Vec<String>,
     /// Clients connect over TLS when set, and over plaintext otherwise.
     pub tls: Option<TlsConfig>,
+    /// Event loops, each on a thread of its own: the machine's cores by
+    /// default.
+    pub threads: Option<usize>,
+}
+
+impl GatewayConfig {
+    /// The gateway's event loops.
+    pub fn threads(&self) -> usize {
+        self.threads.unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(1, |threads| threads.get())
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +225,9 @@ impl Config {
         }
         if self.cluster.secret.is_empty() {
             return Err("cluster.secret is empty".into());
+        }
+        if self.gateway.as_ref().and_then(|gateway| gateway.threads) == Some(0) {
+            return Err("gateway.threads is 0".into());
         }
         let mut keys = BTreeSet::new();
         for client in &self.clients {

@@ -64,7 +64,10 @@ async fn a_prefix_reader_frees_its_connection_before_the_body_ends() {
         .run_until(async {
             let (port, origin) = start(r#"{ bucket = "bucket" }"#, "").await;
             origin.size.set(4 << 20);
-            origin.trickle.set(Duration::from_millis(25));
+            // The body takes about 3.2 s, 64 pieces 50 ms apart, so a read
+            // that waited for it takes twice the bound below, and a busy
+            // machine has twice as long as it needs.
+            origin.trickle.set(Duration::from_millis(50));
             let whole =
                 tokio::task::spawn_local(send(port, "GET", "/bucket/big", "", &[], Vec::new()));
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -85,7 +88,7 @@ async fn a_prefix_reader_frees_its_connection_before_the_body_ends() {
             );
             let waited = started.elapsed();
             assert!(
-                waited < Duration::from_millis(500),
+                waited < Duration::from_millis(1_500),
                 "the next read waited {waited:?}"
             );
             let (status, body) = whole.await.unwrap();

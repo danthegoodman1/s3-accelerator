@@ -6,16 +6,23 @@ use crate::protocol::{REQUEST_ID, RequestId};
 use crate::tls::Session;
 use bytes::Bytes;
 use percent_encoding::percent_decode_str;
+use rustix::net::SendFlags;
 use s3_accelerator_core::s3::{ByteRange, ContentRange, ETag};
+use std::fmt::Write as _;
 use std::io;
+use std::pin::Pin;
 use std::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_HEADERS: usize = 100;
 /// The most bytes one read of a body takes.
 const READ_CHUNK: usize = 256 * 1024;
+/// The most of a node's answer read with its head: a small body, as of a
+/// 4 KiB range, arrives whole, and a larger one's first bytes go on from
+/// memory before `splice` moves the rest.
+pub const READ_AHEAD: usize = 16 * 1024;
 /// How long a peer may leave a write waiting.
 const WRITE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 /// How long a closing connection drains a body it never read.
@@ -82,23 +89,40 @@ impl Response {
     }
 }
 
-/// How long a plaintext listener waits after failing to accept.
+/// How many connections wait in a listener's queue to be accepted; the
+/// kernel caps it at `net.core.somaxconn`.
+const BACKLOG: u32 = 4_096;
+/// How long a listener waits after failing to accept.
 const ACCEPT_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Serves `listener`, named `name` in logs, over plaintext HTTP/1.1 for as
-/// long as the process runs, answering each request from its head alone.
-/// It reads no bodies, so a request that sends one ends its connection
-/// after the answer, and a `HEAD`'s answer carries none.
-pub async fn serve_heads(
-    listener: tokio::net::TcpListener,
-    name: &'static str,
-    answer: std::rc::Rc<dyn Fn(&RequestHead) -> Response>,
-) {
+/// Listens on the first of `address`'s addresses that binds. The queue of
+/// connections waiting to be accepted holds `BACKLOG` of them: with the
+/// standard library's 128, a burst of new connections loses handshakes, and
+/// each client sends its handshake again a second later.
+pub async fn listen(address: &str) -> io::Result<TcpListener> {
+    let mut failure = io::Error::new(io::ErrorKind::InvalidInput, "no address to listen on");
+    for address in tokio::net::lookup_host(address).await? {
+        let socket = match address {
+            std::net::SocketAddr::V4(_) => TcpSocket::new_v4()?,
+            std::net::SocketAddr::V6(_) => TcpSocket::new_v6()?,
+        };
+        socket.set_reuseaddr(true)?;
+        match socket.bind(address) {
+            Ok(()) => return socket.listen(BACKLOG),
+            Err(error) => failure = error,
+        }
+    }
+    Err(failure)
+}
+
+/// The next connection `listener`, named `name` in logs, takes. An error
+/// such as running out of descriptors lasts a while: the listener logs it
+/// and tries again after a pause, which keeps the event loop free for the
+/// connections it has, and serves again once descriptors free up.
+pub async fn accept(listener: &TcpListener, name: &'static str) -> TcpStream {
     loop {
-        let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
-            // An error such as running out of descriptors lasts a while;
-            // the pause keeps the event loop free for the rest.
+        match listener.accept().await {
+            Ok((stream, _)) => return stream,
             Err(error) => {
                 crate::log!(
                     Warn,
@@ -107,14 +131,30 @@ pub async fn serve_heads(
                     error = error
                 );
                 tokio::time::sleep(ACCEPT_PAUSE).await;
-                continue;
             }
-        };
+        }
+    }
+}
+
+/// A response a listener waits for.
+pub type Answering = Pin<Box<dyn Future<Output = Response>>>;
+
+/// Serves `listener`, named `name` in logs, over plaintext HTTP/1.1 for as
+/// long as the process runs, answering each request from its head alone.
+/// It reads no bodies, so a request that sends one ends its connection
+/// after the answer, and a `HEAD`'s answer carries none.
+pub async fn serve_heads(
+    listener: TcpListener,
+    name: &'static str,
+    answer: std::rc::Rc<dyn Fn(&RequestHead) -> Answering>,
+) {
+    loop {
+        let stream = accept(&listener, name).await;
         let answer = answer.clone();
         tokio::task::spawn_local(async move {
             let mut connection = Connection::new(stream);
             while let Ok(Some(head)) = connection.read_head().await {
-                let mut response = answer(&head);
+                let mut response = answer(&head).await;
                 if head.method == "HEAD" {
                     response.body = Bytes::new();
                 }
@@ -291,35 +331,6 @@ impl Connection {
         Ok(body)
     }
 
-    /// Sends a request with a body of `body.len()` bytes.
-    pub async fn write_request(
-        &mut self,
-        method: &str,
-        target: &str,
-        headers: &[(String, String)],
-        body: &[u8],
-    ) -> io::Result<()> {
-        self.write_request_head(method, target, headers, body.len() as u64)
-            .await?;
-        self.write_all(body).await
-    }
-
-    /// Sends a request's head; its `len`-byte body follows.
-    pub async fn write_request_head(
-        &mut self,
-        method: &str,
-        target: &str,
-        headers: &[(String, String)],
-        len: u64,
-    ) -> io::Result<()> {
-        let mut head = format!("{method} {target} HTTP/1.1\r\n");
-        for (name, value) in headers {
-            head.push_str(&format!("{name}: {value}\r\n"));
-        }
-        head.push_str(&format!("Content-Length: {len}\r\n\r\n"));
-        self.write_all(head.as_bytes()).await
-    }
-
     /// The next piece of a chunked body, or `None` at its end. `left`
     /// carries the bytes left in the current chunk from call to call, and
     /// starts at 0.
@@ -379,34 +390,67 @@ impl Connection {
             }
             let start = head.len();
             head.extend_from_slice(&chunk[..peeked]);
-            let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-            let mut response = httparse::Response::new(&mut headers);
-            let consumed = match response.parse(&head) {
-                Ok(httparse::Status::Complete(consumed)) => consumed,
-                Ok(httparse::Status::Partial) => {
-                    if head.len() > MAX_HEAD {
-                        return Err(invalid("response head too large"));
-                    }
-                    // Every byte peeked belongs to the head.
-                    self.stream.read_exact(&mut chunk[..peeked]).await?;
-                    continue;
+            let Some((consumed, status, headers)) = parse_response_head(&head)? else {
+                if head.len() > MAX_HEAD {
+                    return Err(invalid("response head too large"));
                 }
-                Err(error) => return Err(invalid(&error.to_string())),
+                // Every byte peeked belongs to the head.
+                self.stream.read_exact(&mut chunk[..peeked]).await?;
+                continue;
             };
-            let status = response.code.ok_or_else(|| invalid("no status"))?;
-            let headers = response
-                .headers
-                .iter()
-                .map(|header| {
-                    let value = String::from_utf8_lossy(header.value).into_owned();
-                    (header.name.to_string(), value)
-                })
-                .collect();
             self.stream
                 .read_exact(&mut chunk[..consumed - start])
                 .await?;
             return Ok((status, headers));
         }
+    }
+
+    /// Reads a node's answer head, and with it up to `READ_AHEAD` bytes of
+    /// whatever of its body has arrived, which wait in the buffer.
+    pub async fn read_answer_head(&mut self) -> io::Result<(u16, Vec<(String, String)>)> {
+        debug_assert!(self.buffer.is_empty(), "an answer read ahead");
+        loop {
+            // Every byte of earlier reads belongs to the head, so capping
+            // each read caps the body bytes read with it.
+            self.buffer.reserve(READ_AHEAD);
+            let mut limited = (&mut self.stream).take(READ_AHEAD as u64);
+            if limited.read_buf(&mut self.buffer).await? == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let Some((consumed, status, headers)) = parse_response_head(&self.buffer)? else {
+                if self.buffer.len() > MAX_HEAD {
+                    return Err(invalid("response head too large"));
+                }
+                continue;
+            };
+            self.buffer.drain(..consumed);
+            return Ok((status, headers));
+        }
+    }
+
+    /// Bytes read from the stream and not yet consumed: a node's answer's
+    /// first body bytes.
+    pub fn buffered(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    /// Reads until `len` bytes wait in the buffer, and no further: the rest
+    /// of a small body that goes on from memory.
+    pub async fn fill_buffer(&mut self, len: usize) -> io::Result<()> {
+        while self.buffer.len() < len {
+            let missing = len - self.buffer.len();
+            self.buffer.reserve(missing);
+            let mut limited = (&mut self.stream).take(missing as u64);
+            if limited.read_buf(&mut self.buffer).await? == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Marks the first `len` buffered bytes consumed.
+    pub fn consume_buffered(&mut self, len: usize) {
+        self.buffer.drain(..len);
     }
 
     pub async fn write_continue(&mut self) -> io::Result<()> {
@@ -431,7 +475,7 @@ impl Connection {
     pub async fn write_head_and_body(
         &mut self,
         status: u16,
-        headers: &[(String, String)],
+        headers: &[(impl AsRef<str>, impl AsRef<str>)],
         framing: Framing,
         keep_alive: bool,
         body: &[u8],
@@ -455,12 +499,43 @@ impl Connection {
     pub async fn write_response_head(
         &mut self,
         status: u16,
-        headers: &[(String, String)],
+        headers: &[(impl AsRef<str>, impl AsRef<str>)],
         framing: Framing,
         keep_alive: bool,
     ) -> io::Result<()> {
+        let flags = SendFlags::empty();
+        self.write_head(status, headers, framing, keep_alive, flags)
+            .await
+    }
+
+    /// As `write_response_head`, for a head whose body follows at once: over
+    /// plaintext, the kernel holds the head back to send it in one packet
+    /// with the body's first bytes.
+    pub async fn write_response_head_more(
+        &mut self,
+        status: u16,
+        headers: &[(impl AsRef<str>, impl AsRef<str>)],
+        framing: Framing,
+        keep_alive: bool,
+    ) -> io::Result<()> {
+        let flags = match self.kernel_tls {
+            true => SendFlags::empty(),
+            false => SendFlags::MORE,
+        };
+        self.write_head(status, headers, framing, keep_alive, flags)
+            .await
+    }
+
+    async fn write_head(
+        &mut self,
+        status: u16,
+        headers: &[(impl AsRef<str>, impl AsRef<str>)],
+        framing: Framing,
+        keep_alive: bool,
+        flags: SendFlags,
+    ) -> io::Result<()> {
         let head = response_head(status, headers, framing, keep_alive, self.request_id);
-        self.write_all(head.as_bytes()).await?;
+        self.send_all(head.as_bytes(), flags).await?;
         self.answered = Some((status, Instant::now()));
         self.body_sent = 0;
         Ok(())
@@ -475,9 +550,17 @@ impl Connection {
 
     /// Writes all of `bytes`, failing if the peer takes none of them for
     /// `WRITE_IDLE`.
-    pub async fn write_all(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+    pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.send_all(bytes, SendFlags::empty()).await
+    }
+
+    /// Sends all of `bytes` with `flags`, failing if the peer takes none of
+    /// them for `WRITE_IDLE`.
+    async fn send_all(&self, mut bytes: &[u8], flags: SendFlags) -> io::Result<()> {
         while !bytes.is_empty() {
-            let written = tokio::time::timeout(WRITE_IDLE, self.stream.write(bytes))
+            let send = || Ok(rustix::net::send(&self.stream, bytes, flags)?);
+            let sent = self.stream.async_io(Interest::WRITABLE, send);
+            let written = tokio::time::timeout(WRITE_IDLE, sent)
                 .await
                 .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))?;
             if written == 0 {
@@ -579,23 +662,36 @@ const COALESCED_BODY: usize = 64 << 10;
 /// the response no ID of its own, names it as S3's too.
 fn response_head(
     status: u16,
-    headers: &[(String, String)],
+    headers: &[(impl AsRef<str>, impl AsRef<str>)],
     framing: Framing,
     keep_alive: bool,
     request_id: Option<RequestId>,
 ) -> String {
-    let mut head = format!("HTTP/1.1 {status} {}\r\n", reason(status));
+    let named: usize = headers
+        .iter()
+        .map(|(name, value)| name.as_ref().len() + value.as_ref().len() + 4)
+        .sum();
+    let mut head = String::with_capacity(named + 192);
+    let _ = write!(head, "HTTP/1.1 {status} {}\r\n", reason(status));
     for (name, value) in headers {
-        head.push_str(&format!("{name}: {value}\r\n"));
+        head.push_str(name.as_ref());
+        head.push_str(": ");
+        head.push_str(value.as_ref());
+        head.push_str("\r\n");
     }
     if let Some(id) = request_id {
-        head.push_str(&format!("{REQUEST_ID}: {id}\r\n"));
-        if header(headers, "x-amz-request-id").is_none() {
-            head.push_str(&format!("x-amz-request-id: {id}\r\n"));
+        let _ = write!(head, "{REQUEST_ID}: {id}\r\n");
+        let names_id = headers
+            .iter()
+            .any(|(name, _)| name.as_ref().eq_ignore_ascii_case("x-amz-request-id"));
+        if !names_id {
+            let _ = write!(head, "x-amz-request-id: {id}\r\n");
         }
     }
     match framing {
-        Framing::Length(len) => head.push_str(&format!("Content-Length: {len}\r\n")),
+        Framing::Length(len) => {
+            let _ = write!(head, "Content-Length: {len}\r\n");
+        }
         Framing::Chunked => head.push_str("Transfer-Encoding: chunked\r\n"),
     }
     if !keep_alive {
@@ -640,6 +736,30 @@ fn parse_head(buffer: &[u8]) -> io::Result<Option<(RequestHead, usize)>> {
         keep_alive,
     };
     Ok(Some((head, consumed)))
+}
+
+/// A response head's length, status and headers, or `None` while it is
+/// incomplete.
+type ParsedHead = (usize, u16, Vec<(String, String)>);
+
+fn parse_response_head(buffer: &[u8]) -> io::Result<Option<ParsedHead>> {
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut response = httparse::Response::new(&mut headers);
+    let consumed = match response.parse(buffer) {
+        Ok(httparse::Status::Complete(consumed)) => consumed,
+        Ok(httparse::Status::Partial) => return Ok(None),
+        Err(error) => return Err(invalid(&error.to_string())),
+    };
+    let status = response.code.ok_or_else(|| invalid("no status"))?;
+    let headers = response
+        .headers
+        .iter()
+        .map(|header| {
+            let value = String::from_utf8_lossy(header.value).into_owned();
+            (header.name.to_string(), value)
+        })
+        .collect();
+    Ok(Some((consumed, status, headers)))
 }
 
 fn invalid(message: &str) -> io::Error {

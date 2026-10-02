@@ -1,0 +1,380 @@
+# The cluster's full characterization: S3 baselines, fills, hit throughput
+# and latency as concurrency grows, small ranges, Parquet reads, a skewed
+# working set and a scan larger than the cache, a hot key, writes, and
+# crashes, restarts and resizes under load. About 2.3 TiB in S3 and two
+# hours of steps.
+#
+# Sized for the Terraform defaults (4 storage nodes of i4i.4xlarge, 4
+# client hosts of c6in.8xlarge, 1 standby node) with `cache_gib = 256` in
+# settings.toml: 1 TiB of cache, which holds the small and large sets but
+# not the medium and table sets. Connections are per client host.
+#
+#   loadtest/loadtest seed loadtest/plans/full.toml
+#   loadtest/loadtest run loadtest/plans/full.toml
+
+[dataset]
+prefix = "full/v1"
+seed = 1
+
+# Request rate: manifests, indexes, thumbnails.
+[[dataset.sets]]
+name = "small"
+count = 2_000_000
+size = { log_uniform = ["4KiB", "256KiB"] }
+
+# A working set larger than the cache.
+[[dataset.sets]]
+name = "medium"
+count = 100_000
+size = { log_uniform = ["1MiB", "32MiB"] }
+
+# Throughput: dataset shards, checkpoints.
+[[dataset.sets]]
+name = "large"
+count = 2_048
+size = "256MiB"
+
+# Analytics: a reader takes the footer, then row groups.
+[[dataset.sets]]
+name = "tables"
+count = 4_000
+size = { log_uniform = ["64MiB", "512MiB"] }
+format = "parquet"
+footer = "4MiB"
+
+# ---- S3 itself, for comparison.
+
+[[steps]]
+name = "s3-small"
+target = "s3"
+duration = "3m"
+warmup = "30s"
+connections = 256
+[[steps.reads]]
+set = "small"
+
+[[steps]]
+name = "s3-large"
+target = "s3"
+duration = "3m"
+warmup = "30s"
+connections = 64
+[[steps.reads]]
+set = "large"
+
+[[steps]]
+name = "s3-ranges"
+target = "s3"
+duration = "3m"
+warmup = "30s"
+connections = 128
+[[steps.reads]]
+set = "large"
+range = { size = "64KiB" }
+weight = 2
+[[steps.reads]]
+set = "tables"
+range = { suffix = "4MiB" }
+[[steps.reads]]
+set = "tables"
+range = { size = "8MiB" }
+
+# ---- Fills: each window of keys twice, so the doorkeeper stores them. The
+# first read of each streams from S3; the second stores it.
+
+[[steps]]
+name = "fill-large"
+target = "cache"
+requests = 4_096
+connections = 64
+[[steps.reads]]
+set = "large"
+keys = "sequential"
+passes = 2
+window = 64
+
+[[steps]]
+name = "fill-small"
+target = "cache"
+requests = 4_000_000
+connections = 256
+[[steps.reads]]
+set = "small"
+keys = "sequential"
+passes = 2
+window = 10_000
+
+# ---- Hits as concurrency grows, from the page cache and then the drives.
+
+[[steps]]
+name = "hits-large-c4"
+target = "cache"
+duration = "3m"
+warmup = "30s"
+connections = 4
+[[steps.reads]]
+set = "large"
+
+[[steps]]
+name = "hits-large-c16"
+target = "cache"
+duration = "3m"
+warmup = "30s"
+connections = 16
+[[steps.reads]]
+set = "large"
+
+[[steps]]
+name = "hits-large-c64"
+target = "cache"
+duration = "3m"
+warmup = "30s"
+connections = 64
+[[steps.reads]]
+set = "large"
+
+[[steps]]
+name = "hits-large-drive"
+target = "cache"
+duration = "3m"
+drop_page_cache = true
+connections = 64
+[[steps.reads]]
+set = "large"
+
+[[steps]]
+name = "hits-small-c64"
+target = "cache"
+duration = "3m"
+warmup = "30s"
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "small"
+
+[[steps]]
+name = "hits-small-c256"
+target = "cache"
+duration = "3m"
+warmup = "30s"
+connections = 256
+verify = "edges"
+[[steps.reads]]
+set = "small"
+
+[[steps]]
+name = "hits-small-c1024"
+target = "cache"
+duration = "3m"
+warmup = "30s"
+connections = 1024
+verify = "edges"
+[[steps.reads]]
+set = "small"
+
+# A fixed rate, timed from when each request was due: latency below the
+# knee, with stalls counted against every request they delay. Set the rate
+# to about half of what hits-small-c256 reached.
+[[steps]]
+name = "hits-small-rate"
+target = "cache"
+duration = "3m"
+warmup = "30s"
+connections = 512
+rate = 20_000
+verify = "edges"
+[[steps.reads]]
+set = "small"
+
+[[steps]]
+name = "ranges-64k"
+target = "cache"
+duration = "3m"
+warmup = "30s"
+connections = 256
+[[steps.reads]]
+set = "large"
+range = { size = "64KiB" }
+
+# ---- Analytics over a thousand tables: cold, then warm.
+
+[[steps]]
+name = "tables-cold"
+target = "cache"
+duration = "5m"
+connections = 128
+[[steps.reads]]
+set = "tables"
+limit = 1_000
+range = { suffix = "4MiB" }
+[[steps.reads]]
+set = "tables"
+limit = 1_000
+range = { size = "8MiB" }
+weight = 4
+
+[[steps]]
+name = "tables-warm"
+target = "cache"
+duration = "3m"
+warmup = "30s"
+connections = 128
+[[steps.reads]]
+set = "tables"
+limit = 1_000
+range = { suffix = "4MiB" }
+[[steps.reads]]
+set = "tables"
+limit = 1_000
+range = { size = "8MiB" }
+weight = 4
+
+# ---- Working sets larger than the cache.
+
+# Skewed reads of 870 GiB: the byte hit ratio the cache keeps.
+[[steps]]
+name = "zipf-medium"
+target = "cache"
+duration = "10m"
+warmup = "2m"
+connections = 128
+[[steps.reads]]
+set = "medium"
+keys = { zipf = 1.0 }
+
+# A hot set of large objects while a scan reads the medium set once: the
+# hot set should keep its hits, and S3 should send only the scan.
+[[steps]]
+name = "scan"
+target = "cache"
+duration = "10m"
+warmup = "30s"
+connections = 128
+[[steps.reads]]
+set = "large"
+limit = 128
+[[steps.reads]]
+set = "medium"
+keys = "sequential"
+weight = 3
+
+# ---- One small key every client wants: its owner leases it to replicas.
+
+[[steps]]
+name = "hot-key"
+target = "cache"
+duration = "3m"
+warmup = "30s"
+connections = 256
+[[steps.reads]]
+set = "small"
+limit = 1
+
+# ---- Writes pass through the objects' homes to S3.
+
+[[steps]]
+name = "writes"
+target = "cache"
+duration = "3m"
+connections = 64
+[[steps.writes]]
+size = { log_uniform = ["1MiB", "64MiB"] }
+
+# ---- Faults under a mixed load.
+
+[[steps]]
+name = "crash"
+target = "cache"
+duration = "6m"
+connections = 64
+[[steps.reads]]
+set = "small"
+weight = 4
+[[steps.reads]]
+set = "large"
+[[steps.reads]]
+set = "large"
+range = { size = "64KiB" }
+weight = 2
+[[steps.faults]]
+at = "60s"
+action = "kill"
+node = 1
+[[steps.faults]]
+at = "180s"
+action = "start"
+node = 1
+
+# A deploy: each node stops cleanly and starts again, keeping its blocks.
+[[steps]]
+name = "rolling-restart"
+target = "cache"
+duration = "8m"
+connections = 64
+[[steps.reads]]
+set = "small"
+weight = 4
+[[steps.reads]]
+set = "large"
+[[steps.reads]]
+set = "large"
+range = { size = "64KiB" }
+weight = 2
+[[steps.faults]]
+at = "60s"
+action = "restart"
+node = 0
+[[steps.faults]]
+at = "150s"
+action = "restart"
+node = 1
+[[steps.faults]]
+at = "240s"
+action = "restart"
+node = 2
+[[steps.faults]]
+at = "330s"
+action = "restart"
+node = 3
+
+# The standby node joins, and reads what it takes over from the nodes that
+# held it before asking S3.
+[[steps]]
+name = "scale-out"
+target = "cache"
+duration = "6m"
+connections = 64
+[[steps.reads]]
+set = "small"
+weight = 4
+[[steps.reads]]
+set = "large"
+[[steps.reads]]
+set = "large"
+range = { size = "64KiB" }
+weight = 2
+[[steps.faults]]
+at = "60s"
+action = "start"
+node = 4
+
+# It leaves again, serving its blocks to their new owners for the fallback
+# window.
+[[steps]]
+name = "scale-in"
+target = "cache"
+duration = "6m"
+connections = 64
+[[steps.reads]]
+set = "small"
+weight = 4
+[[steps.reads]]
+set = "large"
+[[steps.reads]]
+set = "large"
+range = { size = "64KiB" }
+weight = 2
+[[steps.faults]]
+at = "60s"
+action = "leave"
+node = 4

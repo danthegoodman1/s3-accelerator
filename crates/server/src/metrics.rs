@@ -1,14 +1,14 @@
 //! What the server measures, and every count rendered in Prometheus's text
 //! format. The core counts its own decisions; this module counts what the
-//! server measures on its event loop, where every worker's result arrives,
-//! so no count is shared between threads.
+//! server measures on its event loops, where every worker's result
+//! arrives. Each event loop keeps its own counts, and a scrape sums them.
 
 use crate::http::RequestHead;
 use crate::lookups::{Kind, Lookup, Unresolved};
 use s3_accelerator_core::node::{Stats, Usage};
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 /// Upper bounds of the latency histograms' buckets, in seconds.
@@ -29,6 +29,13 @@ impl Histogram {
         let seconds = value.as_secs_f64();
         self.counts[BUCKETS.partition_point(|&bound| bound < seconds)] += 1;
         self.sum += seconds;
+    }
+
+    fn add(&mut self, other: &Histogram) {
+        for (count, more) in self.counts.iter_mut().zip(other.counts) {
+            *count += more;
+        }
+        self.sum += other.sum;
     }
 }
 
@@ -157,7 +164,7 @@ pub enum Link {
     Cluster,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Counts {
     requests: BTreeMap<(Operation, u16), u64>,
     first_byte: BTreeMap<Operation, Histogram>,
@@ -183,11 +190,61 @@ struct Counts {
     loop_delay: Histogram,
 }
 
-/// What the server measured. It lives on the event loop and is shared as
-/// an `Rc`.
+impl Counts {
+    fn add(&mut self, other: &Counts) {
+        fn add_map<K: Ord + Clone>(map: &mut BTreeMap<K, u64>, other: &BTreeMap<K, u64>) {
+            for (key, count) in other {
+                *map.entry(key.clone()).or_default() += count;
+            }
+        }
+        fn add_histograms<K: Ord + Clone>(
+            map: &mut BTreeMap<K, Histogram>,
+            other: &BTreeMap<K, Histogram>,
+        ) {
+            for (key, histogram) in other {
+                map.entry(key.clone()).or_default().add(histogram);
+            }
+        }
+        fn add_array<const N: usize>(array: &mut [u64; N], other: &[u64; N]) {
+            for (count, more) in array.iter_mut().zip(other) {
+                *count += more;
+            }
+        }
+        add_map(&mut self.requests, &other.requests);
+        add_histograms(&mut self.first_byte, &other.first_byte);
+        add_map(&mut self.response_bytes, &other.response_bytes);
+        add_array(&mut self.node_failures, &other.node_failures);
+        add_array(&mut self.relays_cut, &other.relays_cut);
+        add_map(&mut self.s3_requests, &other.s3_requests);
+        add_histograms(&mut self.s3_first_byte, &other.s3_first_byte);
+        self.syncs.add(&other.syncs);
+        self.events += other.events;
+        self.events_lag.add(&other.events_lag);
+        for (kind, more) in self
+            .metadata_lookups
+            .iter_mut()
+            .zip(&other.metadata_lookups)
+        {
+            add_array(kind, more);
+        }
+        add_array(
+            &mut self.metadata_invalidations,
+            &other.metadata_invalidations,
+        );
+        add_array(&mut self.metadata_stale, &other.metadata_stale);
+        add_array(&mut self.origin_unresolved, &other.origin_unresolved);
+        add_array(&mut self.ring_changes, &other.ring_changes);
+        add_map(&mut self.tls_sessions, &other.tls_sessions);
+        add_map(&mut self.tls_failures, &other.tls_failures);
+        self.loop_delay.add(&other.loop_delay);
+    }
+}
+
+/// What one event loop measured. Only its loop records into it, so its
+/// lock is uncontended; a scrape takes every loop's in turn.
 #[derive(Default)]
 pub struct Metrics {
-    counts: RefCell<Counts>,
+    counts: Mutex<Counts>,
 }
 
 /// The rest of what a scrape renders: the core's counts and the rings.
@@ -203,7 +260,7 @@ impl Metrics {
     /// A client request answered with `status`, `first_byte` after its head
     /// arrived, with `bytes` of body.
     pub fn request(&self, operation: Operation, status: u16, first_byte: Duration, bytes: u64) {
-        let mut counts = self.counts.borrow_mut();
+        let mut counts = self.counts();
         *counts.requests.entry((operation, status)).or_default() += 1;
         counts
             .first_byte
@@ -214,17 +271,17 @@ impl Metrics {
     }
 
     pub fn node_failure(&self, failure: NodeFailure) {
-        self.counts.borrow_mut().node_failures[failure as usize] += 1;
+        self.counts().node_failures[failure as usize] += 1;
     }
 
     pub fn relay_cut(&self, side: Side) {
-        self.counts.borrow_mut().relays_cut[side as usize] += 1;
+        self.counts().relays_cut[side as usize] += 1;
     }
 
     /// A request to S3, answered with `status` after `first_byte`, or never
     /// answered.
     pub fn s3_request(&self, kind: S3Kind, answer: Option<(u16, Duration)>) {
-        let mut counts = self.counts.borrow_mut();
+        let mut counts = self.counts();
         let status = answer.map(|(status, _)| status);
         *counts.s3_requests.entry((kind, status)).or_default() += 1;
         if let Some((_, first_byte)) = answer {
@@ -237,12 +294,12 @@ impl Metrics {
     }
 
     pub fn sync(&self, took: Duration) {
-        self.counts.borrow_mut().syncs.observe(took);
+        self.counts().syncs.observe(took);
     }
 
     /// An event message taken from the queue, `lag` after S3's event.
     pub fn event(&self, lag: Option<Duration>) {
-        let mut counts = self.counts.borrow_mut();
+        let mut counts = self.counts();
         counts.events += 1;
         if let Some(lag) = lag {
             counts.events_lag.observe(lag);
@@ -250,16 +307,16 @@ impl Metrics {
     }
 
     pub fn metadata_lookup(&self, kind: Kind, result: Lookup) {
-        self.counts.borrow_mut().metadata_lookups[kind as usize][result as usize] += 1;
+        self.counts().metadata_lookups[kind as usize][result as usize] += 1;
     }
 
     pub fn metadata_invalidated(&self, kind: Kind) {
-        self.counts.borrow_mut().metadata_invalidations[kind as usize] += 1;
+        self.counts().metadata_invalidations[kind as usize] += 1;
     }
 
     /// `requests` used an entry past its TTL.
     pub fn metadata_stale(&self, kind: Kind, requests: u64) {
-        self.counts.borrow_mut().metadata_stale[kind as usize] += requests;
+        self.counts().metadata_stale[kind as usize] += requests;
     }
 
     pub fn origin_unresolved(&self, reason: Unresolved) {
@@ -267,49 +324,51 @@ impl Metrics {
             Unresolved::Unknown => 0,
             Unresolved::Unavailable | Unresolved::Busy => 1,
         };
-        self.counts.borrow_mut().origin_unresolved[index] += 1;
+        self.counts().origin_unresolved[index] += 1;
     }
 
     /// The gateway, or the node, adopted a ring.
     pub fn ring_changed(&self, gateway: bool) {
-        self.counts.borrow_mut().ring_changes[usize::from(!gateway)] += 1;
+        self.counts().ring_changes[usize::from(!gateway)] += 1;
     }
 
     pub fn tls_session(&self, link: Link, kernel: bool) {
         *self
-            .counts
-            .borrow_mut()
+            .counts()
             .tls_sessions
             .entry((link, kernel))
             .or_default() += 1;
     }
 
     pub fn tls_failure(&self, link: Link) {
-        *self
-            .counts
-            .borrow_mut()
-            .tls_failures
-            .entry(link)
-            .or_default() += 1;
+        *self.counts().tls_failures.entry(link).or_default() += 1;
     }
 
     /// The event loop ran a timer `late`.
     pub fn loop_delay(&self, late: Duration) {
-        self.counts.borrow_mut().loop_delay.observe(late);
+        self.counts().loop_delay.observe(late);
     }
 
-    /// Every metric in Prometheus's text format.
-    pub fn render(&self, view: &View) -> String {
-        let counts = self.counts.borrow();
+    fn counts(&self) -> MutexGuard<'_, Counts> {
+        self.counts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Every metric in Prometheus's text format, summed over `loops`.
+    pub fn render(loops: &[&Metrics], view: &View) -> String {
+        let mut counts = Counts::default();
+        for metrics in loops {
+            counts.add(&metrics.counts());
+        }
+        let counts = &counts;
         let mut out = Out(String::new());
         if view.gateway {
-            render_gateway(&mut out, &counts);
+            render_gateway(&mut out, counts);
         }
         if let Some((stats, usage)) = &view.node {
             render_core(&mut out, stats, usage);
-            render_node(&mut out, &counts);
+            render_node(&mut out, counts);
         }
-        render_process(&mut out, &counts, view);
+        render_process(&mut out, counts, view);
         out.0
     }
 }
@@ -760,6 +819,7 @@ struct Process {
     cpu_seconds: f64,
     resident_bytes: u64,
     open_fds: u64,
+    max_fds: u64,
     start_time: f64,
 }
 
@@ -779,6 +839,9 @@ impl Process {
             cpu_seconds: (field(14)? + field(15)?) as f64 / ticks,
             resident_bytes: field(24)? * rustix::param::page_size() as u64,
             open_fds: std::fs::read_dir("/proc/self/fd").ok()?.count() as u64,
+            max_fds: rustix::process::getrlimit(rustix::process::Resource::Nofile)
+                .current
+                .unwrap_or(u64::MAX),
             start_time: boot as f64 + field(22)? as f64 / ticks,
         })
     }
@@ -806,6 +869,12 @@ impl Process {
             "gauge",
             "Open file descriptors.",
             self.open_fds.to_string(),
+        );
+        plain(
+            "process_max_fds",
+            "gauge",
+            "The soft limit on open file descriptors.",
+            self.max_fds.to_string(),
         );
         plain(
             "process_start_time_seconds",
@@ -891,7 +960,7 @@ mod tests {
             node: None,
             ring: None,
         };
-        let text = metrics.render(&view);
+        let text = Metrics::render(&[&metrics], &view);
         let bucket = |bound: &str| {
             let prefix = format!("s3accel_node_sync_seconds_bucket{{le=\"{bound}\"}} ");
             text.lines()
@@ -900,10 +969,13 @@ mod tests {
         };
         // Node metrics render only for a node.
         assert_eq!(bucket("0.0005"), None);
-        let text = metrics.render(&View {
-            node: Some((Stats::default(), usage())),
-            ..view
-        });
+        let text = Metrics::render(
+            &[&metrics],
+            &View {
+                node: Some((Stats::default(), usage())),
+                ..view
+            },
+        );
         let bucket = |bound: &str| {
             let prefix = format!("s3accel_node_sync_seconds_bucket{{le=\"{bound}\"}} ");
             text.lines()

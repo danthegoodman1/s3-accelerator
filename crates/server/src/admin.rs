@@ -2,10 +2,8 @@
 //! service's invalidations over plaintext HTTP/1.1, on an address of its
 //! own.
 
-use crate::clients::Clients;
-use crate::gateway_engine::{GatewayEngine, SharedGateway};
-use crate::http::{self, RequestHead, Response};
-use crate::lookups::Invalidated;
+use crate::http::{self, Answering, RequestHead, Response};
+use crate::lookups::{self, Invalidated, Kind};
 use crate::metrics::{Metrics, View};
 use crate::node_engine::{NodeEngine, SharedNode};
 use crate::origins::Origins;
@@ -13,38 +11,70 @@ use crate::sigv4;
 use bytes::Bytes;
 use percent_encoding::percent_decode_str;
 use std::cell::{Cell, RefCell};
+use std::future::{Future, ready};
+use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, PoisonError};
 use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot};
 
 /// What the admin listener reports on: the process's roles as they start,
 /// serve and stop.
 pub struct Admin {
-    pub metrics: Rc<Metrics>,
+    /// What this thread's event loop measured: the node's, and the admin
+    /// listener's own.
+    pub metrics: Arc<Metrics>,
     /// Whether the process runs a node, and the node once its store has
     /// recovered.
     runs_node: bool,
     node: RefCell<Option<SharedNode>>,
-    /// The node's origins and the gateway's clients, which invalidations
-    /// reach.
+    /// The node's origins, which invalidations reach.
     origins: RefCell<Option<Rc<Origins>>>,
-    clients: RefCell<Option<Rc<Clients>>>,
+    /// The gateway's event loops once they serve, and the metadata
+    /// service's token, which signs invalidations of their clients.
+    gateways: RefCell<Vec<GatewayLoop>>,
+    client_token: RefCell<Option<String>>,
     /// The node took a ring from a seed, or found none answering.
     joined: Cell<bool>,
-    gateway: RefCell<Option<SharedGateway>>,
     stopping: Cell<bool>,
     leaving: Cell<bool>,
+}
+
+/// A gateway event loop, as the admin listener reaches it from another
+/// thread.
+#[derive(Clone)]
+pub struct GatewayLoop {
+    pub metrics: Arc<Metrics>,
+    pub observed: Arc<Mutex<Observed>>,
+    /// Takes the access key IDs of clients the loop looks up again, and
+    /// answers on the sender once it has dropped each.
+    pub forget: mpsc::UnboundedSender<(String, oneshot::Sender<()>)>,
+}
+
+/// A gateway loop's ring, with its nodes up and down, and whether a node
+/// has answered it, as of the loop's last tick.
+#[derive(Clone, Copy, Default)]
+pub struct Observed {
+    pub ring: (u64, usize, usize),
+    pub heard: bool,
+}
+
+impl GatewayLoop {
+    fn observed(&self) -> Observed {
+        *self.observed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl Admin {
     pub fn new(runs_node: bool) -> Rc<Admin> {
         Rc::new(Admin {
-            metrics: Rc::new(Metrics::default()),
+            metrics: Arc::new(Metrics::default()),
             runs_node,
             node: RefCell::new(None),
             origins: RefCell::new(None),
-            clients: RefCell::new(None),
+            gateways: RefCell::new(Vec::new()),
+            client_token: RefCell::new(None),
             joined: Cell::new(false),
-            gateway: RefCell::new(None),
             stopping: Cell::new(false),
             leaving: Cell::new(false),
         })
@@ -60,19 +90,16 @@ impl Admin {
         *self.origins.borrow_mut() = Some(origins);
     }
 
-    /// The gateway's clients, which take invalidations once it serves.
-    pub fn clients(&self, clients: Rc<Clients>) {
-        *self.clients.borrow_mut() = Some(clients);
-    }
-
     /// The node joined the cluster.
     pub fn joined(&self) {
         self.joined.set(true);
     }
 
-    /// The gateway serves clients.
-    pub fn serving(&self, gateway: SharedGateway) {
-        *self.gateway.borrow_mut() = Some(gateway);
+    /// The gateway's loops serve clients, whom the metadata service holding
+    /// `client_token`, if any, names.
+    pub fn serving(&self, loops: Vec<GatewayLoop>, client_token: Option<String>) {
+        *self.gateways.borrow_mut() = loops;
+        *self.client_token.borrow_mut() = client_token;
     }
 
     pub fn stopping(&self) {
@@ -90,53 +117,97 @@ impl Admin {
             node: self
                 .runs_node
                 .then(|| (self.node.borrow().is_some(), self.joined.get())),
-            gateway_heard: self
-                .gateway
-                .borrow()
-                .as_ref()
-                .map(|gateway| GatewayEngine::observe(gateway).1),
+            gateway_heard: self.gateway_heard(),
             stopping: self.stopping.get(),
             leaving: self.leaving.get(),
         };
         progress.waiting_for()
     }
 
+    /// Whether a node has answered every gateway loop, for a process whose
+    /// gateway serves.
+    fn gateway_heard(&self) -> Option<bool> {
+        let gateways = self.gateways.borrow();
+        (!gateways.is_empty()).then(|| gateways.iter().all(|gateway| gateway.observed().heard))
+    }
+
     fn view(&self) -> View {
-        let gateway = self.gateway.borrow().as_ref().map(GatewayEngine::observe);
+        let gateways = self.gateways.borrow();
         let node = self.node.borrow().as_ref().map(NodeEngine::observe);
-        // A node's ring is the one its membership holds; a gateway's is
-        // the latest a node sent it.
-        let ring = match (&node, &gateway) {
-            (Some((_, _, ring)), _) => Some(*ring),
-            (None, Some((ring, _))) => Some(*ring),
-            (None, None) => None,
+        // A node's ring is the one its membership holds; a gateway's, the
+        // one most of its loops hold, the first loop's among equals.
+        let rings: Vec<(u64, usize, usize)> = gateways
+            .iter()
+            .map(|gateway| gateway.observed().ring)
+            .collect();
+        let held = |version: u64| rings.iter().filter(|ring| ring.0 == version).count();
+        let gateway_ring = rings.iter().rev().max_by_key(|ring| held(ring.0)).copied();
+        let ring = match &node {
+            Some((_, _, ring)) => Some(*ring),
+            None => gateway_ring,
         };
         View {
-            gateway: gateway.is_some(),
+            gateway: !gateways.is_empty(),
             node: node.map(|(stats, usage, _)| (stats, usage)),
             ring,
         }
     }
 
-    fn answer(&self, head: &RequestHead) -> Response {
+    /// Checks the service's invalidation of the client `access_key_id`,
+    /// and has every gateway loop drop it; completes once each has.
+    fn forget_client(
+        &self,
+        access_key_id: &str,
+        path: &str,
+        time: &str,
+        signature: &str,
+    ) -> Pin<Box<dyn Future<Output = Invalidated>>> {
+        let Some(token) = self.client_token.borrow().clone() else {
+            return Box::pin(ready(Invalidated::NoService));
+        };
+        if !lookups::signed_invalidation(&token, path, time, signature, sigv4::unix_now()) {
+            return Box::pin(ready(Invalidated::Refused));
+        }
+        let mut dropped = Vec::new();
+        for gateway in self.gateways.borrow().iter() {
+            let (done, waiting) = oneshot::channel();
+            if gateway
+                .forget
+                .send((access_key_id.to_string(), done))
+                .is_ok()
+            {
+                dropped.push(waiting);
+            }
+        }
+        lookups::took_invalidation(&self.metrics, Kind::Client, access_key_id);
+        Box::pin(async move {
+            for waiting in dropped {
+                // A loop that stopped serves no requests to keep fresh.
+                let _ = waiting.await;
+            }
+            Invalidated::Dropped
+        })
+    }
+
+    fn answer(&self, head: &RequestHead) -> Answering {
         match head.method.as_str() {
-            "GET" | "HEAD" => self.report(&head.path),
+            "GET" | "HEAD" => Box::pin(ready(self.report(&head.path))),
             "POST" => self.invalidate(head),
-            _ => Response::text(405, "method not allowed\n"),
+            _ => Box::pin(ready(Response::text(405, "method not allowed\n"))),
         }
     }
 
     /// `POST /origins/<bucket>/invalidate` or `POST /clients/<access key
-    /// ID>/invalidate`, from the metadata service.
-    fn invalidate(&self, head: &RequestHead) -> Response {
+    /// ID>/invalidate`, from the metadata service. A process answers once
+    /// it has dropped the entry, from every gateway loop for a client.
+    fn invalidate(&self, head: &RequestHead) -> Answering {
         let Some(named) = head.path.strip_suffix("/invalidate") else {
-            return Response::text(404, "not found\n");
+            return Box::pin(ready(Response::text(404, "not found\n")));
         };
         let time = head.header("x-accel-time").unwrap_or_default();
         let signature = head.header("x-accel-signature").unwrap_or_default();
         let (path, now) = (head.path.as_str(), sigv4::unix_now());
         let origins = self.origins.borrow().clone();
-        let clients = self.clients.borrow().clone();
         // The name comes percent-encoded, as the service signed it.
         let decoded = |segment: &str| {
             let name = percent_decode_str(segment).decode_utf8().ok()?;
@@ -144,35 +215,37 @@ impl Admin {
         };
         let origin = named.strip_prefix("/origins/").and_then(decoded);
         let client = named.strip_prefix("/clients/").and_then(decoded);
-        let invalidated = match (origin, client) {
-            (Some(bucket), _) => match origins {
+        let invalidated: Pin<Box<dyn Future<Output = Invalidated>>> = match (origin, client) {
+            (Some(bucket), _) => Box::pin(ready(match origins {
                 Some(origins) => origins.invalidate(&bucket, path, time, signature, now),
                 None => Invalidated::NoService,
-            },
-            (_, Some(id)) => match clients {
-                Some(clients) => clients.invalidate(&id, path, time, signature, now),
-                None => Invalidated::NoService,
-            },
-            _ => return Response::text(404, "not found\n"),
+            })),
+            (_, Some(id)) => self.forget_client(&id, path, time, signature),
+            _ => return Box::pin(ready(Response::text(404, "not found\n"))),
         };
-        match invalidated {
-            Invalidated::Dropped => Response {
-                status: 204,
-                headers: Vec::new(),
-                content_length: 0,
-                body: Bytes::new(),
-            },
-            Invalidated::Refused => Response::text(403, "forbidden\n"),
-            Invalidated::NoService => {
-                Response::text(404, "the process takes these from its config\n")
+        Box::pin(async move {
+            match invalidated.await {
+                Invalidated::Dropped => Response {
+                    status: 204,
+                    headers: Vec::new(),
+                    content_length: 0,
+                    body: Bytes::new(),
+                },
+                Invalidated::Refused => Response::text(403, "forbidden\n"),
+                Invalidated::NoService => {
+                    Response::text(404, "the process takes these from its config\n")
+                }
             }
-        }
+        })
     }
 
     fn report(&self, path: &str) -> Response {
         match path {
             "/metrics" => {
-                let mut response = Response::text(200, self.metrics.render(&self.view()));
+                let gateways = self.gateways.borrow();
+                let mut loops = vec![self.metrics.as_ref()];
+                loops.extend(gateways.iter().map(|gateway| gateway.metrics.as_ref()));
+                let mut response = Response::text(200, Metrics::render(&loops, &self.view()));
                 response.headers[0].1 = "text/plain; version=0.0.4; charset=utf-8".to_string();
                 response
             }
@@ -225,6 +298,45 @@ pub async fn serve(listener: TcpListener, admin: Rc<Admin>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scrape names the ring most of the gateway's loops hold.
+    #[test]
+    fn a_gateway_reports_the_ring_most_loops_hold() {
+        let admin = Admin::new(false);
+        let gateway = |version| GatewayLoop {
+            metrics: Arc::new(Metrics::default()),
+            observed: Arc::new(Mutex::new(Observed {
+                ring: (version, 3, 0),
+                heard: true,
+            })),
+            forget: mpsc::unbounded_channel().0,
+        };
+        admin.serving(vec![gateway(9), gateway(4), gateway(4)], None);
+        assert_eq!(admin.view().ring, Some((4, 3, 0)));
+        admin.serving(vec![gateway(9), gateway(4)], None);
+        assert_eq!(admin.view().ring, Some((9, 3, 0)));
+    }
+
+    /// A gateway is ready once a node has answered every one of its loops.
+    #[test]
+    fn a_gateway_waits_for_every_loop() {
+        let admin = Admin::new(false);
+        let gateway = |heard| {
+            let observed = Observed {
+                ring: (1, 3, 0),
+                heard,
+            };
+            GatewayLoop {
+                metrics: Arc::new(Metrics::default()),
+                observed: Arc::new(Mutex::new(observed)),
+                forget: mpsc::unbounded_channel().0,
+            }
+        };
+        admin.serving(vec![gateway(true), gateway(false)], None);
+        assert_eq!(admin.waiting_for(), ["no node has answered the gateway"]);
+        admin.serving(vec![gateway(true), gateway(true)], None);
+        assert!(admin.waiting_for().is_empty());
+    }
 
     #[test]
     fn a_process_is_ready_once_each_role_is() {

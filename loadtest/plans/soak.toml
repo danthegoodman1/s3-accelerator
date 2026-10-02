@@ -1,0 +1,103 @@
+# Four hours of mixed traffic at a fixed rate, with a rolling restart
+# every half hour and a crash midway: whether memory, open files, event
+# loop delay and tail latency hold steady, and whether faults leave any
+# trace once they pass. Uses full.toml's dataset, so seed that first.
+#
+# Set `rate` to about 60% of what full.toml's mixed steps reached, and
+# watch Prometheus on the first client host while it runs (README.md).
+#
+#   loadtest/loadtest run loadtest/plans/soak.toml
+
+[dataset]
+prefix = "full/v1"
+seed = 1
+
+[[dataset.sets]]
+name = "small"
+count = 2_000_000
+size = { log_uniform = ["4KiB", "256KiB"] }
+
+[[dataset.sets]]
+name = "medium"
+count = 100_000
+size = { log_uniform = ["1MiB", "32MiB"] }
+
+[[dataset.sets]]
+name = "large"
+count = 2_048
+size = "256MiB"
+
+[[dataset.sets]]
+name = "tables"
+count = 4_000
+size = { log_uniform = ["64MiB", "512MiB"] }
+format = "parquet"
+footer = "4MiB"
+
+[[steps]]
+name = "soak"
+target = "cache"
+duration = "4h"
+warmup = "5m"
+connections = 512
+rate = 4_000
+verify = "full"
+
+[[steps.reads]]
+set = "small"
+keys = { zipf = 1.0 }
+weight = 60
+[[steps.reads]]
+set = "medium"
+keys = { zipf = 0.9 }
+weight = 10
+[[steps.reads]]
+set = "large"
+range = { size = "64KiB" }
+weight = 20
+[[steps.reads]]
+set = "tables"
+limit = 1_000
+range = { suffix = "4MiB" }
+weight = 3
+[[steps.reads]]
+set = "tables"
+limit = 1_000
+range = { size = "8MiB" }
+weight = 5
+[[steps.writes]]
+size = { log_uniform = ["64KiB", "8MiB"] }
+weight = 2
+
+[[steps.faults]]
+at = "30m"
+action = "restart"
+node = 0
+[[steps.faults]]
+at = "60m"
+action = "restart"
+node = 1
+[[steps.faults]]
+at = "90m"
+action = "restart"
+node = 2
+[[steps.faults]]
+at = "120m"
+action = "kill"
+node = 3
+[[steps.faults]]
+at = "125m"
+action = "start"
+node = 3
+[[steps.faults]]
+at = "150m"
+action = "restart"
+node = 0
+[[steps.faults]]
+at = "180m"
+action = "restart"
+node = 1
+[[steps.faults]]
+at = "210m"
+action = "restart"
+node = 2

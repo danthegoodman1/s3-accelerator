@@ -4,6 +4,11 @@
 //! the client's connection relays it with `splice`, or the gateway drops it.
 //! Every answer names the version of its node's ring, and the gateway
 //! fetches a ring whose version differs from its own.
+//!
+//! A gateway runs several event loops, each with its own core. A loop
+//! tells the others of each write it proxies before its client hears, so a
+//! client's next read sees its write through any loop, and of each ring it
+//! fetches, so they route by the same ring.
 
 use crate::log;
 use crate::metrics::{Metrics, NodeFailure};
@@ -17,8 +22,9 @@ use s3_accelerator_core::s3::{ObjectKey, Request, ResponseHead};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// How long a gateway waits for each node's ring.
 const RING_WAIT: Duration = Duration::from_secs(1);
@@ -44,9 +50,28 @@ pub enum Event {
 
 pub type SharedGateway = Rc<RefCell<GatewayEngine>>;
 
+/// What a gateway event loop tells the gateway's other loops.
+pub enum Shared {
+    /// Writes the loop proxied, each key with the node that told its home,
+    /// if one did. The other loop answers on `applied` once its core has
+    /// them.
+    Writes {
+        keys: Arc<[(ObjectKey, Option<NodeId>)]>,
+        applied: oneshot::Sender<()>,
+    },
+    /// A ring the loop fetched in place of the ring whose version is
+    /// `from`, with the nodes' addresses and those down.
+    Ring {
+        from: u64,
+        ring: Ring,
+        addresses: BTreeMap<NodeId, String>,
+        down: Vec<NodeId>,
+    },
+}
+
 pub struct GatewayEngine {
     started: Instant,
-    metrics: Rc<Metrics>,
+    metrics: Arc<Metrics>,
     gateway: Gateway,
     peers: Rc<Peers>,
     next_id: u64,
@@ -59,14 +84,18 @@ pub struct GatewayEngine {
     /// fetch rings from, or `None` to try every node known.
     sends: Vec<(NodeId, NodeRequestId, Read, Option<RequestId>)>,
     ring_fetches: Vec<Option<NodeId>>,
+    /// The gateway's other event loops.
+    siblings: Vec<mpsc::UnboundedSender<Shared>>,
 }
 
 impl GatewayEngine {
+    /// A gateway loop, which tells `siblings` what it learns.
     pub fn new(
         ring: Ring,
         config: gateway::Config,
         peers: Rc<Peers>,
-        metrics: Rc<Metrics>,
+        metrics: Arc<Metrics>,
+        siblings: Vec<mpsc::UnboundedSender<Shared>>,
     ) -> SharedGateway {
         Rc::new(RefCell::new(GatewayEngine {
             started: Instant::now(),
@@ -79,7 +108,68 @@ impl GatewayEngine {
             relayed: BTreeMap::new(),
             sends: Vec::new(),
             ring_fetches: Vec::new(),
+            siblings,
         }))
+    }
+
+    /// Tells the gateway's other loops of writes this one proxied, and
+    /// waits until each has them, so a client's next read sees its write
+    /// through whichever loop serves it.
+    pub async fn tell_writes(engine: &SharedGateway, keys: Vec<(ObjectKey, Option<NodeId>)>) {
+        let keys: Arc<[(ObjectKey, Option<NodeId>)]> = keys.into();
+        let siblings = engine.borrow().siblings.clone();
+        let mut applied = Vec::new();
+        for sibling in siblings {
+            let (sender, receiver) = oneshot::channel();
+            let writes = Shared::Writes {
+                keys: keys.clone(),
+                applied: sender,
+            };
+            if sibling.send(writes).is_ok() {
+                applied.push(receiver);
+            }
+        }
+        for receiver in applied {
+            // A loop that stopped serves no reads to keep fresh.
+            let _ = receiver.await;
+        }
+    }
+
+    /// Takes what another of the gateway's loops shared.
+    pub fn take_shared(engine: &SharedGateway, shared: Shared) {
+        let mut this = engine.borrow_mut();
+        let now = this.now();
+        match shared {
+            Shared::Writes { keys, applied } => {
+                for (key, via) in keys.iter() {
+                    this.gateway.on_write(now, key, *via);
+                }
+                let _ = applied.send(());
+            }
+            Shared::Ring {
+                from,
+                ring,
+                addresses,
+                down,
+            } => {
+                this.peers.learn(&addresses);
+                // Versions don't say which ring is newer: a loop still on
+                // the ring the sharer left takes the new one, a loop on the
+                // new one takes its nodes down, and a loop that moved on
+                // keeps its own.
+                let own = this.gateway.ring().version();
+                if own == from || own == ring.version() {
+                    this.gateway.on_ring(now, ring, down);
+                }
+            }
+        }
+    }
+
+    /// Tells the gateway's other loops of `shared`, which needs no answer.
+    fn share(&self, shared: impl Fn() -> Shared) {
+        for sibling in &self.siblings {
+            let _ = sibling.send(shared());
+        }
     }
 
     /// Serves a `GetObject` or `HeadObject` whose ID is `request_id`; what
@@ -138,8 +228,12 @@ impl GatewayEngine {
 
     /// Writes through this gateway to `keys` succeeded, and no node told
     /// their homes: the gateway tells each home, and then forgets the keys'
-    /// metadata, so its next read of a key sees its write.
-    pub async fn written(engine: &SharedGateway, keys: Vec<ObjectKey>) {
+    /// metadata, so its next read of a key sees its write. Returns each key
+    /// with the home that heard of it, if one did.
+    pub async fn written(
+        engine: &SharedGateway,
+        keys: Vec<ObjectKey>,
+    ) -> Vec<(ObjectKey, Option<NodeId>)> {
         let (peers, homes) = {
             let this = engine.borrow();
             let ring = this.gateway.ring();
@@ -189,12 +283,17 @@ impl GatewayEngine {
             log!(Warn, "homes took too long to hear of writes");
         }
         let heard = heard.borrow();
+        let writes: Vec<(ObjectKey, Option<NodeId>)> = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.clone(), homes[index].filter(|_| heard[index])))
+            .collect();
         let mut this = engine.borrow_mut();
         let now = this.now();
-        for (index, key) in keys.iter().enumerate() {
-            let via = homes[index].filter(|_| heard[index]);
-            this.gateway.on_write(now, key, via);
+        for (key, via) in &writes {
+            this.gateway.on_write(now, key, *via);
         }
+        writes
     }
 
     /// The nodes to pass a request for `target` through to S3, best first.
@@ -364,13 +463,19 @@ fn start(engine: &SharedGateway, work: Work) {
                     .and_then(|exchanged| exchanged.versions);
                 match exchanged {
                     Ok(Exchanged {
-                        answer: NodeAnswer::Respond { head, meta, hot },
+                        answer:
+                            NodeAnswer::Respond {
+                                head,
+                                meta,
+                                hot,
+                                s3_error,
+                            },
                         body,
                         ..
                     }) => {
                         this.relayed.insert(id, body);
                         this.gateway.on_hot(now, hints(now, hot));
-                        this.gateway.on_node_response(now, id, head, meta);
+                        this.gateway.on_node_response(now, id, head, meta, s3_error);
                     }
                     Ok(Exchanged {
                         answer: NodeAnswer::Metadata(meta, hot),
@@ -392,8 +497,13 @@ fn start(engine: &SharedGateway, work: Work) {
                     // The node was reached, but answered out of protocol.
                     Ok(_) => {
                         this.metrics.node_failure(NodeFailure::Error);
-                        this.gateway
-                            .on_node_response(now, id, ResponseHead::status(503), None);
+                        this.gateway.on_node_response(
+                            now,
+                            id,
+                            ResponseHead::status(503),
+                            None,
+                            false,
+                        );
                     }
                     Err(error) => {
                         this.metrics.node_failure(NodeFailure::of(&error));
@@ -442,9 +552,16 @@ fn start(engine: &SharedGateway, work: Work) {
                         peers.learn(&addresses);
                         let mut this = engine.borrow_mut();
                         let now = this.now();
-                        if ring.version() != this.gateway.ring().version() {
+                        let from = this.gateway.ring().version();
+                        if ring.version() != from {
                             this.metrics.ring_changed(true);
                         }
+                        this.share(|| Shared::Ring {
+                            from,
+                            ring: ring.clone(),
+                            addresses: addresses.clone(),
+                            down: down.clone(),
+                        });
                         this.gateway.on_ring(now, ring, down);
                         return;
                     }
@@ -475,5 +592,60 @@ fn start(engine: &SharedGateway, work: Work) {
             let now = this.now();
             this.gateway.on_ring_failed(now);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use s3_accelerator_core::placement::Member;
+    use std::num::NonZeroU32;
+
+    fn ring(version: u64, nodes: &[u64]) -> Ring {
+        let members = nodes
+            .iter()
+            .map(|&id| Member {
+                id: NodeId(id),
+                weight: NonZeroU32::MIN,
+            })
+            .collect();
+        Ring::new(version, members)
+    }
+
+    fn shared(from: u64, ring: Ring, down: Vec<NodeId>) -> Shared {
+        Shared::Ring {
+            from,
+            ring,
+            addresses: BTreeMap::new(),
+            down,
+        }
+    }
+
+    /// A loop takes a sibling's ring only in place of the ring the sibling
+    /// left, since versions don't say which ring is newer, and takes the
+    /// nodes down that come with the ring it holds.
+    #[test]
+    fn a_loop_takes_a_siblings_ring_in_place_of_the_one_it_left() {
+        let config: crate::config::Config =
+            toml::from_str("[cluster]\nsecret = \"s\"\nnodes = []\n[gateway]\nlisten = \"x\"\n")
+                .unwrap();
+        let peers = Peers::new(BTreeMap::new(), "s".into(), None, Default::default());
+        let metrics = Arc::new(Metrics::default());
+        let engine = GatewayEngine::new(
+            ring(1, &[0, 1]),
+            config.cache.gateway_config(),
+            peers,
+            metrics,
+            Vec::new(),
+        );
+        let version = |engine: &SharedGateway| engine.borrow().gateway.ring().version();
+        GatewayEngine::take_shared(&engine, shared(1, ring(2, &[0, 1, 2]), Vec::new()));
+        assert_eq!(version(&engine), 2);
+        // A sibling still sharing what it fetched in place of ring 1.
+        GatewayEngine::take_shared(&engine, shared(1, ring(3, &[0]), Vec::new()));
+        assert_eq!(version(&engine), 2);
+        GatewayEngine::take_shared(&engine, shared(7, ring(2, &[0, 1, 2]), vec![NodeId(2)]));
+        assert_eq!(version(&engine), 2);
+        assert!(engine.borrow().gateway.down().contains(&NodeId(2)));
     }
 }

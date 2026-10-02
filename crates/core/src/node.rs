@@ -201,13 +201,17 @@ pub enum Action {
     },
     /// Answer the gateway with `head`, then `body`. Call `on_sent` once the
     /// body is sent. A home that knows the object's metadata includes it.
-    /// Hints name the hot placements the request read.
+    /// Hints name the hot placements the request read. `s3_error` marks a
+    /// 5xx that S3 answered, rather than the node's own failure to get an
+    /// answer: the gateway passes it to its client, since another node
+    /// would only ask S3 again.
     Respond {
         request: GatewayRequestId,
         head: ResponseHead,
         body: Vec<Segment>,
         meta: Option<ObjectMeta>,
         hot: Vec<HotHint>,
+        s3_error: bool,
     },
     /// The request reaches past the blocks the home holds: answer the
     /// gateway with the metadata, and it reads the blocks from their owners.
@@ -582,6 +586,9 @@ struct OriginRequest {
     answered: bool,
     /// Timed out: its response, if it comes, is the owner's to drop.
     cancelled: bool,
+    /// S3 sent no answer, or the node could not ask it: the node's own
+    /// failure, which another node may get past.
+    failed: bool,
     /// The object's offset of the first byte of the response body.
     body_start: u64,
     /// Responses and writes that still read the body.
@@ -1125,6 +1132,16 @@ impl Node {
         self.release_if_unread(origin);
     }
 
+    /// S3 sent no answer to `origin`, or the node could not ask it. Whatever
+    /// waited on it proceeds as if S3 failed with 503, but the node's
+    /// answers leave `s3_error` unset, so a gateway tries another node.
+    pub fn on_origin_failed(&mut self, now: Time, origin: OriginRequestId) {
+        if let Some(request) = self.origins.get_mut(&origin) {
+            request.failed = true;
+        }
+        self.on_origin_response(now, origin, ResponseHead::status(503));
+    }
+
     /// The bytes of an upload of `key`, `size` bytes long, that this node's
     /// owner keeps as it passes the body to S3: the home's region, when the
     /// bucket warms on write and this node is the key's home.
@@ -1168,6 +1185,7 @@ impl Node {
             peer: None,
             answered: true,
             cancelled: false,
+            failed: false,
             body_start: 0,
             readers: 1,
             blocks: Vec::new(),
@@ -1775,11 +1793,11 @@ impl Node {
             .filter(|owner| *owner != self.id && !self.unreachable.contains(owner))
     }
 
-    /// Time passed: S3 requests unanswered past the timeout are abandoned,
-    /// and whatever waited on them proceeds as if S3 failed with 503. The
-    /// previous ring goes once the fallback window ends. An event the
-    /// other homes have not all heard of within the peer timeout is left
-    /// to the queue, which offers it again.
+    /// Time passed: S3 requests unanswered past the timeout are abandoned
+    /// and count as failed (`on_origin_failed`). The previous ring goes
+    /// once the fallback window ends. An event the other homes have not all
+    /// heard of within the peer timeout is left to the queue, which offers
+    /// it again.
     pub fn on_tick(&mut self, now: Time) {
         self.now = self.now.max(now);
         self.events.retain(|_, passed| passed.until > now);
@@ -1816,7 +1834,7 @@ impl Node {
             self.unreachable.extend(peer);
             match asks_metadata {
                 true => self.on_peer_metadata(now, origin, None),
-                false => self.on_origin_response(now, origin, ResponseHead::status(503)),
+                false => self.on_origin_failed(now, origin),
             }
         }
     }
@@ -2222,6 +2240,7 @@ impl Node {
                 peer: None,
                 answered: false,
                 cancelled: false,
+                failed: false,
                 body_start,
                 readers: 0,
                 blocks: Vec::new(),
@@ -2258,6 +2277,7 @@ impl Node {
                 peer: Some(peer),
                 answered: false,
                 cancelled: false,
+                failed: false,
                 body_start,
                 readers: 0,
                 blocks: Vec::new(),
@@ -2390,10 +2410,10 @@ impl Node {
                 None => {
                     self.waiting.remove(&request);
                     let head = ResponseHead::status(head.status);
-                    self.respond(request, head, Vec::new(), Holds::default(), None);
+                    self.respond_from(origin, request, head, Vec::new(), Holds::default(), None);
                 }
             }
-            return self.resume(now, waiters, sent, &head, has_meta);
+            return self.resume(now, origin, waiters, sent, &head, has_meta);
         }
         if let Some(meta) = meta.as_ref().filter(|_| !superseded) {
             self.know(key.clone(), meta.clone(), sent);
@@ -2433,7 +2453,7 @@ impl Node {
                     self.read(origin, &mut holds);
                     self.count_relayed(&head);
                 }
-                self.respond(request, head.clone(), body, holds, known);
+                self.respond_from(origin, request, head.clone(), body, holds, known);
             }
         }
         if let Some(meta) = meta
@@ -2456,16 +2476,18 @@ impl Node {
                 self.unref(version);
             }
         }
-        self.resume(now, waiters, sent, &head, has_meta);
+        self.resume(now, origin, waiters, sent, &head, has_meta);
         self.arriving = None;
     }
 
-    /// Serves the requests that waited on a first fetch sent at `sent`. A
-    /// 404 or a 5xx without metadata answers those that arrived before the
-    /// fetch left, since S3 checked after they did; the rest start over.
+    /// Serves the requests that waited on first fetch `origin`, sent at
+    /// `sent`. A 404 or a 5xx without metadata answers those that arrived
+    /// before the fetch left, since S3 checked after they did; the rest
+    /// start over.
     fn resume(
         &mut self,
         now: Time,
+        origin: OriginRequestId,
         waiters: Vec<GatewayRequestId>,
         sent: Time,
         head: &ResponseHead,
@@ -2477,7 +2499,7 @@ impl Node {
             if shared_answer && arrived.is_some_and(|arrived| arrived <= sent) {
                 self.waiting.remove(&waiter);
                 let head = ResponseHead::status(head.status);
-                self.respond(waiter, head, Vec::new(), Holds::default(), None);
+                self.respond_from(origin, waiter, head, Vec::new(), Holds::default(), None);
             } else {
                 self.serve(now, waiter);
             }
@@ -2544,6 +2566,21 @@ impl Node {
             (200, Some(fresh)) => {
                 *meta = fresh;
                 *validated = sent;
+            }
+            // S3 failed, or the node could not ask it: the metadata stays
+            // as it was, and the reads waiting on it get the failure, as a
+            // fill's would, rather than each asking S3 again.
+            (status, _) if status >= 500 => {
+                // The revalidation was a HEAD, whose answer holds no body
+                // whatever length it names.
+                let error = ResponseHead {
+                    content_length: 0,
+                    ..head
+                };
+                for waiter in waiters {
+                    self.fail(waiter, origin, &error);
+                }
+                return;
             }
             _ => {
                 self.forget(&key);
@@ -2844,6 +2881,15 @@ impl Node {
         let changed = matches!(head.status, 206 | 404 | 412);
         let mut revalidating = Vec::new();
         let (key, etag) = self.name(version).clone();
+        // The body holds no blocks: a later read fetches them again rather
+        // than joining it, though waiters may still read S3's error.
+        let blocks = std::mem::take(&mut self.origins.get_mut(&origin).expect("fill").blocks);
+        for block in blocks {
+            if self.in_flight.get(&block) == Some(&origin) {
+                self.in_flight.remove(&block);
+                self.unref(block.version);
+            }
+        }
         if changed {
             self.changed(&key);
         }
@@ -3088,7 +3134,7 @@ impl Node {
             });
             self.count_relayed(&head);
         }
-        self.respond(id, head, body, holds, None);
+        self.respond_from(origin, id, head, body, holds, None);
     }
 
     /// Counts the blocks an object's bytes in a relayed body span.
@@ -3106,9 +3152,9 @@ impl Node {
         let Some(waiting) = self.waiting.remove(&id) else {
             return;
         };
-        if let Some(plan) = waiting.plan {
-            self.release(plan.holds);
-        }
+        // The plan may hold `origin`'s last reader: read the error's body,
+        // and whether S3 gave it, before releasing the plan.
+        let s3_error = self.s3_error(origin, error);
         let mut holds = Holds::default();
         let mut body = Vec::new();
         if error.content_length > 0 {
@@ -3119,11 +3165,15 @@ impl Node {
                 len: error.content_length,
             });
         }
+        if let Some(plan) = waiting.plan {
+            self.release(plan.holds);
+        }
         let head = ResponseHead {
             content_length: error.content_length,
+            headers: error.headers.clone(),
             ..ResponseHead::status(error.status)
         };
-        self.respond(id, head, body, holds, None);
+        self.answer(id, head, body, holds, None, s3_error);
     }
 
     fn respond(
@@ -3133,6 +3183,39 @@ impl Node {
         body: Vec<Segment>,
         holds: Holds,
         meta: Option<ObjectMeta>,
+    ) {
+        self.answer(id, head, body, holds, meta, false);
+    }
+
+    /// Answers with `head`, taken from S3's answer to `origin`, marking a
+    /// 5xx that S3 gave rather than one the node's own failure left.
+    fn respond_from(
+        &mut self,
+        origin: OriginRequestId,
+        id: GatewayRequestId,
+        head: ResponseHead,
+        body: Vec<Segment>,
+        holds: Holds,
+        meta: Option<ObjectMeta>,
+    ) {
+        let s3_error = self.s3_error(origin, &head);
+        self.answer(id, head, body, holds, meta, s3_error);
+    }
+
+    /// Whether `head`, taken from S3's answer to `origin`, is a 5xx that S3
+    /// gave rather than one the node's own failure left.
+    fn s3_error(&self, origin: OriginRequestId, head: &ResponseHead) -> bool {
+        head.status >= 500 && !self.origins[&origin].failed
+    }
+
+    fn answer(
+        &mut self,
+        id: GatewayRequestId,
+        head: ResponseHead,
+        body: Vec<Segment>,
+        holds: Holds,
+        meta: Option<ObjectMeta>,
+        s3_error: bool,
     ) {
         for segment in &body {
             match segment {
@@ -3154,6 +3237,7 @@ impl Node {
             body,
             meta,
             hot,
+            s3_error,
         });
     }
 

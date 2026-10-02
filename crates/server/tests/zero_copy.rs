@@ -5,9 +5,12 @@
 
 mod common;
 
-use common::trace::{Call, WRITES, check_writes_carry_no_body, now, read_trace, windows};
-use common::{Cluster, Process, data_dir, recorded, start_origin};
+use common::trace::{
+    Call, WRITES, check_writes_carry_at_most, check_writes_carry_no_body, now, read_trace, windows,
+};
+use common::{Cluster, Process, data_dir, recorded, send, start_origin};
 use s3_accelerator::disk::decode_record;
+use s3_accelerator::http;
 use std::collections::BTreeMap;
 use tokio::task::LocalSet;
 
@@ -18,9 +21,11 @@ const MIN_SLOT: u64 = 4096;
 
 /// Reads each object twice through a node and a gateway, each a separate
 /// traced process. The second reads are hits: their bytes must leave the
-/// node through `sendfile` from the slab file and the gateway through
-/// `splice` into the client's socket, and no call that writes may carry
-/// any of them.
+/// node through `sendfile` from the slab file, and no call of the node's
+/// that writes may carry any of them. The gateway reads up to
+/// `READ_AHEAD` bytes of each answer's body with its head and writes them
+/// with the response's head; the rest must leave through `splice` into
+/// the client's socket.
 #[tokio::test(flavor = "current_thread")]
 async fn hits_leave_by_sendfile_and_splice() {
     LocalSet::new()
@@ -79,11 +84,16 @@ async fn hits_leave_by_sendfile_and_splice() {
                 })
                 .map(|call| call.result.max(0))
                 .sum();
+            // Each object is one answer, whose first bytes went with the
+            // response's head, with headers at most a few KiB.
+            let ahead = (keys.len() * http::READ_AHEAD) as i64;
             assert!(
-                spliced >= total,
+                spliced >= total - ahead,
                 "the gateway spliced {spliced} of {total} hit bytes to clients"
             );
-            let gateway_written = check_writes_carry_no_body("gateway", &gateway, &windows, total);
+            let heads = (keys.len() * 4096) as i64;
+            let gateway_written =
+                check_writes_carry_at_most("gateway", &gateway, &windows, total, ahead + heads);
             println!(
                 "{total} hit bytes: the node sent {sent} with sendfile and wrote {node_written} bytes; \
                  the gateway spliced {spliced} to clients and wrote {gateway_written} bytes"
@@ -302,6 +312,100 @@ async fn a_cached_hit_is_sent_from_the_event_loop() {
             assert!(
                 !uncached.is_empty() && uncached.iter().all(|&on_loop| !on_loop),
                 "{uncached:?}"
+            );
+        })
+        .await;
+}
+
+/// A small hit's body comes with its node's answer head, and leaves the
+/// gateway in the same write as the client's response head: a 4 KiB range
+/// takes one write and no `splice`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_small_hit_leaves_the_gateway_in_one_write() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            origin.size.set(OBJECT_SIZE);
+            let dir = data_dir();
+            let cluster = Cluster::new(&dir, origin_port, "block_size = 65536");
+            let _node = Process::start(&cluster.node);
+            common::listening(cluster.node_port).await;
+            let trace = dir.join("gateway.trace");
+            let gateway = Process::traced(&cluster.gateway, &trace, &format!("splice,{WRITES}"));
+            common::listening(cluster.gateway_port).await;
+            let body = origin.object("/bucket/k");
+            assert!(cluster.get("k").await == (200, body.clone()));
+            let from = now();
+            let range = [("range", "bytes=4096-8191")];
+            let port = cluster.gateway_port;
+            let (status, read) = send(port, "GET", "/bucket/k", "", &range, Vec::new()).await;
+            assert!(status == 206 && read == body[4096..8192], "{status}");
+            gateway.stop();
+            let client = format!(":{port}->");
+            let calls = read_trace(&trace, from, f64::MAX);
+            let to_client = |call: &&Call| call.fds().iter().any(|fd| fd.contains(&client));
+            let writes: Vec<Vec<u8>> = calls
+                .iter()
+                .filter(to_client)
+                .filter(|call| WRITES.split(',').any(|name| name == call.name))
+                .map(Call::data)
+                .collect();
+            assert_eq!(writes.len(), 1, "the gateway wrote {} times", writes.len());
+            assert!(writes[0].starts_with(b"HTTP/1.1 206"));
+            assert!(writes[0].ends_with(&body[4096..8192]));
+            let spliced = calls
+                .iter()
+                .filter(to_client)
+                .any(|call| call.name == "splice");
+            assert!(!spliced, "the gateway spliced to the client");
+        })
+        .await;
+}
+
+/// A hit's head goes out with `MSG_MORE`, so the kernel sends it in one
+/// packet with the first bytes of the `sendfile` that follows.
+#[tokio::test(flavor = "current_thread")]
+async fn a_hits_head_shares_its_bodys_first_packet() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            origin.size.set(OBJECT_SIZE);
+            let dir = data_dir();
+            let cluster = Cluster::new(&dir, origin_port, "block_size = 65536");
+            let trace = dir.join("node.trace");
+            let node = Process::traced(&cluster.node, &trace, "sendto,sendfile");
+            common::listening(cluster.node_port).await;
+            let _gateway = cluster.start_gateway().await;
+            let body = origin.object("/bucket/k");
+            assert!(cluster.get("k").await == (200, body.clone()));
+            let slots = dir.join("disk-0/slots");
+            for tries in 0.. {
+                assert!(tries < 500, "the blocks were never recorded");
+                if recorded(&slots) == 3 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let hit = now();
+            assert!(cluster.get("k").await == (200, body));
+            node.stop();
+            // "HTTP/1.1 ", as `strace -xx` prints it.
+            const HEAD: &str = "\\x48\\x54\\x54\\x50\\x2f\\x31\\x2e\\x31\\x20";
+            let calls = read_trace(&trace, hit, f64::MAX);
+            let heads: Vec<&str> = calls
+                .iter()
+                .filter(|call| call.name == "sendto" && call.args.contains(HEAD))
+                .map(|call| call.args.rsplit(", ").nth(2).unwrap_or_default())
+                .collect();
+            assert!(!heads.is_empty(), "no head went out");
+            assert!(
+                heads.iter().all(|flags| flags.contains("MSG_MORE")),
+                "{heads:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| call.name == "sendfile" && call.result > 0)
             );
         })
         .await;

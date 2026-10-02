@@ -132,6 +132,210 @@ The spec left the layout open until benchmarks tested its three risks. It stays:
 - **Splitting what the window holds.** A read's parts to one owner were split at half the read-ahead window even when the window held the whole body, which gained nothing and cost a single client's throughput. Parts split only while runs remain beyond the window.
 - **Settling before fills end.** The benchmark waited for half a second without writes before each workload. A sync that ran longer, with writers throttled behind it, ended the wait early, and a hit workload then waited on the last one's writes: plaintext hits ran at 0.62 GiB/s. The benchmark now waits for the node's metrics to show no fills in progress: 20.9 to 21.9 GiB/s.
 
+## Load tests on AWS
+
+`loadtest/` runs the cluster on EC2 in us-east-1a in front of a real S3 bucket, and checks every byte of every response against the object's known contents. Clients' figures come from the load generator's clocks over each step's measured window, processes' from their `/metrics`, and hosts' from `/proc` and the network card's `ethtool` counters. Runs of 2026-10-01; their reports stay in `loadtest/runs/`, out of the repository. Gb/s below are decimal gigabits: a GiB/s is 8.59 Gb/s.
+
+### Phase 11: one gateway thread
+
+`full-20261001-152652`: 4 i4i.4xlarge nodes (16 vCPUs, one 3.75 TB drive, 25 Gb/s on burst credits and 9.375 Gb/s without) with 256 GiB of cache each, and 4 c6in.8xlarge clients (32 vCPUs, 50 Gb/s), each running a gateway; 2.3 TiB of objects. Of 65 million requests through the cache, two failed: S3's own 500 to a write, passed through, and one read that timed out during a rolling restart. Latencies here include a millisecond the load generator waited before each request, which Phase 12 removed.
+
+| Workload | Requests/s | GiB/s | First byte p50 | p99 | What limited it |
+|---|--:|--:|--:|--:|---|
+| Small hits, 4-256 KiB, 64 connections per client | 66,562 | 3.85 | 3.79 ms | 5.05 ms | Each gateway's one thread, at a core: about 14,600 requests/s per client |
+| 256 MiB hits, 64 connections per client | 45 | 11.23 | 4.93 ms | 45 ms | The nodes' network on burst credits; after an hour, 1.1 GiB/s each without them |
+| S3 directly, small objects | 18,327 | 1.06 | 32 ms | 146 ms | S3 answered 30% with 503 on a new bucket |
+| S3 directly, 256 MiB objects | 84 | 20.91 | 102 ms | 198 ms | |
+
+### Phase 12: every core
+
+`rate-20261001-211850` and `rate8`: Phase 11's hosts with four, then eight, node processes per host, and gateways of 32 loops. 373 million requests, every one answered.
+
+| Workload | Requests/s | GiB/s | First byte p50 | p99 | What limited it |
+|---|--:|--:|--:|--:|---|
+| One connection per client | 12,813 | 0.74 | 0.33 ms | 0.46 ms | The round trip |
+| Small hits, 64 connections per client | 195,660 | 11.30 | 0.55 ms | 4.29 ms | The nodes' network: 25 Gb/s each, at 15-18% CPU |
+| Small hits, 1,024 connections per client | 196,886 | 11.37 | 1.19 ms | 59 ms | The same |
+| 4 KiB range hits, 64 connections, 4 nodes per host | 566,777 | 2.16 | 0.43 ms | 0.88 ms | The busiest node processes' threads, at a core, on hosts at 20% |
+| 4 KiB range hits, 256 connections, 8 nodes per host | 813,561 | 3.10 | 1.06 ms | 3.68 ms | The client hosts' CPU, 79-85%: each gateway took about 19 cores and the load generator most of the rest |
+
+`bandwidth-20261001-215017`: 2 m8idn.32xlarge nodes (128 vCPUs, 496 GiB of memory, two 3.8 TB drives, 200 Gb/s), one process each with 1 TiB of cache, and 5 c6in.16xlarge clients (64 vCPUs, 100 Gb/s) with gateways of 64 loops, over 512 large objects, 128 GiB, warmed into the cache. Every request answered.
+
+| Workload | GiB/s | Each node | Node CPU | Note |
+|---|--:|--:|--:|---|
+| S3 directly, 64 connections per client | 27.39 | | | About 88 MiB/s per connection |
+| 256 MiB hits, 16 connections per client | 42.73 | 21.37 GiB/s | 3% | |
+| 256 MiB hits, 64 connections per client | 45.56 | 22.78 GiB/s, 195.7 Gb/s | 2% | The network card held back 126 million packets (`bw_out_allowance_exceeded`) |
+| 256 MiB hits, 128 connections per client | 45.29 | 22.65 GiB/s | 1-2% | |
+| 8 MiB range hits, 128 connections per client, 5,895 a second | 46.05 | 23.03 GiB/s, 197.8 Gb/s | 2% | |
+| 256 MiB hits after dropping the page cache | 39.98 | 19.99 GiB/s | 13-20% | Each node read its 64 GiB from its drives once, then from the page cache |
+
+Each node's figure counts object bytes; TCP, IP and Ethernet headers add about 0.7% on 9,001-byte frames, which brings the nodes to 197-199 Gb/s of their 200.
+
+### Phase 13: a cheaper request path
+
+`rate13`: Phase 12's `rate8` hardware and layout (4 i4i.4xlarge nodes with eight node processes each, 4 c6in.8xlarge clients with gateways of 32 loops), after the read-ahead, the allocation cuts and the cached signing key. 276 million requests; S3 answered 25 of the million cold reads in `warm-small` with a 5xx, which the gateways passed on, and every other request was answered.
+
+| Workload | Requests/s | GiB/s | First byte p50 | p90 | p99 | p99.9 | Gateway CPU per request |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| One connection per client | 13,654 | 0.79 | 0.28 ms | 0.33 ms | 0.38 ms | 0.44 ms | |
+| Small hits, 256 connections per client | 196,148 | 11.33 | 0.80 ms | 4.93 ms | 29 ms | 55 ms | |
+| 4 KiB range hits, 64 connections per client | 691,839 | 2.64 | 0.35 ms | 0.45 ms | 0.59 ms | 0.81 ms | |
+| 4 KiB range hits, 256 connections per client | 911,555 | 3.48 | 0.56 ms | 1.11 ms | 16 ms | 24 ms | 86 µs of a vCPU |
+| 4 KiB range hits, 1,024 connections per client | 944,692 | 3.60 | 0.83 ms | 3.58 ms | 104 ms | 125 ms | 86 µs of a vCPU |
+
+4 KiB range hits rose 12% at 256 connections, from 813,561 a second to 911,555, and reached 944,692 at 1,024. Each gateway still took about 20 of its host's 32 vCPUs, and the client hosts ran at 72-76%, so the client hosts' CPU still set the limit; the node hosts ran at 32-41%. A request cost the gateway 86 µs of a vCPU against `rate8`'s 93 µs, 8% less, where one loop on a workstation gained 40%: the trims cut the gateway's own work, and on c6in most of a request's cost lies elsewhere, likely in the kernel's TCP and the network driver, which a profile on AWS would confirm. Small hits stayed at the nodes' network limit, and one connection's first byte fell from 0.33 ms to 0.28 ms. Past 256 connections, the client hosts queue: p99 rose to 16 ms at 256 and 104 ms at 1,024.
+
+### Scale test: the cache against S3
+
+`scale`, `scale-2` and `scale-1proc` (`loadtest/plans/scale.toml`): 10 c8in.16xlarge clients (64 vCPUs, 100 Gb/s), each running its gateway, read one dataset from S3 directly and through 6 m8idn.32xlarge nodes (128 vCPUs, 200 Gb/s, two 3.8 TB drives) with 1 TiB of cache each. Small objects and ranges ran 32 node processes per host; `scale-1proc` ran large objects with one. c6in.16xlarge and m6in.16xlarge clients were out of capacity in the zone. Connections are per client; rates are totals.
+
+| Workload | Target | Requests/s | GiB/s | First byte p50 | p90 | p99 | p99.9 |
+|---|---|--:|--:|--:|--:|--:|--:|
+| 4-256 KiB objects, 1 connection | S3 | 218 | 0.01 | 35 ms | 73 ms | 120 ms | 220 ms |
+| | Cache | 13,591 | 0.79 | 0.66 ms | 0.93 ms | 1.20 ms | 1.43 ms |
+| 4-256 KiB objects, 64 connections | S3 | 17,595 | 1.02 | 25 ms | 60 ms | 110 ms | 225 ms |
+| | Cache | 373,341 | 21.56 | 0.49 ms | 1.38 ms | 20 ms | 26 ms |
+| 4-256 KiB objects, 256 connections | Cache | 521,240 | 30.11 | 0.52 ms | 2.25 ms | 47 ms | 147 ms |
+| 4 KiB ranges, 64 connections | S3 | 20,694 | 0.08 | 26 ms | 48 ms | 98 ms | 215 ms |
+| | Cache | 1,642,343 | 6.27 | 0.38 ms | 0.51 ms | 0.65 ms | 0.79 ms |
+| 4 KiB ranges, 256 connections | Cache | 2,721,604 | 10.38 | 0.55 ms | 1.34 ms | 10 ms | 13 ms |
+| 4 KiB ranges, 1,024 connections | Cache | 3,696,502 | 14.10 | 1.00 ms | 7.23 ms | 22 ms | 42 ms |
+| 256 MiB objects, 16 connections | Cache | 416 | 103.93 | 1.22 ms | 1.98 ms | 3.26 ms | 5.12 ms |
+| 256 MiB objects, 64 connections | S3 | 217 | 54.33 | 87 ms | 130 ms | 176 ms | 229 ms |
+| | Cache | 459 | 114.73 | 2.78 ms | 5.76 ms | 11 ms | 211 ms |
+| 256 MiB objects, 256 connections | S3 | 438 | 109.45 | 34 ms | 97 ms | 143 ms | 190 ms |
+| | Cache | 452 | 112.93 | 211 ms | 219 ms | 420 ms | 745 ms |
+
+- **Small objects and ranges:** 21 times S3's request rate for small objects and 79 times for 4 KiB ranges at 64 connections, first byte under a millisecond. Nothing ran out: at 3.7 million ranges a second the client hosts were 42-44% busy and the node hosts 12%, while p99 rose to 22 ms. Small hits at 256 connections climbed from 407,000 to 632,000 a second over the step without a host near its limit. Both point at queueing in the request path, not at a resource.
+- **Large objects:** with one node process per host, the cache gave the clients 104 GiB/s at 16 connections and 115 GiB/s at 64, the clients' 1 Tb/s, each node sending about 170 Gb/s at 4% CPU; S3 gave 54 GiB/s at 64 connections and 109 at 256. At 256 connections the cache's reads queue at the clients' network cards, so its first byte waits 211 ms.
+- **Large objects across 192 ring members:** with 32 node processes per host, 256 MiB hits gave 43 GiB/s at 16 connections, 58 at 64, 50 at 128 and 13.5 at 256, where 667 reads timed out, with clients at 5-6% CPU and nodes at 1-2%. A gateway held 35,744 connections to nodes, most with receive windows near 250 KB. A rerun on fresh hosts with the same layout did not collapse; see the next section.
+- **A cold set read three times** (`cold-medium`, about 870 GiB a pass): 20.5 GiB/s over the three passes; the block hit rate stays at zero while the first pass streams and the second admits, then holds at 100%.
+- **Errors:** S3 answered 67 of the 4.0 million direct requests with a 500, and one timed out; the cache passed on S3's 500s for 14 fills.
+
+
+### Cluster TCP timers, and a rerun on fresh hosts
+
+`ab-linux`, `ab-cluster` and `ab-20ms`: the scale test's hardware again, on new instances, with 32 node processes per host for every workload. The three runs share one deploy and differ only in the timers on links among gateways and nodes: Linux's (a 200 ms minimum retransmission timeout, and loss probes that allow for a 200 ms delayed ACK), the cluster's 5 ms for both, and a 20 ms floor with the 5 ms delayed ACK.
+
+| Workload | Timers | GiB/s | First byte p50 | p99 | p99.9 | Segments resent | Retransmission timeouts |
+|---|---|--:|--:|--:|--:|--:|--:|
+| 256 MiB objects, 16 connections | Linux | 110.63 | 1.40 ms | 3.57 ms | 7.17 ms | | |
+| | 5 ms | 115.84 | 1.81 ms | 6.01 ms | 9.79 ms | | |
+| | 20 ms floor | 115.79 | 1.72 ms | 5.47 ms | 24 ms | | |
+| 256 MiB objects, 64 connections | Linux | 115.22 | 2.90 ms | 15 ms | 213 ms | 14.8 million | 6,057 |
+| | 5 ms | 115.23 | 3.10 ms | 13 ms | 19 ms | 24.0 million | 13,562 |
+| | 20 ms floor | 115.30 | 3.01 ms | 18 ms | 31 ms | 25.4 million | 15,674 |
+| 256 MiB objects, 256 connections | Linux | 112.57 | 2.45 ms | 209 ms | 229 ms | 47.6 million | 176,917 |
+| | 5 ms | 105.99 | 3.52 ms | 24 ms | 42 ms | 85.9 million | 1,526,360 |
+| | 20 ms floor | 109.19 | 3.42 ms | 36 ms | 1,044 ms | 87.3 million | 1,101,104 |
+
+- **The tail at full network cards:** at 64 and 256 connections per client, the clients' cards drop packets past their allowance, and with Linux's timers each loss that a timeout recovers costs 200 ms: p99.9 of 213 ms at 64 connections, and p99 of 209 ms at 256. The 5 ms timers bring those to 19 ms and 24 ms. They resend about 1.8 times the segments, 4.7-5.6% of what each node sent at 256 connections against 2.7-2.9%, which costs 6% of throughput there.
+- **A 20 ms floor** resends as much as 5 ms but recovers more slowly: backed-off timeouts start from 20 ms, and p99.9 reached a second at 256 connections. The cluster keeps 5 ms.
+- **Small objects and ranges** lose nothing and see no change: no allowance drops, a few hundred resent segments a step, and rates within 6% across the three runs, which is the runs' own spread.
+
+With the 5 ms timers, the current defaults:
+
+| Workload | Requests/s | GiB/s | First byte p50 | p90 | p99 | p99.9 |
+|---|--:|--:|--:|--:|--:|--:|
+| 4-256 KiB objects, 64 connections | 1,383,218 | 79.90 | 0.39 ms | 0.53 ms | 0.68 ms | 0.88 ms |
+| 4-256 KiB objects, 256 connections | 1,977,807 | 114.25 | 0.80 ms | 1.94 ms | 4.00 ms | 6.82 ms |
+| 4 KiB ranges, 64 connections | 1,836,670 | 7.01 | 0.34 ms | 0.46 ms | 0.59 ms | 0.71 ms |
+| 4 KiB ranges, 256 connections | 4,621,169 | 17.63 | 0.52 ms | 0.74 ms | 1.07 ms | 1.62 ms |
+| 4 KiB ranges, 1,024 connections | 6,053,848 | 23.09 | 1.43 ms | 2.85 ms | 4.77 ms | 6.62 ms |
+| 256 MiB objects, 16 connections | 463 | 115.84 | 1.81 ms | 3.26 ms | 6.01 ms | 9.79 ms |
+| 256 MiB objects, 64 connections | 461 | 115.23 | 3.10 ms | 7.10 ms | 13 ms | 19 ms |
+| 256 MiB objects, 256 connections | 424 | 105.99 | 3.52 ms | 11 ms | 24 ms | 42 ms |
+
+**The first scale run's slowness did not recur.** With the same layout and Linux's timers, `ab-linux` served 3.9 times the small hits (1,472,009 a second against 373,341) and 1.7 times the 4 KiB ranges at 1,024 connections, with p99 under a millisecond at 64 connections where the first run saw 20 ms. Its large reads held 112.6 GiB/s at 256 connections, where the first run fell to 13.5 GiB/s with 667 timeouts. Every process's event loop ran on time in both runs, and the code differed only in the timers, which `ab-linux` left at Linux's. The first run's hosts are the likeliest difference, through the network between them, but nothing measured shows it: that run predates the report's TCP and network card counters.
+
+### Misses, a profile on AWS, and TLS
+
+`misses`, `plain`, `single`, `plain-fast` and `tls`: the scale test's hardware, one fleet, 32 node processes per host. S3 ran slower this session than in the scale test (30.7 GiB/s for 256 MiB objects at 64 connections, against 54.3), so only figures from one session compare.
+
+Cold reads, through the cache and from S3 directly, on the same keys at 64 connections per client:
+
+| Objects | S3 directly | Through the cache | Cache against S3 |
+|---|---|---|--:|
+| 4-256 KiB, a million | 11,647/s; first byte p50 46 ms, p99 139 ms | 9,060/s; p50 65 ms, p99 166 ms | 78% |
+| 1-32 MiB, 100,000 | 22.3 GiB/s; p50 120 ms | 21.0 GiB/s; p50 126 ms | 94% |
+| 256 MiB, 2,048 | 30.7 GiB/s; p50 134 ms | 24.1 GiB/s; p50 148 ms | 79% |
+| Parquet tables of 64-512 MiB, 4,000 | 25.8 GiB/s; p50 130 ms | 25.7 GiB/s; p50 150 ms | 100% |
+
+The 1-32 MiB set read again admitted its blocks at 22.6 GiB/s, with first byte 199 ms at p50, and read a third time hit at 41.3 GiB/s, 0.82 ms. A cold object streams through its home as one S3 GET, while the client hosts ran at 2% CPU and the node hosts at 6%, leaving room to parallelize it; `PLAN.md` keeps that for later.
+
+One connection per client, the rate one reader sees:
+
+| Objects | S3 directly | Cache hits |
+|---|--:|--:|
+| 256 MiB | 68 MiB/s a stream | 1.42 GiB/s a stream, 21 times |
+| 1-32 MiB | 38 MiB/s | 677 MiB/s, 18 times |
+
+**The profile.** `loadtest profile` sampled every CPU of a client host and a node host during 4 KiB range hits at 256 connections per client (`plain`). On the client host, the gateway's 64 loops took 59.5% of the CPU: 22.7% in the gateway's own code, 18.7% in the kernel and 17.4% in libc, mostly `malloc`, `free` and copies; the load generator took 28.5%. On the node host, ranking ring members for each placement, `placement::score`, took 10.0% of the host: 192 members, each scored with a hash and a logarithm for every placement a request touched. Two changes followed:
+
+- Rings whose members share one weight rank them by their hashes, which orders them as the scores do; `placement::score` left the node profile (`plain-fast`).
+- The server binary allocates with jemalloc.
+
+On one machine, with 32 node processes, a gateway of 8 loops and s3proxy (`target/many`):
+
+| Build | 4 KiB range hits | Gateway CPU a hit | Node CPU a hit | Cold fills |
+|---|--:|--:|--:|--:|
+| Before | 253,800/s | 35.0 µs | 33.5 µs | |
+| Placement by hash | 260,000/s | 34.6 µs | 32.0 µs | 37,800/s |
+| And mimalloc | 270,000/s | 32.2 µs | 30.2 µs | 34,300/s |
+| And jemalloc | 274,000/s | 31.8 µs | 30.2 µs | 39,000/s |
+
+**TLS at scale** (`tls` against `plain-fast`, kernel TLS on clients' and members' links, before the fix below):
+
+| Workload | Plaintext | TLS |
+|---|---|---|
+| 256 MiB, 16 connections | 113.6 GiB/s | 110.5 GiB/s; p99 3.3 ms |
+| 256 MiB, 64 connections | 115.2 GiB/s; p99 13 ms | 112.4 GiB/s; p99 11 ms |
+| 4 KiB ranges, 64 connections | 1,786,185/s; p99 0.59 ms | 1,344,896/s; p99 0.62 ms |
+| 4 KiB ranges, 256 connections | 4,613,334/s; p99 1.05 ms | 1,360,202/s; p99 2.6 ms |
+| 4 KiB ranges, 1,024 connections | 5,323,049/s (`plain`) | 1,340,077/s; p99 4.3 ms |
+| One connection, small hits | 13,109/s; p50 0.66 ms (`plain`) | 10,110/s; p50 0.64 ms |
+
+Large objects lose 2-3% to TLS, since kernel TLS keeps `sendfile` and `splice`. Small requests stopped near 1.35 million a second whatever the connections: the client host's gateway workers took 69% of its CPU, 48% spinning in the kernel on one lock (`osq_lock`). For a kernel TLS client, the gateway handed every body to a worker, even 4 KiB: a duplicated descriptor registered with, and removed from, the one poller all 64 workers share. A body within one TLS record now goes out from the event loop at both ends, the node's `sendfile` and the gateway's write with the head, after the gateway reads the rest of it into memory; encrypting 16 KiB costs microseconds. `PLAN.md` 15F reruns it on AWS.
+
+### The rerun: placement, jemalloc and the TLS fix together
+
+`v-plain` and `v-tls`: one fleet of the scale test's hardware, 32 node processes per host, the same steps in plaintext and with kernel TLS on clients' and members' links.
+
+| Workload | Plaintext | TLS | TLS against plaintext | TLS before the fix (`tls`, another fleet) |
+|---|---|---|--:|---|
+| One connection, small hits | 13,786/s; p50 0.62 ms | 10,903/s; p50 0.62 ms | 79% | 10,110/s |
+| Small hits, 64 connections | 1,392,749/s; p99 0.66 ms | 1,055,998/s; p99 0.71 ms | 76% | 982,007/s |
+| 4 KiB ranges, 64 connections | 1,840,982/s; p99 0.57 ms | 1,740,748/s; p99 0.59 ms | 95% | 1,344,896/s |
+| 4 KiB ranges, 256 connections | 4,746,566/s; p99 0.98 ms | 4,283,255/s; p99 1.15 ms | 90% | 1,360,202/s |
+| 4 KiB ranges, 1,024 connections | 6,426,713/s; p99 4.3 ms | 4,292,706/s; p99 48 ms | 67% | 1,340,077/s |
+| 256 MiB, 16 connections | 115.85 GiB/s | 111.21 GiB/s | 96% | 110.45 GiB/s |
+| 256 MiB, 64 connections | 115.21 GiB/s; p99 14 ms | 113.86 GiB/s; p99 11 ms | 99% | 112.42 GiB/s |
+
+With small bodies on the event loops, TLS keeps 95% of plaintext's request rate at 64 connections per client and 90% at 256, where it had kept 75% and 30%, and `osq_lock` left the client host's profile. At 1,024 connections TLS held 4.3 million a second, 67%, with the client hosts 70% busy and p99 at 48 ms: a limit still to find. Plaintext's 6.4 million 4 KiB ranges a second at 1,024 connections is the most any run has served.
+
+### A response that starts on its first part
+
+`final`: `v-plain`'s fleet and steps, after the gateway began starting a response once its first part answers rather than once every part of the read-ahead window has. A 256 MiB read asks for its first 64 MiB as four parts from four nodes, so its first byte had waited for the slowest.
+
+| 256 MiB objects | Before (`v-plain`, `single`) | After (`final`) |
+|---|---|---|
+| 1 connection: first byte p50, p99 | 1.64 ms, 2.70 ms | 1.25 ms, 2.21 ms |
+| 16 connections: GiB/s; first byte p50, p99 | 115.85; 1.78 ms, 5.66 ms | 115.81; 1.20 ms, 4.86 ms |
+| 64 connections: GiB/s; first byte p50, p99 | 115.21; 3.20 ms, 14 ms | 115.29; 1.72 ms, 13 ms |
+| 256 connections: GiB/s; first byte p50, p99 | 105.99; 3.52 ms, 24 ms (`ab-cluster`) | 107.82; 1.73 ms, 22 ms |
+
+First byte fell by a quarter to a half at every concurrency, with throughput unchanged. Small objects and 4 KiB ranges, a single part each, held: 1,392,850 small hits a second with p99 0.66 ms, and 4 KiB ranges at 1,843,060, 4,757,933 and 6,404,878 a second at 64, 256 and 1,024 connections. One connection's first byte stays above a small object's 0.64 ms, since the first part is 16 MiB and its node's answer races three others' bodies; asking for the first megabyte as a part of its own is the next step (`PLAN.md`).
+
+`docs/scale-test.png` draws `final`'s `hits-large-c64` and `ranges-4k-c64`: `loadtest/chart docs/scale-test.png "loadtest/runs/final:hits-large-c64:TITLE" "loadtest/runs/final:ranges-4k-c64:TITLE"`.
+
+### What limits each workload
+
+- **Large objects and small ones of tens of KiB:** the nodes' network cards, at line rate with a core or two to spare on a 200 Gb/s node. More throughput needs more network per node, or more nodes.
+- **Requests of a few KiB:** on c6in.8xlarge clients, the client hosts' CPU, where a gateway took 86 µs of a vCPU per request after Phase 13 and shared the host with the load generator. On the scale test's c8in.16xlarge clients, queueing set the limit before any CPU ran out. A node runs its core on one thread, so a host needs several node processes for small requests.
+- **Data the page cache doesn't hold:** not measured at line rate. Two drives per m8idn.32xlarge node likely read below its network's rate.
+- **Instances on burst credits:** an i4i.4xlarge sends 25 Gb/s for about an hour, then 9.375 Gb/s.
+
 ## Limits
 
 - **Fills.** A node fills at 3.4 to 4.4 GiB/s, with S3's bodies received on worker threads. The drive's writes trail S3's bodies, so under 32 clients' sustained first reads a 4 GiB fill budget still fills up, and the rest streams from S3 without admission, as the fill budget intends.

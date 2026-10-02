@@ -19,6 +19,19 @@ pub fn check_writes_carry_no_body(
     windows: &HashSet<u64>,
     total: i64,
 ) -> i64 {
+    check_writes_carry_at_most(process, calls, windows, total, 0)
+}
+
+/// As `check_writes_carry_no_body`, but the calls that write may carry
+/// body bytes in all up to `allowed`, such as the first bytes of each
+/// node's answer that a gateway sends with the response's head.
+pub fn check_writes_carry_at_most(
+    process: &str,
+    calls: &[Call],
+    windows: &HashSet<u64>,
+    total: i64,
+    allowed: i64,
+) -> i64 {
     let to_file = |call: &Call| {
         call.fds()
             .first()
@@ -30,19 +43,25 @@ pub fn check_writes_carry_no_body(
         .filter(|call| WRITES.split(',').any(|name| name == call.name))
         .filter(|call| !to_file(call))
         .collect();
+    let mut carried = 0;
     for call in &writes {
         let data = call.data();
-        let carried = data
+        if data
             .windows(32)
-            .any(|window| windows.contains(&xxh3_64(window)));
-        assert!(
-            !carried,
-            "the {process} wrote body bytes with {}",
-            call.name
-        );
+            .any(|window| windows.contains(&xxh3_64(window)))
+        {
+            carried += call.result.max(0);
+        }
     }
+    assert!(
+        carried <= allowed,
+        "the {process} wrote {carried} bytes of calls carrying body bytes, past {allowed}"
+    );
     let written: i64 = writes.iter().map(|call| call.result.max(0)).sum();
-    assert!(written < total / 16, "the {process} wrote {written} bytes");
+    assert!(
+        written < total / 16 + allowed,
+        "the {process} wrote {written} bytes"
+    );
     written
 }
 

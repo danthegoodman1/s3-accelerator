@@ -478,12 +478,17 @@ impl Gateway {
         }
     }
 
+    /// A node answered `from` with `head`. `s3_error` marks a 5xx that S3
+    /// gave the node, which the client gets like any other answer of S3's:
+    /// another node would only ask S3 again. Any other 5xx is the node's
+    /// own failure, and the read goes to the next candidate.
     pub fn on_node_response(
         &mut self,
         now: Time,
         from: NodeRequestId,
         head: ResponseHead,
         meta: Option<ObjectMeta>,
+        s3_error: bool,
     ) {
         self.now = self.now.max(now);
         let Some(part) = self.parts.get_mut(&from) else {
@@ -493,7 +498,7 @@ impl Gateway {
         if part.answer.is_some() {
             return;
         }
-        if head.status >= 500 {
+        if head.status >= 500 && !s3_error {
             // The node could not serve it; the next candidate may.
             self.actions.push(Action::Discard { id: from });
             return self.fail_over(now, from, Some(head), false);
@@ -522,8 +527,14 @@ impl Gateway {
                 self.abandon_parts_except(id, from);
                 self.start(id, head, VecDeque::from([from]));
             }
+            // The response starts once its first part answers, and the
+            // others' bodies follow in order. One that fails afterwards
+            // ends the response early, and the client's retry reads again.
             Stage::Parts { head, parts } => {
-                if parts.iter().all(|part| self.parts[part].answer.is_some()) {
+                if parts
+                    .front()
+                    .is_some_and(|first| self.parts[first].answer.is_some())
+                {
                     let (head, parts) = (head.clone(), parts.clone());
                     self.start(id, head, parts);
                 }
@@ -1439,11 +1450,11 @@ mod tests {
         gateway.on_request(Time(2), ClientRequestId(2), Request::head(key("other")));
         let other = home_read(gateway.drain()).expect("the home is asked");
         let (head, meta) = answer("other");
-        gateway.on_node_response(Time(3), other, head, meta);
+        gateway.on_node_response(Time(3), other, head, meta, false);
         gateway.drain();
         // The home's answer from before the write arrives last.
         let (head, meta) = answer("old");
-        gateway.on_node_response(Time(4), racing, head, meta);
+        gateway.on_node_response(Time(4), racing, head, meta, false);
         gateway.drain();
         gateway.on_request(Time(5), ClientRequestId(3), Request::head(key("k")));
         assert!(home_read(gateway.drain()).is_some());
@@ -1546,7 +1557,7 @@ mod tests {
             content_length: 256,
             headers: Vec::new(),
         };
-        gateway.on_node_response(Time(1), home, head.clone(), None);
+        gateway.on_node_response(Time(1), home, head.clone(), None, false);
         let forward = Action::Forward {
             request: client,
             from: home,
@@ -1563,7 +1574,7 @@ mod tests {
             ]
         );
         for status in [200, 503] {
-            gateway.on_node_response(Time(2), home, ResponseHead::status(status), None);
+            gateway.on_node_response(Time(2), home, ResponseHead::status(status), None, false);
             assert_eq!(gateway.drain(), Vec::new());
         }
         gateway.on_forwarded(Time(3), home, 256);
@@ -1653,7 +1664,7 @@ mod tests {
                 content_length: last - first + 1,
                 headers: Vec::new(),
             };
-            gateway.on_node_response(Time(3), id, answer, None);
+            gateway.on_node_response(Time(3), id, answer, None, false);
         }
         gateway.drain();
         // The first part forwarded, the window has room for the next.
@@ -1680,6 +1691,61 @@ mod tests {
             .map(|(_, first, last)| (first, last))
             .collect();
         assert_eq!(whole, [(0, 255)]);
+    }
+
+    /// A response starts once its first part answers, while the others are
+    /// on their way, so a large read's first byte waits for one node.
+    #[test]
+    fn a_response_starts_on_its_first_parts_answer() {
+        let mut gateway = gateway();
+        let key = ObjectKey {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        let etag = ETag("\"v1\"".into());
+        gateway.on_request(Time(0), ClientRequestId(1), Request::head(key.clone()));
+        let home = sends(&gateway.drain())[0];
+        let meta = ObjectMeta {
+            etag: etag.clone(),
+            size: 256,
+            headers: Vec::new(),
+            age: 0,
+        };
+        gateway.on_node_metadata(Time(1), home, meta);
+        gateway.drain();
+        let client = ClientRequestId(2);
+        gateway.on_request(Time(2), client, Request::get(key));
+        let parts = sends(&gateway.drain());
+        assert!(parts.len() > 1, "the read asks several nodes: {parts:?}");
+        let (first, last) = match &gateway.parts[&parts[0]].what {
+            What::Range { runs, .. } => (runs[0].1, runs[runs.len() - 1].2),
+            What::Object(..) => unreachable!("a read of known metadata asks for ranges"),
+        };
+        let answer = ResponseHead {
+            status: 206,
+            etag: Some(etag),
+            content_range: Some(ContentRange {
+                first,
+                last,
+                size: 256,
+            }),
+            content_length: last - first + 1,
+            headers: Vec::new(),
+        };
+        gateway.on_node_response(Time(3), parts[0], answer, None, false);
+        let actions = gateway.drain();
+        assert!(
+            matches!(actions.first(), Some(Action::Start { request, .. }) if *request == client),
+            "{actions:?}"
+        );
+        assert_eq!(
+            actions.get(1),
+            Some(&Action::Forward {
+                request: client,
+                from: parts[0],
+                len: last - first + 1,
+            })
+        );
     }
 
     /// A node answers a part with other bytes than it asked for, as a node
@@ -1720,7 +1786,7 @@ mod tests {
             content_length: 5,
             headers: Vec::new(),
         };
-        gateway.on_node_response(Time(3), part, wrong, None);
+        gateway.on_node_response(Time(3), part, wrong, None, false);
         let actions = gateway.drain();
         assert_eq!(actions[0], Action::Discard { id: part });
         assert!(matches!(actions[1], Action::Send { id, .. } if id != part));

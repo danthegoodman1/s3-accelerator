@@ -4,8 +4,8 @@
 mod common;
 
 use common::{
-    Metadata, Server, admin, data_dir, invalidate_client, post_invalidation, presigned, sample,
-    send, send_as, start_metadata, start_origin,
+    Metadata, Pinned, Server, admin, data_dir, invalidate_client, post_invalidation, presigned,
+    sample, send, send_as, start_metadata, start_origin,
 };
 use s3_accelerator::lookups::{MAX_IN_FLIGHT, invalidation_signature};
 use s3_accelerator::metadata_service::{self, MetadataService, ServiceConfig};
@@ -18,10 +18,12 @@ const CACHE: &str = "block_size = 65536\nextent_size = 1048576\nextents = 8";
 
 /// Starts a server that asks the fake service at `port`, which serves
 /// `bucket` from the S3 at `origin_port`.
+/// A server whose gateway looks clients up in the service on `port`, with
+/// one event loop, whose cache these tests follow.
 async fn start_asking(port: u16, metadata: &Metadata, origin_port: u16, settings: &str) -> Server {
     metadata.serve("bucket", origin_port, "origin");
     let tables = Metadata::table(port, settings);
-    Server::start_config(&tables, &data_dir(), "", CACHE).await
+    Server::start_loops(&tables, &data_dir(), "", CACHE, 1).await
 }
 
 async fn get(server: &Server, path: &str) -> u16 {
@@ -141,6 +143,33 @@ async fn a_key_the_service_knows_signs_with_its_secret_alone() {
         .await;
 }
 
+/// The service's invalidation of a client reaches every gateway loop: a
+/// client held on two connections, which two loops serve, is looked up
+/// again through each.
+#[tokio::test(flavor = "current_thread")]
+async fn an_invalidation_reaches_every_loop() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, _origin) = start_origin().await;
+            let (port, metadata) = start_metadata().await;
+            metadata.serve("bucket", origin_port, "origin");
+            let tables = Metadata::table(port, "");
+            let server = Server::start_loops(&tables, &data_dir(), "", CACHE, 2).await;
+            let clients = [Pinned::new(server.port), Pinned::new(server.port)];
+            for client in &clients {
+                assert_eq!(client.send("GET", "/bucket/k", Vec::new()).await.0, 200);
+            }
+            assert_eq!(metadata.client_lookups.get(), 2);
+            metadata.clients.borrow_mut().remove("reader");
+            assert_eq!(invalidate_client(server.admin_port, "reader").await, 204);
+            for client in &clients {
+                assert_eq!(client.send("GET", "/bucket/k", Vec::new()).await.0, 403);
+            }
+            assert_eq!(metadata.client_lookups.get(), 4);
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_revoked_key_fails_the_next_request_after_its_invalidation() {
     LocalSet::new()
@@ -230,6 +259,48 @@ async fn a_failing_service_leaves_known_keys_working_through_the_grace() {
             let (status, body) = send(server.port, "GET", "/bucket/k", "", &[], Vec::new()).await;
             assert_eq!(status, 503);
             assert!(String::from_utf8_lossy(&body).contains("ServiceUnavailable"));
+        })
+        .await;
+}
+
+/// The cap on lookups counts the process's, across the gateway's loops:
+/// made-up keys split between two loops fill it together, while the known
+/// key, held on a connection to the loop that looked it up, still serves.
+#[tokio::test(flavor = "current_thread")]
+async fn the_cap_on_lookups_counts_every_loop() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, _origin) = start_origin().await;
+            let (port, metadata) = start_metadata().await;
+            metadata.client_ttl_ms.set(1_000);
+            metadata.serve("bucket", origin_port, "origin");
+            let tables = Metadata::table(port, "");
+            let server = Server::start_loops(&tables, &data_dir(), "", CACHE, 2).await;
+            let reader = Pinned::new(server.port);
+            assert_eq!(reader.send("GET", "/bucket/k", Vec::new()).await.0, 200);
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            metadata.client_delay.set(Duration::from_millis(1_000));
+            let over = 6;
+            let requests = (0..MAX_IN_FLIGHT + over).map(|index| {
+                let port = server.port;
+                tokio::task::spawn_local(async move {
+                    let (id, secret) = (format!("made-up-{index}"), "secret");
+                    let sent = send_as(port, (&id, secret), "GET", "/bucket/k", Vec::new());
+                    let (status, body) = sent.await;
+                    (status, String::from_utf8_lossy(&body).contains("SlowDown"))
+                })
+            });
+            let requests: Vec<_> = requests.collect();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(reader.send("GET", "/bucket/k", Vec::new()).await.0, 200);
+            let mut answers = Vec::new();
+            for request in requests {
+                answers.push(request.await.unwrap());
+            }
+            let slowed = answers
+                .iter()
+                .filter(|(status, slow)| *status == 503 && *slow);
+            assert_eq!(slowed.count(), over);
         })
         .await;
 }

@@ -1,0 +1,53 @@
+# How loadtest/loadtest runs the cluster on the hosts Terraform made.
+# `loadtest render` and `loadtest deploy` apply changes; see README.md.
+
+[ssh]
+# The private key for Terraform's `ssh_public_key`; empty uses ssh's own
+# defaults and agent.
+key = ""
+
+[topology]
+# "clients": each client host runs a gateway on 127.0.0.1:9000, the sidecar
+# layout the spec recommends, so each byte crosses the network once.
+# "nodes": each storage node also runs a gateway on :9000, and each client
+# spreads its connections across them.
+gateways = "clients"
+# Clients reach gateways, and members reach nodes, over TLS, which the
+# kernel carries where it can.
+tls = false
+# Storage nodes on each node host, each a ring member with its own data
+# directory, ports and share of the cache, so small reads use more of the
+# host's cores. A fault on a host acts on all of them.
+nodes_per_host = 1
+
+[cache]
+block_size = "1MiB"
+chunk_blocks = 16
+# GiB of each node's drive the cache takes; 0 takes the filesystem's free
+# space less the slot table and a margin. The index costs about 390 bytes
+# of memory per stored block: plenty for 1 MiB blocks, and 8% of the cache
+# if it held nothing but 4 KiB objects.
+cache_gib = 0
+fill_budget = "1GiB"
+read_ahead = "64MiB"
+# Objects whose metadata each home and each gateway keeps.
+metadata_capacity = 4000000
+gateway_metadata_capacity = 4000000
+# The dataset never overwrites a key. With immutable = false, homes
+# revalidate metadata after ttl_ms.
+immutable = true
+ttl_ms = 5000
+# Off: a block reaches the drive on its second read, the default.
+admit_on_first_read = false
+hot_threshold = 1000
+
+# SWIM's timings, when other than the defaults: probe_period_ms,
+# probe_rtt_ms, suspect_to_down_ms, down_grace_ms, gossip_period_ms.
+[membership]
+
+# TCP timers on links among gateways and nodes, when other than the
+# server's 5 ms: rto_min_us, delack_max_us; 0 keeps Linux's.
+[tcp]
+
+[log]
+level = "info"

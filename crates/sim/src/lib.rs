@@ -68,6 +68,10 @@ pub const IMMUTABLE_BUCKET: &str = "immutable";
 /// Objects in this bucket are overwritten and deleted; metadata expires.
 pub const TTL_BUCKET: &str = "ttl";
 
+/// S3's answer when it slows a client down.
+const SLOW_DOWN: &[u8] =
+    b"<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>";
+
 /// A run's configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
@@ -533,6 +537,7 @@ enum Message {
         body: Body,
         meta: Option<ObjectMeta>,
         hot: Vec<HotHint>,
+        s3_error: bool,
         ring: (usize, u64, u64),
     },
     NodeMetadata {
@@ -774,6 +779,7 @@ enum NodeAnswer {
         body: Body,
         meta: Option<ObjectMeta>,
         hot: Vec<HotHint>,
+        s3_error: bool,
     },
     Metadata(ObjectMeta, Vec<HotHint>),
     Stale,
@@ -871,6 +877,7 @@ struct Sending {
     body: Vec<Segment>,
     meta: Option<ObjectMeta>,
     hot: Vec<HotHint>,
+    s3_error: bool,
 }
 
 /// What a node's actions sent: blocks and bytes from its slots, bytes of
@@ -992,6 +999,10 @@ pub struct Simulator {
     /// Scripted: a write S3 applies just before it answers the next
     /// request from a node.
     write_before_answer: Option<(ObjectKey, u64)>,
+    /// Scripted: requests from nodes that S3 answers with 503, and then
+    /// those it leaves unanswered, counting down.
+    throttled: u64,
+    ignored: u64,
     /// Scripted: forwards finish only once released.
     holding_forwards: bool,
     held_forwards: Vec<Event>,
@@ -1153,6 +1164,8 @@ impl Simulator {
             cut_responses: BTreeMap::new(),
             cut_origin_responses: BTreeMap::new(),
             write_before_answer: None,
+            throttled: 0,
+            ignored: 0,
             holding_forwards: false,
             held_forwards: Vec::new(),
             writes: BTreeMap::new(),
@@ -1362,6 +1375,18 @@ impl Simulator {
     /// request from a node.
     pub fn write_before_next_answer(&mut self, key: &ObjectKey, size: u64) {
         self.write_before_answer = Some((key.clone(), size));
+    }
+
+    /// Makes S3 answer the next `count` requests from nodes with 503, as
+    /// it does to slow a client down.
+    pub fn throttle_origin(&mut self, count: u64) {
+        self.throttled = count;
+    }
+
+    /// Makes S3 leave the next `count` requests from nodes unanswered, so
+    /// the nodes that sent them time out.
+    pub fn ignore_origin(&mut self, count: u64) {
+        self.ignored = count;
     }
 
     /// Makes the queue offer every event to `node`, whether or not it is up.
@@ -2063,6 +2088,7 @@ impl Simulator {
                 body,
                 meta,
                 hot,
+                s3_error,
             } = self
                 .sending
                 .remove(&(node, id))
@@ -2081,6 +2107,7 @@ impl Simulator {
                 body,
                 meta,
                 hot,
+                s3_error,
             };
             self.answer_request(node, requester, answer);
         }
@@ -2641,12 +2668,13 @@ impl Simulator {
                     body,
                     meta,
                     hot,
+                    s3_error,
                     ring: (node, version, down),
                 },
             ) => {
                 self.gateway_bodies.insert((gateway, id), body);
                 self.gateways[gateway].on_hot(now, hot);
-                self.gateways[gateway].on_node_response(now, id, head, meta);
+                self.gateways[gateway].on_node_response(now, id, head, meta, s3_error);
                 self.gateways[gateway].on_ring_version(now, NodeId(node as u64), version, down);
                 self.drain_gateway(gateway)
             }
@@ -3023,12 +3051,31 @@ impl Simulator {
                     read,
                 },
             ) => {
-                let (head, body) = match self.faulty
-                    && self
-                        .origin_errors
-                        .percent(self.options.origin_error_percent)
+                if self.ignored > 0 {
+                    self.ignored -= 1;
+                    return Ok(());
+                }
+                let throttled = self.throttled > 0;
+                self.throttled -= u64::from(throttled);
+                let (head, body) = match throttled
+                    || self.faulty
+                        && self
+                            .origin_errors
+                            .percent(self.options.origin_error_percent)
                 {
-                    true => (ResponseHead::status(503), Vec::new()),
+                    // S3 slows clients down with 503 and an XML body,
+                    // whose length an answer to a HEAD names without it.
+                    true => {
+                        let head = ResponseHead {
+                            content_length: SLOW_DOWN.len() as u64,
+                            ..ResponseHead::status(503)
+                        };
+                        let body = match read.method {
+                            Method::Get => SLOW_DOWN.to_vec(),
+                            Method::Head => Vec::new(),
+                        };
+                        (head, body)
+                    }
                     false => {
                         if let Some((key, size)) = self.write_before_answer.take() {
                             self.put(&key, size);
@@ -3313,6 +3360,7 @@ impl Simulator {
                     body,
                     meta,
                     hot,
+                    s3_error,
                 } => {
                     if self.trace {
                         let etag = meta.as_ref().map(|meta| &meta.etag);
@@ -3343,6 +3391,7 @@ impl Simulator {
                         body,
                         meta,
                         hot,
+                        s3_error,
                     };
                     self.sending.insert((node, request), sending);
                     let sent = Event::Sent {
@@ -3619,6 +3668,7 @@ impl Simulator {
             body,
             meta,
             hot,
+            s3_error,
         } = self
             .sending
             .remove(&(node, id))
@@ -3640,6 +3690,7 @@ impl Simulator {
             body,
             meta,
             hot,
+            s3_error,
         };
         self.answer_request(node, requester, answer);
         self.node(node).on_sent(id);
@@ -3674,12 +3725,14 @@ impl Simulator {
                         body,
                         meta,
                         hot,
+                        s3_error,
                     } => Message::NodeResponse {
                         id,
                         head,
                         body,
                         meta,
                         hot,
+                        s3_error,
                         ring,
                     },
                     NodeAnswer::Metadata(meta, hot) => Message::NodeMetadata {

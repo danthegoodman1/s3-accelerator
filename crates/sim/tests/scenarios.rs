@@ -521,6 +521,74 @@ fn failover_moves_past_every_node_tried() {
     assert!(sim.summary().ticks - started < 10_000);
 }
 
+/// S3 answers 503 to slow clients down. The client gets each one from the
+/// node that asked, the home fetching the object or an owner filling a
+/// chunk, and retries: another node would only ask S3 again.
+#[test]
+fn s3s_errors_reach_the_client_from_the_node_that_asked() {
+    let mut sim = Simulator::new(1, cluster());
+    // Eight chunks, so a read the gateway has metadata for fans out to
+    // their owners.
+    let key = key(IMMUTABLE_BUCKET, "k");
+    sim.put(&key, 1_024);
+    sim.throttle_origin(3);
+    let (head, body) = sim.read(Request::get(key.clone())).unwrap();
+    assert_eq!((head.status, body.len()), (200, 1_024));
+    let summary = sim.summary();
+    assert_eq!((summary.server_errors, summary.client_retries), (3, 3));
+    assert_eq!(summary.origin_requests, 1);
+    // The doorkeeper stored nothing, so the owners fill from S3.
+    sim.throttle_origin(1);
+    let (head, body) = sim.read(Request::get(key)).unwrap();
+    assert_eq!((head.status, body.len()), (200, 1_024));
+    let summary = sim.summary();
+    assert_eq!((summary.server_errors, summary.client_retries), (4, 4));
+}
+
+/// S3 answers a revalidation with 503. The home keeps the metadata, and the
+/// client gets the 503; its retry revalidates the same metadata, rather than
+/// the home dropping it and fetching the object again.
+#[test]
+fn a_throttled_revalidation_keeps_the_metadata() {
+    let mut options = cluster();
+    // Every read asks the home.
+    options.gateway_metadata_ttl = 0;
+    let mut sim = Simulator::new(1, options);
+    let key = key(TTL_BUCKET, "k");
+    sim.put(&key, 100);
+    sim.read(Request::get(key.clone())).unwrap();
+    for _ in 0..1_100 {
+        sim.step().unwrap();
+    }
+    let before = sim.summary();
+    sim.throttle_origin(1);
+    let (head, body) = sim.read(Request::get(key)).unwrap();
+    assert_eq!((head.status, body.len()), (200, 100));
+    let after = sim.summary();
+    assert_eq!(after.server_errors - before.server_errors, 1);
+    // The retry's revalidation and its fill; no first fetch.
+    assert_eq!(after.origin_requests - before.origin_requests, 2);
+}
+
+/// S3 leaves the home's first fetch unanswered. The home times out and
+/// answers 503 itself, and the gateway reads from the next candidate: the
+/// client never notices.
+#[test]
+fn a_node_that_gets_no_answer_from_s3_lets_the_next_candidate_try() {
+    let mut options = cluster();
+    // The home gives up on S3 before the gateway gives up on the home.
+    options.node_timeout = 5_000;
+    let mut sim = Simulator::new(1, options);
+    let key = key(IMMUTABLE_BUCKET, "k");
+    sim.put(&key, 100);
+    sim.ignore_origin(1);
+    let (head, body) = sim.read(Request::get(key)).unwrap();
+    assert_eq!((head.status, body.len()), (200, 100));
+    let summary = sim.summary();
+    assert_eq!((summary.server_errors, summary.client_retries), (0, 0));
+    assert_eq!(summary.origin_requests, 1);
+}
+
 /// With the home cut off, a candidate answers its reads, but writes reach
 /// only the home: the candidate must not keep metadata a write would leave
 /// stale. A `HeadObject` shows it, since metadata alone answers it.

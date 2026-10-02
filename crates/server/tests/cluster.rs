@@ -4,8 +4,8 @@
 mod common;
 
 use common::{
-    CLUSTER_CACHE, Cluster, LISTING, Process, data_dir, listening, object, object_of, send,
-    send_for_headers, start_origin, start_queue, try_get,
+    CLUSTER_CACHE, Cluster, LISTING, Pinned, Process, SLOW_DOWN, data_dir, listening, object,
+    object_of, send, send_for_headers, start_origin, start_queue, try_get,
 };
 use s3_accelerator::http::header;
 use s3_accelerator::peers::Peers;
@@ -79,6 +79,69 @@ async fn a_node_restart_keeps_the_cache_warm() {
         .await;
 }
 
+/// Links between gateways and nodes resend a lost segment within
+/// milliseconds: from its handshake on, each end's retransmission timeout
+/// sits near the cluster's 5 ms floor, as `ss` shows, while clients' links
+/// keep Linux's 200 ms. Timers of 0 keep Linux's on cluster links too.
+#[tokio::test(flavor = "current_thread")]
+async fn cluster_links_resend_lost_segments_within_milliseconds() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, _origin) = start_origin().await;
+            let cluster = Cluster::new(&data_dir(), origin_port, CLUSTER_CACHE);
+            let _node = cluster.start_node().await;
+            let _gateway = cluster.start_gateway().await;
+            let client = Pinned::new(cluster.gateway_port);
+            let read = client.send("GET", "/bucket/k", Vec::new()).await;
+            assert_eq!(read, (200, object()));
+            let node = cluster.node_port;
+            let links = timeouts(&format!("( sport = :{node} or dport = :{node} )"));
+            assert!(
+                links.len() >= 2,
+                "ss found {} ends of links to the node",
+                links.len()
+            );
+            assert!(
+                links.iter().all(|rto| *rto < 50),
+                "retransmission timeouts on links to the node: {links:?} ms"
+            );
+            let clients = timeouts(&format!("( sport = :{} )", cluster.gateway_port));
+            assert!(
+                !clients.is_empty() && clients.iter().all(|rto| *rto >= 200),
+                "retransmission timeouts on client links: {clients:?} ms"
+            );
+
+            let linux = "[cluster.tcp]\nrto_min_us = 0\ndelack_max_us = 0";
+            let cluster =
+                Cluster::with_nodes(&data_dir(), origin_port, CLUSTER_CACHE, 1, linux, &[]);
+            let _node = cluster.start_node().await;
+            let _gateway = cluster.start_gateway().await;
+            assert_eq!(cluster.get("k").await, (200, object()));
+            let node = cluster.node_port;
+            let links = timeouts(&format!("( sport = :{node} or dport = :{node} )"));
+            assert!(
+                !links.is_empty() && links.iter().all(|rto| *rto >= 200),
+                "retransmission timeouts with Linux's timers: {links:?} ms"
+            );
+        })
+        .await;
+}
+
+/// The retransmission timeout, in ms, of each established TCP socket that
+/// `ss` matches with `filter`.
+fn timeouts(filter: &str) -> Vec<u32> {
+    let out = std::process::Command::new("ss")
+        .args(["-tin", "state", "established", filter])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .filter_map(|field| field.strip_prefix("rto:"))
+        .filter_map(|rto| rto.parse::<f64>().ok())
+        .map(|rto| rto as u32)
+        .collect()
+}
+
 /// A node killed while it fills many objects comes back serving every one
 /// correctly: blocks whose writes it finished, verified first, and the rest
 /// from S3. Each round kills it at a different moment, so some land while
@@ -146,7 +209,12 @@ async fn a_process_without_the_clusters_secret_can_not_join() {
             let _node = cluster.start(0).await;
             let ring_of_node_0 = |secret: &str| {
                 let address = format!("127.0.0.1:{}", cluster.nodes[0].0);
-                let peers = Peers::new(BTreeMap::from([(NodeId(0), address)]), secret.into(), None);
+                let peers = Peers::new(
+                    BTreeMap::from([(NodeId(0), address)]),
+                    secret.into(),
+                    None,
+                    Default::default(),
+                );
                 async move {
                     match peers.exchange(NodeId(0), &NodeRequest::Ring).await?.answer {
                         NodeAnswer::Ring { ring, .. } => Ok(members(&ring)),
@@ -280,6 +348,58 @@ async fn a_gateway_reaches_nodes_its_config_never_named() {
                 }
                 assert!(answer == (200, object), "{key}: {}", answer.0);
             }
+        })
+        .await;
+}
+
+/// S3's 503, which asks clients to slow down, reaches the client from the
+/// node that asked, whether it fetched for the home or filled a chunk: every
+/// other node would ask S3 again. A response that started before a chunk's
+/// fill was refused ends early instead, and the client reads again. A node
+/// that gets no answer from S3 has failed on its own, and the gateway reads
+/// from the next candidate.
+#[tokio::test(flavor = "current_thread")]
+async fn s3s_errors_reach_the_client_and_a_nodes_own_go_to_the_next_candidate() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            let cluster =
+                Cluster::with_nodes(&data_dir(), origin_port, CLUSTER_CACHE, 3, GOSSIP, &[]);
+            let _nodes = [
+                cluster.start(0).await,
+                cluster.start(1).await,
+                cluster.start(2).await,
+            ];
+            let _gateway = cluster.start_gateway().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            origin.throttled.set(10);
+            let (status, body) = cluster.get("throttled").await;
+            assert_eq!(status, 503);
+            assert_eq!(String::from_utf8_lossy(&body), SLOW_DOWN);
+            assert_eq!(origin.requests.get(), 1);
+            origin.throttled.set(0);
+            origin.unanswered.set(1);
+            assert_eq!(cluster.get("unanswered").await, (200, object()));
+            assert_eq!(origin.requests.get(), 3);
+            // Eight chunks: with the metadata, the gateway reads the middle
+            // six from their owners, which fill them from S3.
+            origin.size.set(8 << 20);
+            let large = origin.object("/bucket/large");
+            assert_eq!(cluster.get("large").await, (200, large.clone()));
+            origin.throttled.set(1);
+            match try_get(cluster.gateway_port, "/bucket/large").await {
+                Some((503, body)) => assert_eq!(String::from_utf8_lossy(&body), SLOW_DOWN),
+                // The first chunk answered, and the response started, before
+                // the throttled fill: it ends early.
+                None => {}
+                Some((status, body)) => {
+                    panic!(
+                        "a throttled read answered {status} with {} bytes",
+                        body.len()
+                    )
+                }
+            }
+            assert_eq!(cluster.get("large").await, (200, large));
         })
         .await;
 }
@@ -461,6 +581,10 @@ async fn a_hot_key_is_read_from_its_replicas() {
                 "{CLUSTER_CACHE}\nhot_threshold = 5\nhot_window_ms = 10000\nlease_ms = 60000"
             );
             let cluster = Cluster::with_nodes(&data_dir(), origin_port, &cache, 3, "", &[]);
+            // One loop, whose cached metadata the reads keep fresh. A loop
+            // whose entry expired would ask the home, which is down, and a
+            // replica would ask S3.
+            cluster.gateway_threads(1);
             let mut nodes: Vec<_> = Vec::new();
             for id in 0..3 {
                 nodes.push(Some(cluster.start(id).await));

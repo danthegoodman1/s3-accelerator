@@ -2,6 +2,7 @@
 //! nodes both speak to storage nodes: connections kept idle between
 //! requests, and answers whose bodies stay in their connections until read.
 
+use crate::config::TcpConfig;
 use crate::http::{Connection, header};
 use crate::protocol::{self, NodeAnswer, NodeRequest, RequestId, Versions};
 use crate::tls::Connector;
@@ -12,11 +13,50 @@ use s3_accelerator_core::placement::NodeId;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
+use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::Duration;
-use tokio::net::TcpStream;
+use tokio::io::Interest;
+use tokio::net::{TcpSocket, TcpStream};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Linux 6.15's socket options for those timers, which the libc crate
+/// lacks.
+const TCP_RTO_MIN_US: libc::c_int = 45;
+const TCP_DELACK_MAX_US: libc::c_int = 46;
+
+/// Sets the cluster's TCP timers on a socket for links between gateways and
+/// nodes, or between nodes, before its handshake: the handshake's round
+/// trip starts the timeout's estimate, which falls only slowly to a floor
+/// set later. A kernel that refuses them keeps its defaults, which only
+/// recover from losses more slowly.
+pub fn cluster_timers(socket: &impl AsRawFd, tcp: TcpConfig) {
+    let fd = socket.as_raw_fd();
+    for (option, value) in [
+        (TCP_RTO_MIN_US, tcp.rto_min_us),
+        (TCP_DELACK_MAX_US, tcp.delack_max_us),
+    ] {
+        let Ok(value) = libc::c_int::try_from(value) else {
+            continue;
+        };
+        if value == 0 {
+            continue;
+        }
+        // SAFETY: `fd` is open for the call, and the option's value is the
+        // `c_int` whose size it passes.
+        let _ = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                option,
+                (&raw const value).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+    }
+}
 
 pub struct Peers {
     /// Where each node listens, as the config and rings tell, and the
@@ -25,14 +65,16 @@ pub struct Peers {
     secret: Rc<str>,
     /// Nodes take members over mutual TLS when set.
     tls: Option<Connector>,
+    tcp: TcpConfig,
     idle: RefCell<BTreeMap<NodeId, Vec<Connection>>>,
 }
 
-/// A node's answer whose body is still in its connection.
+/// A node's answer whose body is still in its connection: its first bytes
+/// read with the head, and the rest in the socket.
 pub struct NodeBody {
     node: NodeId,
     connection: Connection,
-    /// Body bytes still unread.
+    /// Body bytes still unread, those read with the head among them.
     len: u64,
 }
 
@@ -49,6 +91,26 @@ impl NodeBody {
     /// Body bytes still unread.
     pub fn unread(&self) -> u64 {
         self.len
+    }
+
+    /// The first of the body's next `most` bytes that arrived with its
+    /// head, which go on from memory; the rest are in the socket.
+    pub fn held(&self, most: u64) -> &[u8] {
+        let held = self.connection.buffered();
+        &held[..held.len().min(usize::try_from(most).unwrap_or(usize::MAX))]
+    }
+
+    /// Reads the body's next `most` bytes into memory, so they go on with
+    /// the bytes that came with the head.
+    pub async fn hold(&mut self, most: u64) -> io::Result<()> {
+        let len = usize::try_from(most.min(self.len)).unwrap_or(usize::MAX);
+        self.connection.fill_buffer(len).await
+    }
+
+    /// Marks the first `len` held bytes sent on.
+    pub fn take_held(&mut self, len: usize) {
+        self.connection.consume_buffered(len);
+        self.len = self.len.saturating_sub(len as u64);
     }
 
     /// Marks `copied` more bytes of the body read.
@@ -69,11 +131,13 @@ impl Peers {
         addresses: BTreeMap<NodeId, String>,
         secret: Rc<str>,
         tls: Option<Connector>,
+        tcp: TcpConfig,
     ) -> Rc<Peers> {
         Rc::new(Peers {
             addresses: RefCell::new(addresses),
             secret,
             tls,
+            tcp,
             idle: RefCell::new(BTreeMap::new()),
         })
     }
@@ -148,17 +212,15 @@ impl Peers {
                 self.connect(&address).await?
             }
         };
-        let (method, target, headers) = encode(request, &self.secret, id);
-        connection
-            .write_request_head(method, &target, &headers, len)
-            .await?;
+        let head = protocol::request_head(request, &self.secret, id, len);
+        connection.write_all(head.as_bytes()).await?;
         Ok(connection)
     }
 
     /// A new connection to the node at `address`, with its handshake done.
     async fn connect(&self, address: &str) -> io::Result<Connection> {
         let connecting = async {
-            let stream = TcpStream::connect(address).await?;
+            let stream = connect_tuned(address, self.tcp).await?;
             stream.set_nodelay(true)?;
             match &self.tls {
                 Some(tls) => Ok(Connection::tls(tls.connect(stream, address).await?)),
@@ -173,6 +235,7 @@ impl Peers {
     /// Keeps a connection whose last answer was read in full for the next
     /// request.
     pub fn keep(&self, node: NodeId, connection: Connection) {
+        settle(&connection);
         self.idle
             .borrow_mut()
             .entry(node)
@@ -188,9 +251,10 @@ impl Peers {
     }
 
     /// Keeps a connection for the next request if its last answer was read
-    /// in full, and otherwise closes it.
+    /// in full, and nothing past it, and otherwise closes it.
     pub fn idle(&self, body: NodeBody) {
-        if body.len == 0 {
+        if body.len == 0 && body.connection.buffered().is_empty() {
+            settle(&body.connection);
             self.idle
                 .borrow_mut()
                 .entry(body.node)
@@ -210,6 +274,24 @@ impl Peers {
     }
 }
 
+/// Connects to the first of `address`'s addresses that answers, with the
+/// cluster's TCP timers set before the handshake.
+async fn connect_tuned(address: &str, tcp: TcpConfig) -> io::Result<TcpStream> {
+    let mut failure = io::Error::new(io::ErrorKind::InvalidInput, "no address to connect to");
+    for address in tokio::net::lookup_host(address).await? {
+        let socket = match address {
+            SocketAddr::V4(_) => TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => TcpSocket::new_v6()?,
+        };
+        cluster_timers(&socket, tcp);
+        match socket.connect(address).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => failure = error,
+        }
+    }
+    Err(failure)
+}
+
 /// Whether an idle connection is still open, with nothing unread: a node
 /// that restarted closed it, and a stray byte would corrupt the next
 /// answer.
@@ -222,18 +304,12 @@ fn open(connection: &Connection) -> bool {
     )
 }
 
-/// A request's method, target and headers, which name the client request
-/// `id` it serves.
-fn encode(
-    request: &NodeRequest,
-    secret: &str,
-    id: Option<RequestId>,
-) -> (&'static str, String, Vec<(String, String)>) {
-    let (method, target, mut headers) = protocol::encode_request(request, secret);
-    if let Some(id) = id {
-        headers.push((protocol::REQUEST_ID.to_string(), id.to_string()));
-    }
-    (method, target, headers)
+/// Forgets that `connection` turned readable: its last answer was read in
+/// full, so the next request waits for the node's answer rather than first
+/// trying a read that finds nothing. Costs no syscall.
+fn settle(connection: &Connection) {
+    let nothing = || Err::<(), _>(io::Error::from(io::ErrorKind::WouldBlock));
+    let _ = connection.stream().try_io(Interest::READABLE, nothing);
 }
 
 async fn exchange_on(
@@ -242,11 +318,12 @@ async fn exchange_on(
     secret: &str,
     id: Option<RequestId>,
 ) -> io::Result<(NodeAnswer, Option<Versions>, u64, Connection)> {
-    let (method, target, headers) = encode(request, secret, id);
-    connection
-        .write_request(method, &target, &headers, &[])
-        .await?;
-    let (status, headers) = connection.read_response_head().await?;
+    let head = protocol::request_head(request, secret, id, 0);
+    connection.write_all(head.as_bytes()).await?;
+    // The answer's first body bytes come with its head. Over kernel TLS,
+    // reading the head decrypts its record on the event loop either way,
+    // and a worker's `splice` decrypts the rest.
+    let (status, headers) = connection.read_answer_head().await?;
     let answer = protocol::decode_answer(status, &headers).map_err(io::Error::other)?;
     let versions = protocol::versions(&headers);
     let len = header(&headers, "content-length")
