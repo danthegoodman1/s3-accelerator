@@ -6,10 +6,13 @@
 
 mod common;
 
-use common::trace::{Call, WRITES, check_writes_carry_no_body, now, read_trace, windows};
+use common::trace::{
+    Call, WRITES, check_writes_carry_at_most, check_writes_carry_no_body, now, read_trace, windows,
+};
 use common::{Cluster, Process, Server, data_dir, object, signed, start_origin};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, ServerName};
+use s3_accelerator::http;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
@@ -19,6 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::LocalSet;
 use tokio_rustls::TlsConnector;
+use xxhash_rust::xxh3::xxh3_64;
 
 /// Three whole 64 KiB blocks.
 const OBJECT_SIZE: usize = 3 * 65536;
@@ -103,7 +107,12 @@ fn client(trusted: &[u8]) -> reqwest::Client {
 
 /// A signed GET over TLS.
 async fn get(client: &reqwest::Client, port: u16, path: &str) -> (u16, Vec<u8>) {
-    let mut request = client.get(format!("https://127.0.0.1:{port}{path}"));
+    get_over(client, "https", port, path).await
+}
+
+/// A signed GET over `scheme`.
+async fn get_over(client: &reqwest::Client, scheme: &str, port: u16, path: &str) -> (u16, Vec<u8>) {
+    let mut request = client.get(format!("{scheme}://127.0.0.1:{port}{path}"));
     for (name, value) in signed(port, "GET", path, "", &[]) {
         request = request.header(name, value);
     }
@@ -253,8 +262,11 @@ async fn hits_reach_kernel_tls_sessions_through_sendfile_and_splice() {
     let _counters = COUNTERS.lock().await;
     tls_stat();
     let total = 3 * OBJECT_SIZE as i64;
+    // Bytes a gateway may read with the answers' heads, which reach the
+    // client by a write rather than `splice`.
+    let ahead = (3 * http::READ_AHEAD) as i64;
 
-    let kernel = evidence(true).await;
+    let kernel = evidence(true, true, true).await;
     println!("kernel TLS: {kernel:#?}");
     for (name, link) in [("client", &kernel.clients), ("peer", &kernel.peers)] {
         assert!(link.sockets > 0, "ss found no {name} connection");
@@ -270,12 +282,12 @@ async fn hits_reach_kernel_tls_sessions_through_sendfile_and_splice() {
             link.sockets
         );
         assert!(
-            link.zero_copy >= total,
+            link.zero_copy >= total - ahead,
             "{} of {total} hit bytes reached {name} sockets inside the kernel",
             link.zero_copy
         );
         assert!(
-            link.written < total / 16,
+            link.written < total / 16 + ahead,
             "{} bytes were written to {name} sockets",
             link.written
         );
@@ -293,7 +305,7 @@ async fn hits_reach_kernel_tls_sessions_through_sendfile_and_splice() {
         kernel.rx_sessions
     );
 
-    let userspace = evidence(false).await;
+    let userspace = evidence(false, true, true).await;
     println!("userspace TLS: {userspace:#?}");
     for (name, link) in [("client", &userspace.clients), ("peer", &userspace.peers)] {
         assert!(link.sockets > 0, "ss found no {name} connection");
@@ -310,6 +322,61 @@ async fn hits_reach_kernel_tls_sessions_through_sendfile_and_splice() {
     assert_eq!((userspace.tx_sessions, userspace.rx_sessions), (0, 0));
 }
 
+/// Over plaintext links to the node, a gateway reads each answer's first
+/// bytes with its head. A kernel TLS client still gets them from a worker,
+/// which encrypts them as it writes, and none from an event loop.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs the tls module (sudo modprobe tls), strace, and sudo for ss"]
+async fn a_kernel_tls_client_takes_held_bytes_from_a_worker() {
+    let _counters = COUNTERS.lock().await;
+    let evidence = evidence(true, true, false).await;
+    assert!(
+        evidence.held > 0,
+        "the gateway held none of the answers' bytes"
+    );
+    assert_eq!(
+        evidence.held_on_event_loop, 0,
+        "an event loop wrote held bytes to a kernel TLS client"
+    );
+    assert_eq!(evidence.clients.on_event_loop, 0);
+}
+
+/// Behind a plaintext client, as a gateway on the client's host serves it,
+/// workers splice and so decrypt the body of a kernel TLS node answer,
+/// past the bytes read with its head.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs the tls module (sudo modprobe tls), strace, and sudo for ss"]
+async fn kernel_tls_node_answers_are_decrypted_on_workers() {
+    let _counters = COUNTERS.lock().await;
+    let evidence = evidence(true, false, true).await;
+    println!("{evidence:#?}");
+    let ahead = (3 * http::READ_AHEAD) as i64;
+    let total = 3 * OBJECT_SIZE as i64;
+    assert!(
+        evidence.from_peers >= total - ahead,
+        "{} of {total} hit bytes left the node's links by splice",
+        evidence.from_peers
+    );
+    assert_eq!(
+        evidence.from_peers_on_event_loop, 0,
+        "an event loop spliced, and so decrypted, a node's answer"
+    );
+}
+
+/// The threads of process `pid` that run event loops: its main thread, and
+/// a gateway's loops.
+fn event_loops(pid: u32) -> Vec<u32> {
+    let mut loops = vec![pid];
+    for task in std::fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
+        let task = task.unwrap();
+        let name = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+        if name.trim().starts_with("gateway-") {
+            loops.push(task.file_name().to_string_lossy().parse().unwrap());
+        }
+    }
+    loops
+}
+
 /// Tests that set up kernel TLS sessions or count them take turns.
 static COUNTERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -322,6 +389,14 @@ struct Evidence {
     /// Sessions the kernel set up to encrypt and to decrypt.
     tx_sessions: u64,
     rx_sessions: u64,
+    /// Body bytes the gateway wrote to clients from userspace, and those
+    /// its event loops wrote.
+    held: i64,
+    held_on_event_loop: i64,
+    /// Body bytes the gateway spliced out of its links to the node, and
+    /// those its event loops spliced.
+    from_peers: i64,
+    from_peers_on_event_loop: i64,
 }
 
 /// One kind of connection.
@@ -337,15 +412,17 @@ struct Link {
     /// the kernel: the gateway's `splice` to clients, and the node's
     /// `sendfile` to the gateway.
     zero_copy: i64,
-    /// Those bytes the process's event loop moved, on its main thread.
+    /// Those bytes the process's event loops moved.
     on_event_loop: i64,
     /// Bytes written to the same ends from userspace during the hits.
     written: i64,
 }
 
 /// Reads three objects twice through a traced node and gateway, with every
-/// session in the kernel or in userspace.
-async fn evidence(kernel: bool) -> Evidence {
+/// session in the kernel or in userspace, the client's link to the gateway
+/// over TLS when `clients_tls`, and the gateway's links to the node over
+/// TLS when `peers_tls`; each is plaintext otherwise.
+async fn evidence(kernel: bool, clients_tls: bool, peers_tls: bool) -> Evidence {
     LocalSet::new()
         .run_until(async {
             let before = tls_stat();
@@ -356,10 +433,14 @@ async fn evidence(kernel: bool) -> Evidence {
             let cache = "block_size = 65536\nextent_size = 1048576\nextents = 4";
             let cluster = Cluster::new(&dir, origin_port, cache);
             let (tls, trusted) = tls_table(&dir, kernel);
-            append(&cluster.gateway, &tls);
-            let members = CertificateAuthority::new();
-            for config in [&cluster.node, &cluster.gateway] {
-                append(config, &members.table(&dir, kernel));
+            if clients_tls {
+                append(&cluster.gateway, &tls);
+            }
+            if peers_tls {
+                let members = CertificateAuthority::new();
+                for config in [&cluster.node, &cluster.gateway] {
+                    append(config, &members.table(&dir, kernel));
+                }
             }
             let (node_trace, gateway_trace) = (dir.join("node.trace"), dir.join("gateway.trace"));
             let calls = format!("sendfile,splice,setsockopt,{WRITES}");
@@ -371,6 +452,7 @@ async fn evidence(kernel: bool) -> Evidence {
             let (node_loop, gateway_loop) = (node.server_pid(), gateway.server_pid());
 
             let client = client(&trusted);
+            let scheme = if clients_tls { "https" } else { "http" };
             let keys = ["a", "b", "c"];
             let bodies: Vec<Vec<u8>> = keys
                 .iter()
@@ -379,7 +461,7 @@ async fn evidence(kernel: bool) -> Evidence {
             for (key, body) in keys.iter().zip(&bodies) {
                 let path = format!("/bucket/{key}");
                 assert!(
-                    get(&client, port, &path).await == (200, body.clone()),
+                    get_over(&client, scheme, port, &path).await == (200, body.clone()),
                     "{key}"
                 );
             }
@@ -387,7 +469,7 @@ async fn evidence(kernel: bool) -> Evidence {
             for (key, body) in keys.iter().zip(&bodies) {
                 let path = format!("/bucket/{key}");
                 assert!(
-                    get(&client, port, &path).await == (200, body.clone()),
+                    get_over(&client, scheme, port, &path).await == (200, body.clone()),
                     "{key}"
                 );
             }
@@ -398,6 +480,9 @@ async fn evidence(kernel: bool) -> Evidence {
             let peer_sockets =
                 sockets(&format!("( sport = :{node_port} or dport = :{node_port} )"));
             let after = tls_stat();
+            // The gateway's event loops: its main thread, which accepts
+            // clients, and a thread per loop.
+            let gateway_loops = event_loops(gateway_loop);
             drop(client);
             gateway.stop();
             node.stop();
@@ -430,14 +515,15 @@ async fn evidence(kernel: bool) -> Evidence {
             let (gateway_hits, node_hits) = (during_hits(&gateway_calls), during_hits(&node_calls));
             // Bytes moved into a link's ends by `name` calls, whose
             // destination is argument `at`, on any thread or on `thread`.
-            let moved = |calls: &[Call], name: &str, at: usize, end: &str, thread: Option<u32>| {
-                calls
-                    .iter()
-                    .filter(|call| call.name == name && on(call.fds().get(at), end))
-                    .filter(|call| thread.is_none_or(|thread| call.thread == thread))
-                    .map(|call| call.result.max(0))
-                    .sum::<i64>()
-            };
+            let moved =
+                |calls: &[Call], name: &str, at: usize, end: &str, threads: Option<&[u32]>| {
+                    calls
+                        .iter()
+                        .filter(|call| call.name == name && on(call.fds().get(at), end))
+                        .filter(|call| threads.is_none_or(|threads| threads.contains(&call.thread)))
+                        .map(|call| call.result.max(0))
+                        .sum::<i64>()
+                };
             let written = |calls: &[Call], end: &str| -> i64 {
                 calls
                     .iter()
@@ -447,11 +533,29 @@ async fn evidence(kernel: bool) -> Evidence {
                     .sum()
             };
             if kernel {
-                // No write carries body bytes anywhere: to a socket or to a
-                // pipe.
-                check_writes_carry_no_body("gateway", &gateway_hits, &windows, total);
+                // No write carries body bytes anywhere, to a socket or to a
+                // pipe, but those a gateway read with each answer's head,
+                // which `held` counts.
+                let ahead = (keys.len() * http::READ_AHEAD) as i64;
+                check_writes_carry_at_most("gateway", &gateway_hits, &windows, total, ahead);
                 check_writes_carry_no_body("node", &node_hits, &windows, total);
             }
+            // Body bytes the gateway wrote to clients from userspace, from
+            // any thread or from its event loops.
+            let held = |threads: Option<&[u32]>| -> i64 {
+                gateway_hits
+                    .iter()
+                    .filter(|call| WRITES.split(',').any(|name| name == call.name))
+                    .filter(|call| on(call.fds().first(), &gateway_end))
+                    .filter(|call| threads.is_none_or(|threads| threads.contains(&call.thread)))
+                    .filter(|call| {
+                        call.data()
+                            .windows(32)
+                            .any(|window| windows.contains(&xxh3_64(window)))
+                    })
+                    .map(|call| call.result.max(0))
+                    .sum()
+            };
             let rose = |names: [&str; 2]| -> u64 {
                 names.iter().map(|name| after[*name] - before[*name]).sum()
             };
@@ -466,7 +570,7 @@ async fn evidence(kernel: bool) -> Evidence {
                         "splice",
                         1,
                         &gateway_end,
-                        Some(gateway_loop),
+                        Some(&gateway_loops),
                     ),
                     written: written(&gateway_hits, &gateway_end),
                 },
@@ -476,11 +580,21 @@ async fn evidence(kernel: bool) -> Evidence {
                     ulp_calls: ulp_calls(&node_calls, &node_end)
                         + ulp_calls(&gateway_calls, &peer_end),
                     zero_copy: moved(&node_hits, "sendfile", 0, &node_end, None),
-                    on_event_loop: moved(&node_hits, "sendfile", 0, &node_end, Some(node_loop)),
+                    on_event_loop: moved(&node_hits, "sendfile", 0, &node_end, Some(&[node_loop])),
                     written: written(&node_hits, &node_end),
                 },
                 tx_sessions: rose(["TlsTxSw", "TlsTxDevice"]),
                 rx_sessions: rose(["TlsRxSw", "TlsRxDevice"]),
+                held: held(None),
+                held_on_event_loop: held(Some(&gateway_loops)),
+                from_peers: moved(&gateway_hits, "splice", 0, &peer_end, None),
+                from_peers_on_event_loop: moved(
+                    &gateway_hits,
+                    "splice",
+                    0,
+                    &peer_end,
+                    Some(&gateway_loops),
+                ),
             }
         })
         .await

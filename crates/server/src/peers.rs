@@ -29,11 +29,12 @@ pub struct Peers {
     idle: RefCell<BTreeMap<NodeId, Vec<Connection>>>,
 }
 
-/// A node's answer whose body is still in its connection.
+/// A node's answer whose body is still in its connection: its first bytes
+/// read with the head, and the rest in the socket.
 pub struct NodeBody {
     node: NodeId,
     connection: Connection,
-    /// Body bytes still unread.
+    /// Body bytes still unread, those read with the head among them.
     len: u64,
 }
 
@@ -50,6 +51,19 @@ impl NodeBody {
     /// Body bytes still unread.
     pub fn unread(&self) -> u64 {
         self.len
+    }
+
+    /// The first of the body's next `most` bytes that arrived with its
+    /// head, which go on from memory; the rest are in the socket.
+    pub fn held(&self, most: u64) -> &[u8] {
+        let held = self.connection.buffered();
+        &held[..held.len().min(usize::try_from(most).unwrap_or(usize::MAX))]
+    }
+
+    /// Marks the first `len` held bytes sent on.
+    pub fn take_held(&mut self, len: usize) {
+        self.connection.consume_buffered(len);
+        self.len = self.len.saturating_sub(len as u64);
     }
 
     /// Marks `copied` more bytes of the body read.
@@ -149,10 +163,8 @@ impl Peers {
                 self.connect(&address).await?
             }
         };
-        let (method, target, headers) = encode(request, &self.secret, id);
-        connection
-            .write_request_head(method, &target, &headers, len)
-            .await?;
+        let head = protocol::request_head(request, &self.secret, id, len);
+        connection.write_all(head.as_bytes()).await?;
         Ok(connection)
     }
 
@@ -190,9 +202,9 @@ impl Peers {
     }
 
     /// Keeps a connection for the next request if its last answer was read
-    /// in full, and otherwise closes it.
+    /// in full, and nothing past it, and otherwise closes it.
     pub fn idle(&self, body: NodeBody) {
-        if body.len == 0 {
+        if body.len == 0 && body.connection.buffered().is_empty() {
             settle(&body.connection);
             self.idle
                 .borrow_mut()
@@ -233,31 +245,18 @@ fn settle(connection: &Connection) {
     let _ = connection.stream().try_io(Interest::READABLE, nothing);
 }
 
-/// A request's method, target and headers, which name the client request
-/// `id` it serves.
-fn encode(
-    request: &NodeRequest,
-    secret: &str,
-    id: Option<RequestId>,
-) -> (&'static str, String, Vec<(String, String)>) {
-    let (method, target, mut headers) = protocol::encode_request(request, secret);
-    if let Some(id) = id {
-        headers.push((protocol::REQUEST_ID.to_string(), id.to_string()));
-    }
-    (method, target, headers)
-}
-
 async fn exchange_on(
     mut connection: Connection,
     request: &NodeRequest,
     secret: &str,
     id: Option<RequestId>,
 ) -> io::Result<(NodeAnswer, Option<Versions>, u64, Connection)> {
-    let (method, target, headers) = encode(request, secret, id);
-    connection
-        .write_request(method, &target, &headers, &[])
-        .await?;
-    let (status, headers) = connection.read_response_head().await?;
+    let head = protocol::request_head(request, secret, id, 0);
+    connection.write_all(head.as_bytes()).await?;
+    // The answer's first body bytes come with its head. Over kernel TLS,
+    // reading the head decrypts its record on the event loop either way,
+    // and a worker's `splice` decrypts the rest.
+    let (status, headers) = connection.read_answer_head().await?;
     let answer = protocol::decode_answer(status, &headers).map_err(io::Error::other)?;
     let versions = protocol::versions(&headers);
     let len = header(&headers, "content-length")

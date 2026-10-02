@@ -14,13 +14,13 @@
 use crate::http::{
     etag_condition, format_content_range, format_range, header, parse_content_range, parse_range,
 };
-use crate::origin::is_object_header;
-use crate::sigv4;
+use crate::origin::{self, is_object_header};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use s3_accelerator_core::node::{ObjectMeta, RangeRead, Read};
 use s3_accelerator_core::placement::{Member, NodeId, PlacementHash, Ring};
 use s3_accelerator_core::s3::{ETag, Method, ObjectKey, Request, ResponseHead};
 use std::collections::BTreeMap;
+use std::fmt::{Display, Write as _};
 
 pub const SECRET: &str = "x-accel-secret";
 /// Names the client request a node request serves, and a gateway's
@@ -167,66 +167,125 @@ pub enum NodeAnswer {
     },
 }
 
-/// A request's method, target and headers.
-pub fn encode_request(
+/// A request's method, target and headers, as `request_head` writes them.
+#[cfg(test)]
+fn encode_request(
     request: &NodeRequest,
     secret: &str,
 ) -> (&'static str, String, Vec<(String, String)>) {
-    let mut headers = vec![(SECRET.to_string(), secret.to_string())];
-    let mut add = |name: &str, value: String| headers.push((name.to_string(), value));
+    let mut headers = Vec::new();
+    let (method, target) = encode(request, secret, &mut |name, value| {
+        headers.push((name.to_string(), value.to_string()));
+    });
+    let mut path = String::new();
+    write_target(&mut path, &target);
+    (method, path, headers)
+}
+
+/// A request's head, written whole: its request line and headers, the
+/// client request `id` it serves, and the length of the body that follows.
+pub fn request_head(
+    request: &NodeRequest,
+    secret: &str,
+    id: Option<RequestId>,
+    len: u64,
+) -> String {
+    let mut headers = String::with_capacity(384);
+    let (method, target) = encode(request, secret, &mut |name, value| {
+        let _ = write!(headers, "{name}: {value}\r\n");
+    });
+    let mut head = String::with_capacity(headers.len() + 256);
+    head.push_str(method);
+    head.push(' ');
+    write_target(&mut head, &target);
+    head.push_str(" HTTP/1.1\r\n");
+    head.push_str(&headers);
+    if let Some(id) = id {
+        let _ = write!(head, "{REQUEST_ID}: {id}\r\n");
+    }
+    let _ = write!(head, "Content-Length: {len}\r\n\r\n");
+    head
+}
+
+/// Where a request goes.
+enum Target<'r> {
+    Root,
+    /// A forwarded request's path and query, as the client wrote them.
+    Path(&'r str, &'r str),
+    Key(&'r ObjectKey),
+}
+
+fn write_target(out: &mut String, target: &Target) {
+    match target {
+        Target::Root => out.push('/'),
+        Target::Path(path, query) => {
+            out.push_str(path);
+            if !query.is_empty() {
+                out.push('?');
+                out.push_str(query);
+            }
+        }
+        Target::Key(key) => origin::write_object_path(out, key),
+    }
+}
+
+/// Passes each of a request's headers to `add`, and returns its method and
+/// target.
+fn encode<'r>(
+    request: &'r NodeRequest,
+    secret: &str,
+    add: &mut dyn FnMut(&str, &dyn Display),
+) -> (&'static str, Target<'r>) {
+    add(SECRET, &secret);
     let key = match request {
         NodeRequest::Ring => {
-            add(KIND, "ring".into());
-            return ("GET", "/".into(), headers);
+            add(KIND, &"ring");
+            return ("GET", Target::Root);
         }
         NodeRequest::Lease {
             placement,
             owner,
             left,
         } => {
-            add(KIND, "lease".into());
-            add(PLACEMENT, format!("{:016x}", placement.0));
-            add(OWNER, owner.0.to_string());
-            add(LEFT, left.to_string());
-            return ("POST", "/".into(), headers);
+            add(KIND, &"lease");
+            add(PLACEMENT, &format_args!("{:016x}", placement.0));
+            add(OWNER, &owner.0);
+            add(LEFT, left);
+            return ("POST", Target::Root);
         }
         NodeRequest::LeaseReport { placement, reads } => {
-            add(KIND, "lease-report".into());
-            add(PLACEMENT, format!("{:016x}", placement.0));
-            add(READS, reads.to_string());
-            return ("POST", "/".into(), headers);
+            add(KIND, &"lease-report");
+            add(PLACEMENT, &format_args!("{:016x}", placement.0));
+            add(READS, reads);
+            return ("POST", Target::Root);
         }
         NodeRequest::Forward(forward) => {
-            add(KIND, "forward".into());
-            add(METHOD, forward.method.clone());
-            add(PAYLOAD, forward.payload_hash.clone());
+            add(KIND, &"forward");
+            add(METHOD, &forward.method);
+            add(PAYLOAD, &forward.payload_hash);
             for (name, value) in &forward.headers {
-                add(&format!("{FORWARDED}{name}"), value.clone());
+                add(&format!("{FORWARDED}{name}"), value);
             }
-            let target = match forward.query.as_str() {
-                "" => forward.path.clone(),
-                query => format!("{}?{query}", forward.path),
-            };
-            return ("POST", target, headers);
+            return ("POST", Target::Path(&forward.path, &forward.query));
         }
         NodeRequest::Written { key, passed_on } => {
-            add(KIND, "written".into());
+            add(KIND, &"written");
             if *passed_on {
-                add(PASSED_ON, "1".into());
+                add(PASSED_ON, &"1");
             }
             key
         }
         NodeRequest::Purge { key, passed_on } => {
-            add(KIND, "purge".into());
+            add(KIND, &"purge");
             if *passed_on {
-                add(PASSED_ON, "1".into());
+                add(PASSED_ON, &"1");
             }
             key
         }
         NodeRequest::Event { key, etag } => {
-            add(KIND, "event".into());
+            add(KIND, &"event");
             if let Some(etag) = etag {
-                add(ETAG, etag.0.clone());
+                add(ETAG, &etag.0);
             }
             key
         }
@@ -235,26 +294,26 @@ pub fn encode_request(
             stale,
             direct,
         }) => {
-            add(KIND, "object".into());
+            add(KIND, &"object");
             let method = match request.method {
                 Method::Get => "GET",
                 Method::Head => "HEAD",
             };
-            add(METHOD, method.into());
+            add(METHOD, &method);
             if let Some(range) = request.range {
-                add("range", format_range(range));
+                add("range", &format_range(range));
             }
             if let Some(etag) = &request.if_match {
-                add("if-match", etag.0.clone());
+                add("if-match", &etag.0);
             }
             if let Some(etag) = &request.if_none_match {
-                add("if-none-match", etag.0.clone());
+                add("if-none-match", &etag.0);
             }
             if let Some(etag) = stale {
-                add(STALE, etag.0.clone());
+                add(STALE, &etag.0);
             }
             if *direct {
-                add(DIRECT, "1".into());
+                add(DIRECT, &"1");
             }
             &request.key
         }
@@ -263,15 +322,15 @@ pub fn encode_request(
                 NodeRequest::Read(Read::Stored(_)) => "stored",
                 _ => "range",
             };
-            add(KIND, kind.into());
-            add(ETAG, range.etag.0.clone());
-            add(SIZE, range.size.to_string());
-            add(FIRST, range.first.to_string());
-            add(LAST, range.last.to_string());
+            add(KIND, &kind);
+            add(ETAG, &range.etag.0);
+            add(SIZE, &range.size);
+            add(FIRST, &range.first);
+            add(LAST, &range.last);
             &range.key
         }
         NodeRequest::Read(Read::Known(key)) => {
-            add(KIND, "known".into());
+            add(KIND, &"known");
             key
         }
     };
@@ -285,7 +344,7 @@ pub fn encode_request(
         | NodeRequest::Lease { .. }
         | NodeRequest::LeaseReport { .. } => "GET",
     };
-    (method, path(key), headers)
+    (method, Target::Key(key))
 }
 
 /// The request a gateway sent, from its path, query and headers, and for
@@ -670,12 +729,7 @@ fn decode_meta(headers: &[(String, String)]) -> Result<ObjectMeta, String> {
     })
 }
 
-/// `/bucket/key`, each segment percent-encoded.
-fn path(key: &ObjectKey) -> String {
-    let segments: Vec<String> = key.key.split('/').map(sigv4::encode).collect();
-    format!("/{}/{}", sigv4::encode(&key.bucket), segments.join("/"))
-}
-
+/// The object a `/bucket/key` path names, each segment percent-decoded.
 fn key(path: &str) -> Result<ObjectKey, String> {
     let path = path.strip_prefix('/').ok_or("a relative path")?;
     let (bucket, key) = path.split_once('/').ok_or("no key")?;
@@ -699,8 +753,18 @@ mod tests {
     }
 
     fn round_trip(request: NodeRequest) {
-        let (_, target, headers) = encode_request(&request, "secret");
+        let (method, target, headers) = encode_request(&request, "secret");
         assert_eq!(header(&headers, SECRET), Some("secret"));
+        // The head written whole says what the parts say.
+        let mut parts = format!("{method} {target} HTTP/1.1\r\n");
+        for (name, value) in &headers {
+            parts.push_str(&format!("{name}: {value}\r\n"));
+        }
+        parts.push_str(&format!(
+            "{REQUEST_ID}: 0000000000000007\r\nContent-Length: 9\r\n\r\n"
+        ));
+        let id = Some(RequestId(7));
+        assert_eq!(request_head(&request, "secret", id, 9), parts);
         let (path, query) = target.split_once('?').unwrap_or((&target, ""));
         let len = match &request {
             NodeRequest::Forward(forward) => forward.len,

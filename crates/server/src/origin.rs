@@ -291,10 +291,21 @@ pub fn client() -> HttpClient {
     Client::builder(TokioExecutor::new()).build(https)
 }
 
-/// `/bucket/key`, each segment percent-encoded.
+/// As `write_object_path`, in a string of its own.
 fn object_path(key: &ObjectKey) -> String {
-    let segments: Vec<String> = key.key.split('/').map(sigv4::encode).collect();
-    format!("/{}/{}", sigv4::encode(&key.bucket), segments.join("/"))
+    let mut path = String::with_capacity(key.bucket.len() + key.key.len() + 2);
+    write_object_path(&mut path, key);
+    path
+}
+
+/// `/bucket/key` onto the end of `out`, each segment percent-encoded.
+pub fn write_object_path(out: &mut String, key: &ObjectKey) {
+    out.push('/');
+    sigv4::encode_into(out, &key.bucket);
+    for segment in key.key.split('/') {
+        out.push('/');
+        sigv4::encode_into(out, segment);
+    }
 }
 
 pub fn empty() -> RequestBody {
@@ -391,14 +402,21 @@ pub fn is_object_header(name: &str) -> bool {
         "x-amz-version-id",
         "x-amz-website-redirect-location",
     ];
-    let name = name.to_ascii_lowercase();
-    name.starts_with("x-amz-meta-")
-        || is_checksum_header(&name)
-        || OBJECT_HEADERS.contains(&name.as_str())
+    starts_with_ignoring_case(name, "x-amz-meta-")
+        || is_checksum_header(name)
+        || OBJECT_HEADERS
+            .iter()
+            .any(|known| name.eq_ignore_ascii_case(known))
 }
 
 /// An object's full-object checksum, or its type, which S3 sends for a
 /// whole object when asked with `x-amz-checksum-mode: ENABLED`.
 pub fn is_checksum_header(name: &str) -> bool {
-    name.to_ascii_lowercase().starts_with("x-amz-checksum-")
+    starts_with_ignoring_case(name, "x-amz-checksum-")
+}
+
+/// Whether `name` starts with `prefix`, a lowercase one, in any case.
+fn starts_with_ignoring_case(name: &str, prefix: &str) -> bool {
+    name.get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
 }

@@ -87,6 +87,19 @@ pub async fn relay(
     if !kernel_tls {
         return relay_here(from, to, len).await;
     }
+    relay_on_workers(Bytes::new(), from, to, len).await
+}
+
+/// Writes `first` to `to`, then moves `len` bytes from `from` to `to`
+/// through a pipe, all in one task on the workers, for sockets that carry
+/// a kernel TLS session. Returns the bytes that reached `to`, `first`
+/// among them, and why the relay stopped short if it did.
+pub async fn relay_on_workers(
+    first: Bytes,
+    from: &TcpStream,
+    to: &TcpStream,
+    len: u64,
+) -> (u64, Result<(), Short>) {
     let from = match from.as_fd().try_clone_to_owned() {
         Ok(from) => std::net::TcpStream::from(from),
         Err(error) => return (0, Err(Short::Source(error))),
@@ -104,7 +117,17 @@ pub async fn relay(
             Ok(to) => to,
             Err(error) => return (0, Err(Short::Destination(error))),
         };
-        relay_here(&from, &to, len).await
+        if let Err(error) = write_idle(&to, &first).await {
+            return (0, Err(Short::Destination(error)));
+        }
+        let wrote = first.len() as u64;
+        match len {
+            0 => (wrote, Ok(())),
+            _ => {
+                let (spliced, relayed) = relay_here(&from, &to, len).await;
+                (wrote + spliced, relayed)
+            }
+        }
     });
     relayed
         .await

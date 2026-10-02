@@ -6,6 +6,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::fmt::Write as _;
 
 /// Clients may sign a request without hashing its body.
 pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
@@ -184,6 +185,23 @@ fn decoded_query(query: &str) -> Vec<(String, String)> {
 /// from which SigV4 derives the rest.
 pub trait DateKeys {
     fn date_key(&self, date: &str) -> Option<Vec<u8>>;
+
+    /// The key that signs `date`'s requests to `service` in `region`, from
+    /// the date's key. It changes once a day, so a client may keep it.
+    fn signing_key(&self, date: &str, region: &str, service: &str) -> Option<[u8; 32]> {
+        Some(signing_key(&self.date_key(date)?, region, service))
+    }
+}
+
+/// The key that signs requests to `service` in `region` on the day whose
+/// key is `date_key`: the date's key through the region, the service and
+/// `aws4_request`.
+pub fn signing_key(date_key: &[u8], region: &str, service: &str) -> [u8; 32] {
+    let mut key = hmac32(date_key, region.as_bytes());
+    for part in [service, "aws4_request"] {
+        key = hmac32(&key, part.as_bytes());
+    }
+    key
 }
 
 /// A secret derives every date's key.
@@ -220,7 +238,7 @@ impl Signed<'_> {
     pub fn check<C: DateKeys + ?Sized>(&self, client: &C) -> Result<(), AuthError> {
         let authorization = &self.authorization;
         let key = client
-            .date_key(&authorization.date)
+            .signing_key(&authorization.date, &authorization.region, "s3")
             .ok_or(AuthError::SignatureMismatch)?;
         let request = match &self.presigned_query {
             Some(query) => Signable {
@@ -467,65 +485,89 @@ fn signature(
     secret: &str,
 ) -> String {
     let date = &amz_date[..amz_date.len().min(8)];
-    let key = date_key(secret, date);
+    let key = signing_key(&date_key(secret, date), scope.0, scope.1);
     keyed_signature(request, signed_headers, amz_date, scope, &key)
 }
 
-/// The signature of `request` from the key of its date.
+/// The signature of `request` from the signing key of its date, region
+/// and service.
 fn keyed_signature(
     request: &Signable,
     signed_headers: &[&str],
     amz_date: &str,
     (region, service): (&str, &str),
-    date_key: &[u8],
+    signing_key: &[u8],
 ) -> String {
     let canonical = canonical_request(request, signed_headers);
     let date = &amz_date[..amz_date.len().min(8)];
-    let scope = format!("{date}/{region}/{service}/aws4_request");
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-        hex::encode(Sha256::digest(canonical.as_bytes()))
+    let mut string_to_sign = String::with_capacity(160);
+    let _ = write!(
+        string_to_sign,
+        "AWS4-HMAC-SHA256\n{amz_date}\n{date}/{region}/{service}/aws4_request\n"
     );
-    let mut key = date_key.to_vec();
-    for part in [region, service, "aws4_request"] {
-        key = hmac(&key, part.as_bytes());
-    }
-    hex::encode(hmac(&key, string_to_sign.as_bytes()))
+    let mut hash = [0; 64];
+    hex::encode_to_slice(Sha256::digest(canonical.as_bytes()), &mut hash)
+        .expect("a SHA-256 digest is 32 bytes");
+    string_to_sign.push_str(std::str::from_utf8(&hash).expect("hex is ASCII"));
+    hex::encode(hmac32(signing_key, string_to_sign.as_bytes()))
 }
 
 fn canonical_request(request: &Signable, signed_headers: &[&str]) -> String {
-    let mut canonical = format!(
-        "{}\n{}\n{}\n",
-        request.method,
-        canonical_path(request.path),
-        canonical_query(request.query)
-    );
+    let mut canonical = String::with_capacity(512 + request.path.len() + request.query.len());
+    canonical.push_str(request.method);
+    canonical.push('\n');
+    canonical_path(&mut canonical, request.path);
+    canonical.push('\n');
+    canonical.push_str(&canonical_query(request.query));
+    canonical.push('\n');
     for name in signed_headers {
-        let values: Vec<String> = request
+        canonical.push_str(name);
+        canonical.push(':');
+        let values = request
             .headers
             .iter()
-            .filter(|(header, _)| header.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.split_whitespace().collect::<Vec<_>>().join(" "))
-            .collect();
-        canonical.push_str(&format!("{name}:{}\n", values.join(",")));
+            .filter(|(header, _)| header.eq_ignore_ascii_case(name));
+        for (index, (_, value)) in values.enumerate() {
+            if index > 0 {
+                canonical.push(',');
+            }
+            // Runs of whitespace become one space, and none at the ends.
+            for (index, word) in value.split_whitespace().enumerate() {
+                if index > 0 {
+                    canonical.push(' ');
+                }
+                canonical.push_str(word);
+            }
+        }
+        canonical.push('\n');
     }
-    canonical.push_str(&format!(
-        "\n{}\n{}",
-        signed_headers.join(";"),
-        request.payload_hash
-    ));
+    canonical.push('\n');
+    for (index, name) in signed_headers.iter().enumerate() {
+        if index > 0 {
+            canonical.push(';');
+        }
+        canonical.push_str(name);
+    }
+    canonical.push('\n');
+    canonical.push_str(request.payload_hash);
     canonical
 }
 
 /// S3 encodes each path segment once.
-fn canonical_path(path: &str) -> String {
-    path.split('/')
-        .map(|segment| encode(&percent_decode_str(segment).decode_utf8_lossy()))
-        .collect::<Vec<_>>()
-        .join("/")
+fn canonical_path(out: &mut String, path: &str) {
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            out.push('/');
+        }
+        let decoded = percent_decode_str(segment).decode_utf8_lossy();
+        let _ = write!(out, "{}", utf8_percent_encode(&decoded, ENCODE));
+    }
 }
 
 fn canonical_query(query: &str) -> String {
+    if query.is_empty() {
+        return String::new();
+    }
     let mut pairs: Vec<(String, String)> = query
         .split('&')
         .filter(|pair| !pair.is_empty())
@@ -548,10 +590,20 @@ pub fn encode(text: &str) -> String {
     utf8_percent_encode(text, ENCODE).to_string()
 }
 
+/// As `encode`, onto the end of `out`.
+pub fn encode_into(out: &mut String, text: &str) {
+    let _ = write!(out, "{}", utf8_percent_encode(text, ENCODE));
+}
+
 pub fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+    hmac32(key, data).to_vec()
+}
+
+/// The HMAC-SHA256 of `data` under `key`.
+pub fn hmac32(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes any key length");
     mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+    mac.finalize().into_bytes().into()
 }
 
 /// Unix seconds now.

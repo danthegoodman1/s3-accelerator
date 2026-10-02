@@ -264,8 +264,8 @@ MUTANTS = [
     ),
     (
         "the S3 client drops . segments",
-        [(ORIGIN, "let segments: Vec<String> = key.key.split('/').map(sigv4::encode).collect();",
-          "let segments: Vec<String> = key.key.split('/').filter(|segment| *segment != \".\").map(sigv4::encode).collect();")],
+        [(ORIGIN, "for segment in key.key.split('/') {",
+          "for segment in key.key.split('/').filter(|segment| *segment != \".\") {")],
     ),
     (
         "S3 receives a body that fails its hash",
@@ -470,6 +470,18 @@ MUTANTS = [
     (
         "the scrape leaves out the limit on open files",
         [(METRICS, '"process_max_fds",', '"process_fd_limit",')],
+    ),
+    (
+        "a node's answer is read without its first body bytes",
+        [(PEERS, "let (status, headers) = connection.read_answer_head().await?;", "let (status, headers) = connection.read_response_head().await?;")],
+    ),
+    (
+        "held bytes go to a kernel TLS client from an event loop",
+        [(SERVER, "let (copied, relayed) = match connection.kernel_tls() {", "let (copied, relayed) = match false {")],
+    ),
+    (
+        "a client's signing key is kept across days",
+        [(CLIENTS, "held.date.as_str(),\n                held.region.as_str(),", "date,\n                held.region.as_str(),")],
     ),
     (
         "a closed loop waits for the next millisecond",
@@ -919,7 +931,7 @@ MUTANTS = [
     ),
     (
         "cached reads ignore response overrides",
-        [(SERVER, "headers.extend(overrides.iter().cloned());", "let _ = overrides;")],
+        [(SERVER, "let set = overrides.iter();", "let set = overrides.iter().take(0);")],
     ),
     (
         "virtual-hosted requests are read path-style",
@@ -952,7 +964,7 @@ MUTANTS = [
     ),
     (
         "checksums stay out of the metadata",
-        [(ORIGIN, "|| is_checksum_header(&name)", "")],
+        [(ORIGIN, "|| is_checksum_header(name)", "")],
     ),
     (
         "checksums go to reads that did not ask or read a range",
@@ -1117,8 +1129,7 @@ MUTANTS = [
     ),
     (
         "bytes relayed from nodes go uncounted",
-        [(SERVER, "want, kernel_tls).await;\n                connection.sent_body(copied);",
-                  "want, kernel_tls).await;")],
+        [(SERVER, "connection.sent_body(spliced);", "let _ = spliced;")],
     ),
     (
         "a histogram files values under lower bounds",
@@ -1188,11 +1199,11 @@ MUTANTS = [
     ),
     (
         "request IDs never reach nodes",
-        [(PEERS, "headers.push((protocol::REQUEST_ID.to_string(), id.to_string()));", "let _ = id;")],
+        [(PROTOCOL, 'let _ = write!(head, "{REQUEST_ID}: {id}\\r\\n");', "let _ = id;")],
     ),
     (
         "responses S3 did not give lack an S3 request ID",
-        [(HTTP, 'head.push_str(&format!("x-amz-request-id: {id}\\r\\n"));', "")],
+        [(HTTP, 'let _ = write!(head, "x-amz-request-id: {id}\\r\\n");', "")],
     ),
     (
         "log values with spaces go unquoted",
@@ -1334,8 +1345,8 @@ MUTANTS = [
     ),
     (
         "a signature is checked with today's key",
-        [(SIGV4, ".date_key(&authorization.date)",
-                 ".date_key(&format_amz_date(unix_now())[..8])")],
+        [(SIGV4, ".signing_key(&authorization.date, &authorization.region, \"s3\")",
+                 ".signing_key(&format_amz_date(unix_now())[..8], &authorization.region, \"s3\")")],
     ),
     (
         "a key from the service checks every date",
@@ -1344,8 +1355,8 @@ MUTANTS = [
     ),
     (
         "grants from the service reach every bucket",
-        [(CLIENTS, "grants: served.grants,",
-                   "grants: vec![Grant { access: Access::Admin, bucket: \"*\".into(), prefix: String::new() }],")],
+        [(CLIENTS, "Credential::new(served.grants, Keys::Dates(keys))",
+                   "Credential::new(vec![Grant { access: Access::Admin, bucket: \"*\".into(), prefix: String::new() }], Keys::Dates(keys))")],
     ),
     (
         "a client's invalidation drops nothing",

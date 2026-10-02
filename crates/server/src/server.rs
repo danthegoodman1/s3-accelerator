@@ -31,6 +31,7 @@ use s3_accelerator_core::node::Node;
 use s3_accelerator_core::placement::NodeId;
 use s3_accelerator_core::s3::{Method, ObjectKey, Request, ResponseHead};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::io;
 use std::path::Path;
@@ -620,14 +621,13 @@ async fn serve_connection(mut connection: Connection, context: &Context) -> io::
             let first_byte = answered.head_sent.saturating_duration_since(arrived);
             let (status, sent) = (answered.status, answered.body_sent);
             context.metrics.request(operation, status, first_byte, sent);
-            let first_byte_ms = format!("{:.3}", first_byte.as_secs_f64() * 1e3);
-            let operation = format!("{operation:?}");
+            // The macro formats its fields only for a line it writes.
             if status >= 500 {
                 log!(
                     Warn,
                     "answered a client with a server error",
                     request = id,
-                    operation = operation,
+                    operation = format!("{operation:?}"),
                     status = status
                 );
             } else {
@@ -635,10 +635,10 @@ async fn serve_connection(mut connection: Connection, context: &Context) -> io::
                     Debug,
                     "answered a client",
                     request = id,
-                    operation = operation,
+                    operation = format!("{operation:?}"),
                     status = status,
                     bytes = sent,
-                    first_byte_ms = first_byte_ms
+                    first_byte_ms = format!("{:.3}", first_byte.as_secs_f64() * 1e3)
                 );
             }
         }
@@ -734,12 +734,17 @@ async fn authenticate(head: &RequestHead, context: &Context) -> Result<Rc<Creden
 /// path-style, with its bucket first in the path; without a presigned
 /// URL's signature, which S3 must not see beside the node's; and with a
 /// presigned body's payload hash.
-fn normalize(head: &RequestHead, domains: &[String]) -> RequestHead {
+fn normalize<'h>(head: &'h RequestHead, domains: &[String]) -> Cow<'h, RequestHead> {
+    let bucket = virtual_bucket(header(&head.headers, "host"), domains);
+    let presigned = sigv4::is_presigned(&head.query);
+    if bucket.is_none() && !presigned {
+        return Cow::Borrowed(head);
+    }
     let mut normal = head.clone();
-    if let Some(bucket) = virtual_bucket(header(&head.headers, "host"), domains) {
+    if let Some(bucket) = bucket {
         normal.path = format!("/{bucket}{}", head.path);
     }
-    if sigv4::is_presigned(&head.query) {
+    if presigned {
         let kept: Vec<&str> = head
             .query
             .split('&')
@@ -756,7 +761,7 @@ fn normalize(head: &RequestHead, domains: &[String]) -> RequestHead {
             normal.headers.push(unsigned);
         }
     }
-    normal
+    Cow::Owned(normal)
 }
 
 /// The bucket a virtual-hosted-style request names: what precedes one of
@@ -1064,35 +1069,90 @@ async fn read(
     let mut events = GatewayEngine::read(&context.gateway, request, connection.request_id());
     // Body bytes the started response still owes.
     let mut remaining = None;
+    // The started response's head, which waits to go out with the body's
+    // first bytes.
+    let mut waiting: Option<ResponseHead> = None;
     while let Some(event) = events.recv().await {
         match event {
             Event::Respond(head) => {
-                let mut response = answer(&head, method);
-                response.headers = presenting.present(response.status, response.headers);
+                let response = answer(&head, method, presenting);
                 connection.write_response(&response, true).await?;
                 return Ok(true);
             }
+            // The core answers a body of no bytes with `Respond`.
             Event::Start(head) => {
-                let framing = Framing::Length(head.content_length);
-                let headers = presenting.present(head.status, client_headers(&head));
-                connection
-                    .write_response_head(head.status, &headers, framing, keep_alive)
-                    .await?;
                 remaining = Some(head.content_length);
+                waiting = Some(head);
             }
-            Event::Forward { from, body, len } => {
+            Event::Forward {
+                from,
+                mut body,
+                len,
+            } => {
                 let want = len.min(body.unread());
-                let kernel_tls = body.kernel_tls() || connection.kernel_tls();
-                let (copied, relayed) =
-                    zero_copy::relay(body.stream(), connection.stream(), want, kernel_tls).await;
-                connection.sent_body(copied);
+                // Bytes that came with the node's head go from memory, with
+                // the response's head if it still waits, and `splice` moves
+                // the rest.
+                let held = body.held(want);
+                let first = held.len() as u64;
+                let (copied, relayed) = match connection.kernel_tls() {
+                    // Kernel TLS encrypts as it sends, so the body goes from
+                    // a worker, after the head.
+                    true => {
+                        let held = Bytes::copy_from_slice(held);
+                        body.take_held(held.len());
+                        match write_waiting(connection, &mut waiting, presenting, keep_alive).await
+                        {
+                            Err(error) => (0, Err(Short::Destination(error))),
+                            Ok(()) => {
+                                let (from, to) = (body.stream(), connection.stream());
+                                let left = want - first;
+                                let moved = zero_copy::relay_on_workers(held, from, to, left).await;
+                                connection.sent_body(moved.0);
+                                moved
+                            }
+                        }
+                    }
+                    false => {
+                        let wrote = match waiting.take() {
+                            Some(head) => {
+                                let headers =
+                                    presenting.present(head.status, client_headers(&head));
+                                let framing = Framing::Length(head.content_length);
+                                connection
+                                    .write_head_and_body(
+                                        head.status,
+                                        &headers,
+                                        framing,
+                                        keep_alive,
+                                        held,
+                                    )
+                                    .await
+                            }
+                            None => connection.write_body(held).await,
+                        };
+                        body.take_held(first as usize);
+                        match (wrote, want - first) {
+                            (Err(error), _) => (0, Err(Short::Destination(error))),
+                            (Ok(()), 0) => (first, Ok(())),
+                            (Ok(()), left) => {
+                                let (from, to) = (body.stream(), connection.stream());
+                                let kernel_tls = body.kernel_tls();
+                                let (spliced, relayed) =
+                                    zero_copy::relay(from, to, left, kernel_tls).await;
+                                connection.sent_body(spliced);
+                                (first + spliced, relayed)
+                            }
+                        }
+                    }
+                };
                 if let Err(Short::Destination(error)) = relayed {
                     // The client is gone, and needs none of the rest.
                     context.metrics.relay_cut(Side::Client);
                     GatewayEngine::forwarded(&context.gateway, from, len, None);
                     return Err(error);
                 }
-                let read_in_full = relayed.is_ok() && copied == body.unread();
+                let read_in_full = relayed.is_ok() && copied == first + body.unread();
                 GatewayEngine::forwarded(
                     &context.gateway,
                     from,
@@ -1107,38 +1167,68 @@ async fn read(
             }
             // The body ends short, and the connection with it.
             Event::Abort => {
+                write_waiting(connection, &mut waiting, presenting, keep_alive).await?;
                 context.metrics.relay_cut(Side::Node);
                 return Ok(false);
             }
         }
     }
     // The gateway dropped the read.
-    if remaining.is_none() {
-        let response = error(500, "InternalError", "the request was dropped");
-        connection.write_response(&response, false).await?;
+    match remaining {
+        None => {
+            let response = error(500, "InternalError", "the request was dropped");
+            connection.write_response(&response, false).await?;
+        }
+        Some(_) => write_waiting(connection, &mut waiting, presenting, keep_alive).await?,
     }
     Ok(false)
 }
 
-/// The headers of a client's response.
-fn client_headers(head: &ResponseHead) -> Vec<(String, String)> {
-    let mut headers = vec![("Accept-Ranges".to_string(), "bytes".to_string())];
-    headers.extend(head.headers.iter().cloned());
+/// Writes the head that waits for its body's first bytes, if one does.
+async fn write_waiting(
+    connection: &mut Connection,
+    waiting: &mut Option<ResponseHead>,
+    presenting: &Presenting,
+    keep_alive: bool,
+) -> io::Result<()> {
+    let Some(head) = waiting.take() else {
+        return Ok(());
+    };
+    let headers = presenting.present(head.status, client_headers(&head));
+    let framing = Framing::Length(head.content_length);
+    connection
+        .write_response_head(head.status, &headers, framing, keep_alive)
+        .await
+}
+
+/// A header borrowed from where the gateway holds it, or made for one
+/// response.
+type Header<'a> = (Cow<'a, str>, Cow<'a, str>);
+
+/// The headers of a client's response, borrowed from the node's head.
+fn client_headers(head: &ResponseHead) -> Vec<Header<'_>> {
+    let mut headers = Vec::with_capacity(head.headers.len() + 4);
+    headers.push((Cow::from("Accept-Ranges"), Cow::from("bytes")));
+    let held = head.headers.iter();
+    headers.extend(held.map(|(name, value)| (Cow::from(name.as_str()), Cow::from(value.as_str()))));
     if let Some(etag) = &head.etag {
-        headers.push(("ETag".to_string(), etag.0.clone()));
+        headers.push((Cow::from("ETag"), Cow::from(etag.0.as_str())));
     }
     if let Some(range) = head.content_range {
-        headers.push(("Content-Range".to_string(), format_content_range(range)));
+        headers.push((
+            Cow::from("Content-Range"),
+            Cow::from(format_content_range(range)),
+        ));
     }
     if head.status >= 400 {
-        headers.push(("Content-Type".to_string(), "application/xml".to_string()));
+        headers.push((Cow::from("Content-Type"), Cow::from("application/xml")));
     }
     headers
 }
 
 /// A response with no body from the nodes: a HEAD's, or an answer the core
 /// gave itself, with an S3 error body for a failure.
-fn answer(head: &ResponseHead, method: Method) -> Response {
+fn answer(head: &ResponseHead, method: Method, presenting: &Presenting) -> Response {
     if method == Method::Get && head.status >= 400 {
         return error(head.status, error_code(head), reason_message(head.status));
     }
@@ -1146,9 +1236,14 @@ fn answer(head: &ResponseHead, method: Method) -> Response {
         Method::Head => head.content_length,
         Method::Get => 0,
     };
+    let headers = presenting
+        .present(head.status, client_headers(head))
+        .into_iter()
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
     Response {
         status: head.status,
-        headers: client_headers(head),
+        headers,
         content_length,
         body: Bytes::new(),
     }
@@ -1194,7 +1289,7 @@ struct Presenting {
 impl Presenting {
     /// The headers of an answer with `status`. S3 sends checksums only for
     /// a whole object, and applies overrides only to a success.
-    fn present(&self, status: u16, mut headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    fn present<'a>(&'a self, status: u16, mut headers: Vec<Header<'a>>) -> Vec<Header<'a>> {
         if !(self.checksums && status == 200) {
             headers.retain(|(name, _)| !origin::is_checksum_header(name));
         }
@@ -1205,7 +1300,10 @@ impl Presenting {
                     .iter()
                     .any(|(set, _)| set.eq_ignore_ascii_case(name))
             });
-            headers.extend(overrides.iter().cloned());
+            let set = overrides.iter();
+            headers.extend(
+                set.map(|(name, value)| (Cow::from(name.as_str()), Cow::from(value.as_str()))),
+            );
         }
         headers
     }
