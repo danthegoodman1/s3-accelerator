@@ -513,7 +513,10 @@ def make_certificates(setup):
                         "-keyout", ca_key, "-out", ca], check=True, capture_output=True)
     for host in setup.hosts:
         cert, key = directory / f"{host.name}.pem", directory / f"{host.name}-key.pem"
-        if cert.exists():
+        # Host names repeat across fleets, and addresses change: a host's
+        # certificate is reissued when its address does.
+        issued = directory / f"{host.name}.ip"
+        if cert.exists() and issued.exists() and issued.read_text().strip() == host.private_ip:
             continue
         csr, ext = directory / f"{host.name}.csr", directory / f"{host.name}.ext"
         subprocess.run(["openssl", "req", *ec, "-subj", f"/CN={host.name}", "-keyout", key, "-out", csr],
@@ -524,6 +527,7 @@ def make_certificates(setup):
                         "-extfile", ext, "-out", cert], check=True, capture_output=True)
         csr.unlink()
         ext.unlink()
+        issued.write_text(host.private_ip + "\n")
     for key in directory.glob("*key.pem"):
         key.chmod(0o600)
 

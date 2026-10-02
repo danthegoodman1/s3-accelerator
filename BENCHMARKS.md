@@ -213,7 +213,6 @@ Each node's figure counts object bytes; TCP, IP and Ethernet headers add about 0
 - **A cold set read three times** (`cold-medium`, about 870 GiB a pass): 20.5 GiB/s over the three passes; the block hit rate stays at zero while the first pass streams and the second admits, then holds at 100%.
 - **Errors:** S3 answered 67 of the 4.0 million direct requests with a 500, and one timed out; the cache passed on S3's 500s for 14 fills.
 
-`docs/scale-test.png` draws `ab-cluster`'s `hits-large-c64` and `ranges-4k-c64` over their measured windows: `loadtest/chart docs/scale-test.png "loadtest/runs/ab-cluster:hits-large-c64:TITLE" "loadtest/runs/ab-cluster:ranges-4k-c64:TITLE"`.
 
 ### Cluster TCP timers, and a rerun on fresh hosts
 
@@ -298,6 +297,37 @@ On one machine, with 32 node processes, a gateway of 8 loops and s3proxy (`targe
 | One connection, small hits | 13,109/s; p50 0.66 ms (`plain`) | 10,110/s; p50 0.64 ms |
 
 Large objects lose 2-3% to TLS, since kernel TLS keeps `sendfile` and `splice`. Small requests stopped near 1.35 million a second whatever the connections: the client host's gateway workers took 69% of its CPU, 48% spinning in the kernel on one lock (`osq_lock`). For a kernel TLS client, the gateway handed every body to a worker, even 4 KiB: a duplicated descriptor registered with, and removed from, the one poller all 64 workers share. A body within one TLS record now goes out from the event loop at both ends, the node's `sendfile` and the gateway's write with the head, after the gateway reads the rest of it into memory; encrypting 16 KiB costs microseconds. `PLAN.md` 15F reruns it on AWS.
+
+### The rerun: placement, jemalloc and the TLS fix together
+
+`v-plain` and `v-tls`: one fleet of the scale test's hardware, 32 node processes per host, the same steps in plaintext and with kernel TLS on clients' and members' links.
+
+| Workload | Plaintext | TLS | TLS against plaintext | TLS before the fix (`tls`, another fleet) |
+|---|---|---|--:|---|
+| One connection, small hits | 13,786/s; p50 0.62 ms | 10,903/s; p50 0.62 ms | 79% | 10,110/s |
+| Small hits, 64 connections | 1,392,749/s; p99 0.66 ms | 1,055,998/s; p99 0.71 ms | 76% | 982,007/s |
+| 4 KiB ranges, 64 connections | 1,840,982/s; p99 0.57 ms | 1,740,748/s; p99 0.59 ms | 95% | 1,344,896/s |
+| 4 KiB ranges, 256 connections | 4,746,566/s; p99 0.98 ms | 4,283,255/s; p99 1.15 ms | 90% | 1,360,202/s |
+| 4 KiB ranges, 1,024 connections | 6,426,713/s; p99 4.3 ms | 4,292,706/s; p99 48 ms | 67% | 1,340,077/s |
+| 256 MiB, 16 connections | 115.85 GiB/s | 111.21 GiB/s | 96% | 110.45 GiB/s |
+| 256 MiB, 64 connections | 115.21 GiB/s; p99 14 ms | 113.86 GiB/s; p99 11 ms | 99% | 112.42 GiB/s |
+
+With small bodies on the event loops, TLS keeps 95% of plaintext's request rate at 64 connections per client and 90% at 256, where it had kept 75% and 30%, and `osq_lock` left the client host's profile. At 1,024 connections TLS held 4.3 million a second, 67%, with the client hosts 70% busy and p99 at 48 ms: a limit still to find. Plaintext's 6.4 million 4 KiB ranges a second at 1,024 connections is the most any run has served.
+
+### A response that starts on its first part
+
+`final`: `v-plain`'s fleet and steps, after the gateway began starting a response once its first part answers rather than once every part of the read-ahead window has. A 256 MiB read asks for its first 64 MiB as four parts from four nodes, so its first byte had waited for the slowest.
+
+| 256 MiB objects | Before (`v-plain`, `single`) | After (`final`) |
+|---|---|---|
+| 1 connection: first byte p50, p99 | 1.64 ms, 2.70 ms | 1.25 ms, 2.21 ms |
+| 16 connections: GiB/s; first byte p50, p99 | 115.85; 1.78 ms, 5.66 ms | 115.81; 1.20 ms, 4.86 ms |
+| 64 connections: GiB/s; first byte p50, p99 | 115.21; 3.20 ms, 14 ms | 115.29; 1.72 ms, 13 ms |
+| 256 connections: GiB/s; first byte p50, p99 | 105.99; 3.52 ms, 24 ms (`ab-cluster`) | 107.82; 1.73 ms, 22 ms |
+
+First byte fell by a quarter to a half at every concurrency, with throughput unchanged. Small objects and 4 KiB ranges, a single part each, held: 1,392,850 small hits a second with p99 0.66 ms, and 4 KiB ranges at 1,843,060, 4,757,933 and 6,404,878 a second at 64, 256 and 1,024 connections. One connection's first byte stays above a small object's 0.64 ms, since the first part is 16 MiB and its node's answer races three others' bodies; asking for the first megabyte as a part of its own is the next step (`PLAN.md`).
+
+`docs/scale-test.png` draws `final`'s `hits-large-c64` and `ranges-4k-c64`: `loadtest/chart docs/scale-test.png "loadtest/runs/final:hits-large-c64:TITLE" "loadtest/runs/final:ranges-4k-c64:TITLE"`.
 
 ### What limits each workload
 

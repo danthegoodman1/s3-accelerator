@@ -12,7 +12,7 @@ Non-goals until a phase names them: POSIX access, multipart-upload warming, SSE-
 - The core does no I/O, reads no clocks and starts no threads (`AGENTS.md`). It handles block locations and response heads; the server and simulator move bytes.
 - Every core feature ships with its simulator model, a property that fails on a wrong answer, and a planted bug that the simulator catches.
 - Build the smallest implementation that meets the phase gate. Add abstraction when a later phase needs it.
-- Execution order: Phase 1, S1, Phase 2, Phase 3, S2, Phase 4, Phase 5, S3, Phase 6, Phase 7, Phase 8, Phase 9, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 15.
+- Execution order: Phase 1, S1, Phase 2, Phase 3, S2, Phase 4, Phase 5, S3, Phase 6, Phase 7, Phase 8, Phase 9, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 15, Phase 16.
 
 ## Testing Strategy
 
@@ -720,5 +720,27 @@ Status ledger:
 | Complete | Work | 15B A profile on AWS | `plain`, 4 KiB ranges at 256 connections per client: the client host's gateway loops took 59.5% of its CPU, 22.7% in its own code, 18.7% in the kernel and 17.4% in libc's allocator and copies; on a node host, `placement::score` alone took 10.0%. |
 | Complete | Work | 15C Placement | `uniform_rings_rank_as_the_scores_do` proves the same owner and candidates as the scores over 4,000 placements at three weights; 100,000 simulator seeds pass. On AWS (`plain-fast`), `placement::score` left the node profile, and `Node::on_request` fell from 2.5% to 1.0% of the host. Planted bug: uniform rings ranked by their lowest draw. |
 | Complete | Work | 15D Allocator | On one machine with 32 node processes, 4 KiB range hits: 253,800 a second at 35.0 µs of gateway CPU and 33.5 µs of node CPU each before 15C and 15D, 274,000 at 31.8 and 30.2 µs after; cold fills 39,000 a second against glibc's 37,800. mimalloc saved as much on hits but slowed fills to 34,300 a second. |
-| In progress | Work | 15E TLS at scale | `tls`, against `plain-fast` on the same fleet: 256 MiB hits 112.4 GiB/s against 115.2 at 64 connections; 4 KiB ranges held near 1.35 million a second at 64, 256 and 1,024 connections, against 1.79, 4.61 and 5.32 million, while the gateway's workers took 69% of the client host's CPU, spinning in the kernel (`osq_lock`, 48%) on the lock of the poller every relay registered with. The fix sends a body within one TLS record from the event loop at both ends; `a_small_hit_crosses_kernel_tls_links_on_event_loops` shows it under `strace`, and three planted bugs, each sending such a body through a worker or leaving it in the socket, are caught. |
-| Not started | Gate | 15F Rerun on AWS | |
+| Complete | Work | 15E TLS at scale | `tls`, against `plain-fast` on the same fleet: 256 MiB hits 112.4 GiB/s against 115.2 at 64 connections; 4 KiB ranges held near 1.35 million a second at 64, 256 and 1,024 connections, against 1.79, 4.61 and 5.32 million, while the gateway's workers took 69% of the client host's CPU, spinning in the kernel (`osq_lock`, 48%) on the lock of the poller every relay registered with. The fix sends a body within one TLS record from the event loop at both ends, the gateway reading the rest of it into memory first; `a_small_hit_crosses_kernel_tls_links_on_event_loops` shows it under `strace`, and three planted bugs, each sending such a body through a worker or leaving it in the socket, are caught by the kernel TLS tests. |
+| Complete | Gate | 15F Rerun on AWS | `v-plain` and `v-tls`, one fleet, the three changes together. Plaintext: 4 KiB ranges 1,840,982, 4,746,566 and 6,426,713 a second at 64, 256 and 1,024 connections per client, small hits 1,392,749, 256 MiB hits 115.2 GiB/s at 64 connections. TLS: 4 KiB ranges 1,740,748, 4,283,255 and 4,292,706 (95%, 90% and 67% of plaintext, against 25-75% before the fix), small hits 1,055,998 (76%), 256 MiB hits 113.9 GiB/s (99%); `osq_lock` left the client host's profile. Kernel TLS on member links needed the load test to reissue each host's certificate when its address changes, as it now does. |
+
+## Phase 16: A Response That Starts on Its First Part
+
+Goal:
+A large read's first byte waits for one node. The gateway asked for a large read's first 64 MiB as several parts and started the client's response once every one had answered, so first byte waited for the slowest of four nodes: 1.64 ms at p50 for one 256 MiB reader, and 3.20 ms at 64 connections per client.
+
+Scope:
+- 16A The response starts once its first part answers, and the others' bodies follow in order. A part that fails afterwards, S3's 503 for a chunk's fill among them, ends the response early, as a failure past the first window already did, and the client's retry reads again.
+- 16B Rerun on AWS: the scale test's large and small hits.
+
+Later:
+- Ask for a large read's first megabyte as a part of its own, so its answer does not race the window's other bodies: one reader's first byte stays at 1.25 ms against a small object's 0.64 ms.
+
+Completion gate:
+First byte of 256 MiB hits falls on AWS at every concurrency, with throughput unchanged; tests, simulator sweep and planted bugs pass.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+|---|---|---|---|
+| Complete | Work | 16A Start on the first part | `a_response_starts_on_its_first_parts_answer`; `s3s_errors_reach_the_client_and_a_nodes_own_go_to_the_next_candidate` now takes a throttled fill mid-read as a 503 or a response that ends early. 100,000 simulator seeds pass, and all 37 test binaries with `--include-ignored`. Planted bug: a response waits for every part of its first window, caught by the core's unit tests. |
+| Complete | Gate | 16B Rerun on AWS | `final`, on `v-plain`'s fleet: 256 MiB first byte at p50 from 1.64 to 1.25 ms at one connection, 1.78 to 1.20 ms at 16, 3.20 to 1.72 ms at 64 and 3.52 to 1.73 ms at 256, with 115.81, 115.29 and 107.82 GiB/s at 16, 64 and 256 connections. Small hits and 4 KiB ranges held. |

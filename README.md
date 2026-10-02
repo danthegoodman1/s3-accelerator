@@ -22,7 +22,7 @@ A distributed NVMe read cache in front of S3. Clients keep their S3 SDKs and poi
 
 ![Two tests over time: 256 MiB objects and 4 KiB ranges, each with every storage node host's throughput, reads per second and block hit rate, and every client host's time to first byte](docs/scale-test.png)
 
-*Two tests with the current defaults, each over its measured 100 seconds, on six storage hosts running 32 node processes each. Top: 256 MiB objects at 64 connections per client host. Every node sends about 170 Gb/s, its share of the clients' 1 Tb/s, with first byte near 3 ms at p50. Bottom: 4 KiB ranges at 64 connections per client host: 1.84 million reads a second, first byte 0.34 ms at p50 and 0.59 ms at p99. Each line is one storage node host, except in the latency panels, where each pair is one client host.*
+*Two tests with the current defaults, each over its measured 100 seconds, on six storage hosts running 32 node processes each. Top: 256 MiB objects at 64 connections per client host. Every node sends about 170 Gb/s, its share of the clients' 1 Tb/s, with first byte near 1.7 ms at p50. Bottom: 4 KiB ranges at 64 connections per client host: 1.84 million reads a second, first byte 0.34 ms at p50 and 0.57 ms at p99. Each line is one storage node host, except in the latency panels, where each pair is one client host.*
 
 ## The scale test
 
@@ -30,18 +30,20 @@ Ten c8in.16xlarge client hosts (64 vCPUs, 100 Gb/s each) read one dataset from S
 
 | Workload | S3 directly | Through the cache | Gain |
 |---|---|---|--:|
-| 4–256 KiB objects, 1 connection | 218/s; first byte p50 35 ms, p99 120 ms | 13,591/s; p50 0.66 ms, p99 1.2 ms | 62× |
-| 4–256 KiB objects, 64 connections | 17,595/s, 1.0 GiB/s; p50 25 ms, p99 110 ms | 1,383,218/s, 79.9 GiB/s; p50 0.39 ms, p99 0.68 ms | 79× |
-| 4 KiB ranges, 64 connections | 20,694/s; p50 26 ms, p99 98 ms | 1,836,670/s; p50 0.34 ms, p99 0.59 ms | 89× |
-| 4 KiB ranges, 1,024 connections | | 6,053,848/s; p50 1.4 ms, p99 4.8 ms | |
-| 256 MiB objects, 16 connections | | 115.8 GiB/s; p50 1.8 ms, p99 6.0 ms | |
-| 256 MiB objects, 64 connections | 54.3 GiB/s; p50 87 ms, p99 176 ms | 115.2 GiB/s; p50 3.1 ms, p99 13 ms | 2.1× |
-| 256 MiB objects, 256 connections | 109.5 GiB/s; p50 34 ms, p99 143 ms | 106.0 GiB/s; p50 3.5 ms, p99 24 ms | |
+| 4–256 KiB objects, 1 connection | 218/s; first byte p50 35 ms, p99 120 ms | 13,474/s; p50 0.64 ms, p99 1.1 ms | 62× |
+| 4–256 KiB objects, 64 connections | 17,595/s, 1.0 GiB/s; p50 25 ms, p99 110 ms | 1,392,850/s, 80.5 GiB/s; p50 0.38 ms, p99 0.66 ms | 79× |
+| 4 KiB ranges, 64 connections | 20,694/s; p50 26 ms, p99 98 ms | 1,843,060/s; p50 0.34 ms, p99 0.57 ms | 89× |
+| 4 KiB ranges, 1,024 connections | | 6,404,878/s; p50 1.4 ms, p99 4.4 ms | |
+| 256 MiB objects, 1 connection | 68 MiB/s a stream; p50 112 ms | 1.44 GiB/s a stream; p50 1.25 ms, p99 2.2 ms | 22× |
+| 256 MiB objects, 16 connections | | 115.8 GiB/s; p50 1.2 ms, p99 4.9 ms | |
+| 256 MiB objects, 64 connections | 54.3 GiB/s; p50 87 ms, p99 176 ms | 115.3 GiB/s; p50 1.7 ms, p99 13 ms | 2.1× |
+| 256 MiB objects, 256 connections | 109.5 GiB/s; p50 34 ms, p99 143 ms | 107.8 GiB/s; p50 1.7 ms, p99 22 ms | |
 
-- **Small objects and ranges:** 79 to 89 times S3's request rate at the same connections, with p99 under a millisecond. At 6 million ranges a second the client hosts, each running a gateway and the load generator, were 80% busy and the storage hosts 18%: the clients set the limit.
-- **Large objects:** the cache fills the clients' 1 Tb/s of network at 16 connections per host, with first byte under 2 ms; S3 needs 256 connections to come close, at 34 ms. At 256 connections the clients' network cards drop packets past their allowance, and the cluster's [TCP timers](#tuning) keep the cost of each loss to milliseconds.
-- **Runs, and how much hosts vary:** the S3 figures and the one-connection row come from the first scale run; the cache's other figures from a rerun on fresh hosts with the current defaults. The two fleets had the same instance types, zone, layout and settings, were launched the same day, and ran code that differed only in timers the rerun's comparison pass left at Linux's. Yet the first served small objects at a quarter of the rerun's rate (373,341 a second against 1,472,009), with p99 at 20 ms against 0.70 ms, and its 256 MiB reads fell to 13.5 GiB/s at 256 connections, with reads timing out, against 112.6. Every process's event loop ran on time in both. [Tuning](#tuning) says how to check a fleet.
-- **Errors:** S3 answered 67 of the 4.0 million direct requests with a 500, and one timed out. The cache answered every request of the rerun.
+- **Small objects and ranges:** 79 to 89 times S3's request rate at the same connections, with p99 under a millisecond. At 6.4 million ranges a second the client hosts, each running a gateway and the load generator, were 81% busy and the storage hosts 17%: the clients set the limit.
+- **Large objects:** the cache fills the clients' 1 Tb/s of network at 16 connections per host, with first byte near a millisecond; S3 needs 256 connections to come close, at 34 ms. One reader gets 22 times S3's stream. At 256 connections the clients' network cards drop packets past their allowance, and the cluster's [TCP timers](#tuning) keep the cost of each loss to milliseconds.
+- **TLS:** with kernel TLS on every link, small requests keep 76-95% of plaintext's rate up to 256 connections per client, and large reads 96-99% ([BENCHMARKS.md](BENCHMARKS.md)).
+- **Runs, and how much hosts vary:** the cache's figures come from the final run with the current defaults; S3's from the first scale run, and its one-stream figure from a later session on the same hardware. Two fleets of the same instance types, zone, layout and settings, launched the same day, differed widely: the first served small objects at a quarter of the second's rate (373,341 a second against 1,472,009), with p99 at 20 ms against 0.70 ms, and its 256 MiB reads fell to 13.5 GiB/s at 256 connections, with reads timing out, against 112.6, while every process's event loop ran on time. [Tuning](#tuning) says how to check a fleet.
+- **Errors:** S3 answered 67 of the 4.0 million direct requests with a 500, and one timed out. The cache answered every request of the final run.
 
 `loadtest/plans/scale.toml` reruns it.
 
