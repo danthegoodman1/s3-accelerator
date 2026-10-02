@@ -434,6 +434,20 @@ impl Connection {
         &self.buffer
     }
 
+    /// Reads until `len` bytes wait in the buffer, and no further: the rest
+    /// of a small body that goes on from memory.
+    pub async fn fill_buffer(&mut self, len: usize) -> io::Result<()> {
+        while self.buffer.len() < len {
+            let missing = len - self.buffer.len();
+            self.buffer.reserve(missing);
+            let mut limited = (&mut self.stream).take(missing as u64);
+            if limited.read_buf(&mut self.buffer).await? == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+        }
+        Ok(())
+    }
+
     /// Marks the first `len` buffered bytes consumed.
     pub fn consume_buffered(&mut self, len: usize) {
         self.buffer.drain(..len);

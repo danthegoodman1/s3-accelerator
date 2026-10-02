@@ -1,0 +1,169 @@
+# Misses: reads of objects the cache has never held, through the cache and
+# from S3 directly, from the same clients at the same connections. Each
+# cache step reads its keys once, so every read misses; the S3 step after
+# it reads the same keys. A medium set is then read twice more through the
+# cache: once while its blocks are admitted, and once as hits. Run it on a
+# fresh cluster, before anything warms these keys, on the scale test's
+# hardware. Each step reads a whole set, or a million small objects.
+#
+#   loadtest/loadtest run loadtest/plans/misses.toml
+
+[dataset]
+prefix = "full/v1"
+seed = 1
+
+# Request rate: manifests, indexes, thumbnails.
+[[dataset.sets]]
+name = "small"
+count = 2_000_000
+size = { log_uniform = ["4KiB", "256KiB"] }
+
+# A working set larger than the cache.
+[[dataset.sets]]
+name = "medium"
+count = 100_000
+size = { log_uniform = ["1MiB", "32MiB"] }
+
+# Throughput: dataset shards, checkpoints.
+[[dataset.sets]]
+name = "large"
+count = 2_048
+size = "256MiB"
+
+# Analytics: a reader takes the footer, then row groups.
+[[dataset.sets]]
+name = "tables"
+count = 4_000
+size = { log_uniform = ["64MiB", "512MiB"] }
+format = "parquet"
+footer = "4MiB"
+
+[[steps]]
+name = "miss-small-c64"
+target = "cache"
+requests = 1_000_000
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 1_000_000
+keys = "sequential"
+passes = 1
+window = 1_000_000
+
+[[steps]]
+name = "s3-small-c64"
+target = "s3"
+requests = 1_000_000
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 1_000_000
+keys = "sequential"
+passes = 1
+window = 1_000_000
+
+[[steps]]
+name = "miss-medium-c64"
+target = "cache"
+requests = 100_000
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "medium"
+limit = 100_000
+keys = "sequential"
+passes = 1
+window = 100_000
+
+[[steps]]
+name = "s3-medium-c64"
+target = "s3"
+requests = 100_000
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "medium"
+limit = 100_000
+keys = "sequential"
+passes = 1
+window = 100_000
+
+[[steps]]
+name = "miss-large-c64"
+target = "cache"
+requests = 2_048
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "large"
+limit = 2_048
+keys = "sequential"
+passes = 1
+window = 2_048
+
+[[steps]]
+name = "s3-large-c64"
+target = "s3"
+requests = 2_048
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "large"
+limit = 2_048
+keys = "sequential"
+passes = 1
+window = 2_048
+
+[[steps]]
+name = "miss-tables-c64"
+target = "cache"
+requests = 4_000
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "tables"
+limit = 4_000
+keys = "sequential"
+passes = 1
+window = 4_000
+
+[[steps]]
+name = "s3-tables-c64"
+target = "s3"
+requests = 4_000
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "tables"
+limit = 4_000
+keys = "sequential"
+passes = 1
+window = 4_000
+
+[[steps]]
+name = "admit-medium-c64"
+target = "cache"
+requests = 100_000
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "medium"
+limit = 100_000
+keys = "sequential"
+passes = 1
+window = 100_000
+
+[[steps]]
+name = "hits-medium-c64"
+target = "cache"
+requests = 100_000
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "medium"
+limit = 100_000
+keys = "sequential"
+passes = 1
+window = 100_000

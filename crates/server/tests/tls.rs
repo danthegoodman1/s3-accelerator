@@ -266,7 +266,7 @@ async fn hits_reach_kernel_tls_sessions_through_sendfile_and_splice() {
     // client by a write rather than `splice`.
     let ahead = (3 * http::READ_AHEAD) as i64;
 
-    let kernel = evidence(true, true, true).await;
+    let kernel = evidence(true, true, true, OBJECT_SIZE).await;
     println!("kernel TLS: {kernel:#?}");
     for (name, link) in [("client", &kernel.clients), ("peer", &kernel.peers)] {
         assert!(link.sockets > 0, "ss found no {name} connection");
@@ -305,7 +305,7 @@ async fn hits_reach_kernel_tls_sessions_through_sendfile_and_splice() {
         kernel.rx_sessions
     );
 
-    let userspace = evidence(false, true, true).await;
+    let userspace = evidence(false, true, true, OBJECT_SIZE).await;
     println!("userspace TLS: {userspace:#?}");
     for (name, link) in [("client", &userspace.clients), ("peer", &userspace.peers)] {
         assert!(link.sockets > 0, "ss found no {name} connection");
@@ -329,7 +329,7 @@ async fn hits_reach_kernel_tls_sessions_through_sendfile_and_splice() {
 #[ignore = "needs the tls module (sudo modprobe tls), strace, and sudo for ss"]
 async fn a_kernel_tls_client_takes_held_bytes_from_a_worker() {
     let _counters = COUNTERS.lock().await;
-    let evidence = evidence(true, true, false).await;
+    let evidence = evidence(true, true, false, OBJECT_SIZE).await;
     assert!(
         evidence.held > 0,
         "the gateway held none of the answers' bytes"
@@ -348,7 +348,7 @@ async fn a_kernel_tls_client_takes_held_bytes_from_a_worker() {
 #[ignore = "needs the tls module (sudo modprobe tls), strace, and sudo for ss"]
 async fn kernel_tls_node_answers_are_decrypted_on_workers() {
     let _counters = COUNTERS.lock().await;
-    let evidence = evidence(true, false, true).await;
+    let evidence = evidence(true, false, true, OBJECT_SIZE).await;
     println!("{evidence:#?}");
     let ahead = (3 * http::READ_AHEAD) as i64;
     let total = 3 * OBJECT_SIZE as i64;
@@ -360,6 +360,31 @@ async fn kernel_tls_node_answers_are_decrypted_on_workers() {
     assert_eq!(
         evidence.from_peers_on_event_loop, 0,
         "an event loop spliced, and so decrypted, a node's answer"
+    );
+}
+
+/// A hit within one TLS record crosses kernel TLS links on event loops: the
+/// node sends it with `sendfile` from its event loop, and the gateway
+/// writes it with its head from one of its loops, each encrypting in the
+/// kernel, with no worker between them.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs the tls module (sudo modprobe tls), strace, and sudo for ss"]
+async fn a_small_hit_crosses_kernel_tls_links_on_event_loops() {
+    let _counters = COUNTERS.lock().await;
+    let size = 4096;
+    let evidence = evidence(true, true, true, size).await;
+    println!("{evidence:#?}");
+    let total = 3 * size as i64;
+    assert!(
+        evidence.held_on_event_loop >= total && evidence.held_on_event_loop == evidence.held,
+        "the gateway's event loops wrote {} of the {} bytes of writes carrying {total} body bytes",
+        evidence.held_on_event_loop,
+        evidence.held
+    );
+    assert_eq!(
+        evidence.peers.on_event_loop, total,
+        "the node's event loop sent {} of {total} hit bytes",
+        evidence.peers.on_event_loop
     );
 }
 
@@ -418,17 +443,18 @@ struct Link {
     written: i64,
 }
 
-/// Reads three objects twice through a traced node and gateway, with every
+/// Reads three objects of `size` bytes twice through a traced node and
+/// gateway, with every
 /// session in the kernel or in userspace, the client's link to the gateway
 /// over TLS when `clients_tls`, and the gateway's links to the node over
 /// TLS when `peers_tls`; each is plaintext otherwise.
-async fn evidence(kernel: bool, clients_tls: bool, peers_tls: bool) -> Evidence {
+async fn evidence(kernel: bool, clients_tls: bool, peers_tls: bool, size: usize) -> Evidence {
     LocalSet::new()
         .run_until(async {
             let before = tls_stat();
             let (origin_port, origin) = start_origin().await;
             origin.distinct.set(true);
-            origin.size.set(OBJECT_SIZE);
+            origin.size.set(size);
             let dir = data_dir();
             let cache = "block_size = 65536\nextent_size = 1048576\nextents = 4";
             let cluster = Cluster::new(&dir, origin_port, cache);
@@ -487,7 +513,7 @@ async fn evidence(kernel: bool, clients_tls: bool, peers_tls: bool) -> Evidence 
             gateway.stop();
             node.stop();
 
-            let total = (keys.len() * OBJECT_SIZE) as i64;
+            let total = (keys.len() * size) as i64;
             let windows = windows(&bodies);
             let gateway_calls = read_trace(&gateway_trace, 0.0, f64::MAX);
             let node_calls = read_trace(&node_trace, 0.0, f64::MAX);

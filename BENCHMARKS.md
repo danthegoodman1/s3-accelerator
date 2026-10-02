@@ -250,6 +250,55 @@ With the 5 ms timers, the current defaults:
 
 **The first scale run's slowness did not recur.** With the same layout and Linux's timers, `ab-linux` served 3.9 times the small hits (1,472,009 a second against 373,341) and 1.7 times the 4 KiB ranges at 1,024 connections, with p99 under a millisecond at 64 connections where the first run saw 20 ms. Its large reads held 112.6 GiB/s at 256 connections, where the first run fell to 13.5 GiB/s with 667 timeouts. Every process's event loop ran on time in both runs, and the code differed only in the timers, which `ab-linux` left at Linux's. The first run's hosts are the likeliest difference, through the network between them, but nothing measured shows it: that run predates the report's TCP and network card counters.
 
+### Misses, a profile on AWS, and TLS
+
+`misses`, `plain`, `single`, `plain-fast` and `tls`: the scale test's hardware, one fleet, 32 node processes per host. S3 ran slower this session than in the scale test (30.7 GiB/s for 256 MiB objects at 64 connections, against 54.3), so only figures from one session compare.
+
+Cold reads, through the cache and from S3 directly, on the same keys at 64 connections per client:
+
+| Objects | S3 directly | Through the cache | Cache against S3 |
+|---|---|---|--:|
+| 4-256 KiB, a million | 11,647/s; first byte p50 46 ms, p99 139 ms | 9,060/s; p50 65 ms, p99 166 ms | 78% |
+| 1-32 MiB, 100,000 | 22.3 GiB/s; p50 120 ms | 21.0 GiB/s; p50 126 ms | 94% |
+| 256 MiB, 2,048 | 30.7 GiB/s; p50 134 ms | 24.1 GiB/s; p50 148 ms | 79% |
+| Parquet tables of 64-512 MiB, 4,000 | 25.8 GiB/s; p50 130 ms | 25.7 GiB/s; p50 150 ms | 100% |
+
+The 1-32 MiB set read again admitted its blocks at 22.6 GiB/s, with first byte 199 ms at p50, and read a third time hit at 41.3 GiB/s, 0.82 ms. A cold object streams through its home as one S3 GET, while the client hosts ran at 2% CPU and the node hosts at 6%, leaving room to parallelize it; `PLAN.md` keeps that for later.
+
+One connection per client, the rate one reader sees:
+
+| Objects | S3 directly | Cache hits |
+|---|--:|--:|
+| 256 MiB | 68 MiB/s a stream | 1.42 GiB/s a stream, 21 times |
+| 1-32 MiB | 38 MiB/s | 677 MiB/s, 18 times |
+
+**The profile.** `loadtest profile` sampled every CPU of a client host and a node host during 4 KiB range hits at 256 connections per client (`plain`). On the client host, the gateway's 64 loops took 59.5% of the CPU: 22.7% in the gateway's own code, 18.7% in the kernel and 17.4% in libc, mostly `malloc`, `free` and copies; the load generator took 28.5%. On the node host, ranking ring members for each placement, `placement::score`, took 10.0% of the host: 192 members, each scored with a hash and a logarithm for every placement a request touched. Two changes followed:
+
+- Rings whose members share one weight rank them by their hashes, which orders them as the scores do; `placement::score` left the node profile (`plain-fast`).
+- The server binary allocates with jemalloc.
+
+On one machine, with 32 node processes, a gateway of 8 loops and s3proxy (`target/many`):
+
+| Build | 4 KiB range hits | Gateway CPU a hit | Node CPU a hit | Cold fills |
+|---|--:|--:|--:|--:|
+| Before | 253,800/s | 35.0 µs | 33.5 µs | |
+| Placement by hash | 260,000/s | 34.6 µs | 32.0 µs | 37,800/s |
+| And mimalloc | 270,000/s | 32.2 µs | 30.2 µs | 34,300/s |
+| And jemalloc | 274,000/s | 31.8 µs | 30.2 µs | 39,000/s |
+
+**TLS at scale** (`tls` against `plain-fast`, kernel TLS on clients' and members' links, before the fix below):
+
+| Workload | Plaintext | TLS |
+|---|---|---|
+| 256 MiB, 16 connections | 113.6 GiB/s | 110.5 GiB/s; p99 3.3 ms |
+| 256 MiB, 64 connections | 115.2 GiB/s; p99 13 ms | 112.4 GiB/s; p99 11 ms |
+| 4 KiB ranges, 64 connections | 1,786,185/s; p99 0.59 ms | 1,344,896/s; p99 0.62 ms |
+| 4 KiB ranges, 256 connections | 4,613,334/s; p99 1.05 ms | 1,360,202/s; p99 2.6 ms |
+| 4 KiB ranges, 1,024 connections | 5,323,049/s (`plain`) | 1,340,077/s; p99 4.3 ms |
+| One connection, small hits | 13,109/s; p50 0.66 ms (`plain`) | 10,110/s; p50 0.64 ms |
+
+Large objects lose 2-3% to TLS, since kernel TLS keeps `sendfile` and `splice`. Small requests stopped near 1.35 million a second whatever the connections: the client host's gateway workers took 69% of its CPU, 48% spinning in the kernel on one lock (`osq_lock`). For a kernel TLS client, the gateway handed every body to a worker, even 4 KiB: a duplicated descriptor registered with, and removed from, the one poller all 64 workers share. A body within one TLS record now goes out from the event loop at both ends, the node's `sendfile` and the gateway's write with the head, after the gateway reads the rest of it into memory; encrypting 16 KiB costs microseconds. `PLAN.md` 15F reruns it on AWS.
+
 ### What limits each workload
 
 - **Large objects and small ones of tens of KiB:** the nodes' network cards, at line rate with a core or two to spare on a 200 Gb/s node. More throughput needs more network per node, or more nodes.

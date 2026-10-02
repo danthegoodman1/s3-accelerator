@@ -100,6 +100,13 @@ impl NodeBody {
         &held[..held.len().min(usize::try_from(most).unwrap_or(usize::MAX))]
     }
 
+    /// Reads the body's next `most` bytes into memory, so they go on with
+    /// the bytes that came with the head.
+    pub async fn hold(&mut self, most: u64) -> io::Result<()> {
+        let len = usize::try_from(most.min(self.len)).unwrap_or(usize::MAX);
+        self.connection.fill_buffer(len).await
+    }
+
     /// Marks the first `len` held bytes sent on.
     pub fn take_held(&mut self, len: usize) {
         self.connection.consume_buffered(len);

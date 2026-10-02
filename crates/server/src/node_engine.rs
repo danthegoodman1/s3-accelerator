@@ -1855,11 +1855,14 @@ async fn send_body(
                 let disk = engine.borrow().disk.clone();
                 let total: u64 = run.iter().map(|(_, len)| len).sum();
                 // Bytes the page cache holds go out from the event loop.
-                // Kernel TLS encrypts as it sends, so its sends stay on
-                // workers.
-                let inline = !connection.kernel_tls()
-                    && total <= zero_copy::INLINE_SEND
-                    && run.iter().all(|&(offset, len)| disk.cached(offset, len));
+                // Kernel TLS encrypts as it sends, so only a run within one
+                // record does.
+                let most = match connection.kernel_tls() {
+                    true => zero_copy::INLINE_TLS,
+                    false => zero_copy::INLINE_SEND,
+                };
+                let inline =
+                    total <= most && run.iter().all(|&(offset, len)| disk.cached(offset, len));
                 if inline {
                     for (offset, len) in run {
                         disk.send_cached(connection.stream(), offset, len).await?;

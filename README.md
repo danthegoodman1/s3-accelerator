@@ -369,6 +369,8 @@ delack_max_us = 5000   # the most time an acknowledgement waits
 
 **Node processes per host.** A node process runs its core on one thread, so small-request rates grow with processes. The scale test ran 32 on each 128-vCPU storage host: 6 million 4 KiB reads a second with those hosts 18% busy, and large reads at the clients' network limit.
 
+**Equal weights.** When every node has the same weight, gateways and nodes rank a key's candidates by hash alone; with weights that differ, they compute a logarithm for each node, for every key they place. With 192 ring members, that ranking had taken a tenth of a node host's CPU on AWS. Give nodes one weight where you can: hosts of one size, and node processes that split a host's disk evenly, as the scale test's did.
+
 **Gateways.** A gateway runs an event loop per core by default. At 6 million reads a second, the client hosts, each running a gateway beside the load generator, were 80% busy; give a sidecar gateway the cores its client's request rate needs.
 
 ## Development

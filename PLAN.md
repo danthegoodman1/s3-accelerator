@@ -12,7 +12,7 @@ Non-goals until a phase names them: POSIX access, multipart-upload warming, SSE-
 - The core does no I/O, reads no clocks and starts no threads (`AGENTS.md`). It handles block locations and response heads; the server and simulator move bytes.
 - Every core feature ships with its simulator model, a property that fails on a wrong answer, and a planted bug that the simulator catches.
 - Build the smallest implementation that meets the phase gate. Add abstraction when a later phase needs it.
-- Execution order: Phase 1, S1, Phase 2, Phase 3, S2, Phase 4, Phase 5, S3, Phase 6, Phase 7, Phase 8, Phase 9, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14.
+- Execution order: Phase 1, S1, Phase 2, Phase 3, S2, Phase 4, Phase 5, S3, Phase 6, Phase 7, Phase 8, Phase 9, Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 15.
 
 ## Testing Strategy
 
@@ -691,3 +691,34 @@ Status ledger:
 | Complete | Work | 14A Find where the time goes | On one machine, 32 node processes made large reads faster, not slower: 27.5 GiB/s at 16 connections against 8.0 with two, and no retransmission timeouts or receive queue drops (`nstat`). On AWS, p99 spikes sat at 210 ms, Linux's 200 ms minimum retransmission timeout, and the report's new TCP counters showed 176,917 timeouts in one step of 256 MiB reads at 256 connections, where the clients' network cards dropped packets past their allowance. A rerun on fresh hosts with 32 node processes per host and Linux's timers (`ab-linux`) did not collapse: 112.6 GiB/s at 256 connections, against 13.5 in the first run, whose small requests were also slower; the first run's hosts remain the likeliest difference. |
 | Complete | Work | 14B Fix | `[cluster.tcp]`: a 5 ms minimum retransmission timeout and a 5 ms maximum delayed ACK (`TCP_RTO_MIN_US`, `TCP_DELACK_MAX_US`) on links among gateways and nodes, set on a node's listener and a gateway's socket before the handshake. `cluster_links_resend_lost_segments_within_milliseconds` reads each link's timeout with `ss`: near 5 ms on cluster links, 200 ms on client links and with timers of 0. Planted bugs: a node's listener and a gateway's socket left at Linux's timers, each caught. |
 | Complete | Gate | 14C Rerun on AWS | `ab-linux`, `ab-cluster` and `ab-20ms` on one deploy. 256 MiB reads with 32 node processes per host matched one per host within 6%: 115.8, 115.2 and 106.0 GiB/s at 16, 64 and 256 connections, against 103.9, 114.7 and 112.9. The 5 ms timers cut p99 at 256 connections from 209 ms to 24 ms and p99.9 at 64 from 213 ms to 19 ms, resending 1.8 times the segments and losing 6% of throughput at 256; a 20 ms floor resent as much and reached a p99.9 of 1,044 ms. Small objects and ranges saw no difference: 1.38 million small hits and 6.05 million 4 KiB ranges a second, with the client hosts 80% busy. |
+
+## Phase 15: Misses, a Profile on AWS, and TLS at Scale
+
+Goal:
+Know how the cache's misses compare with S3's, where the CPU goes under load on AWS, and what TLS costs at scale, and cut what the profile shows.
+
+Scope:
+- 15A Misses against S3: cold reads through the cache and from S3 on the same keys and connections, for small, medium, large and table objects (`loadtest/plans/misses.toml`).
+- 15B A profile on AWS: `loadtest profile` samples a host's CPUs with `perf` during a step.
+- 15C Placement: rings whose members share one weight rank them by their draws, without a logarithm each.
+- 15D Allocator: jemalloc in the server binary.
+- 15E TLS at scale: the hits steps with kernel TLS on clients' and members' links, and a body within one TLS record sent from the event loop at both ends.
+- 15F Rerun on AWS: placement, jemalloc and the TLS fix together, plaintext and TLS on one fleet.
+
+Later:
+- Parallel first reads of large objects. A cold large object streams through its home as one S3 GET, so a miss runs at one S3 stream's rate: 79% of S3's own throughput for 256 MiB objects at 64 connections per client. Once the home has the metadata, its chunks could come from their owners at once, each owner fetching its ranges from S3, which would make a cold large read faster than S3 rather than slower. The first fetch still needs the object's size and ETag before it can plan chunks.
+- Medium objects under load: 1-32 MiB hits at 64 connections per client reached 24-41 GiB/s, while every CPU stayed under 5% and the clients' network cards dropped packets in bursts (`pps_allowance_exceeded`). Pacing on the nodes (`fq`) changed nothing.
+
+Completion gate:
+Placement, jemalloc and the TLS fix measured on AWS against the same fleet's plaintext and TLS runs; tests, simulator sweep, conformance and planted bugs pass.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+|---|---|---|---|
+| Complete | Work | 15A Misses against S3 | `misses`, on the scale test's hardware, 64 connections per client, the same keys: small objects 9,060 a second through the cache against S3's 11,647 (78%), with first byte 65 ms at p50 against 46 ms; medium 21.0 GiB/s against 22.3 (94%); 256 MiB 24.1 GiB/s against 30.7 (79%); tables 25.7 against 25.8 (100%). The medium set's second read, which admits its blocks, ran at 22.6 GiB/s, and its third, as hits, at 41.3 GiB/s with first byte 0.82 ms. One connection per client (`single`): 256 MiB hits 1.42 GiB/s a stream against S3's 68 MiB/s, and 1-32 MiB hits 677 MiB/s against 38 MiB/s. |
+| Complete | Work | 15B A profile on AWS | `plain`, 4 KiB ranges at 256 connections per client: the client host's gateway loops took 59.5% of its CPU, 22.7% in its own code, 18.7% in the kernel and 17.4% in libc's allocator and copies; on a node host, `placement::score` alone took 10.0%. |
+| Complete | Work | 15C Placement | `uniform_rings_rank_as_the_scores_do` proves the same owner and candidates as the scores over 4,000 placements at three weights; 100,000 simulator seeds pass. On AWS (`plain-fast`), `placement::score` left the node profile, and `Node::on_request` fell from 2.5% to 1.0% of the host. Planted bug: uniform rings ranked by their lowest draw. |
+| Complete | Work | 15D Allocator | On one machine with 32 node processes, 4 KiB range hits: 253,800 a second at 35.0 µs of gateway CPU and 33.5 µs of node CPU each before 15C and 15D, 274,000 at 31.8 and 30.2 µs after; cold fills 39,000 a second against glibc's 37,800. mimalloc saved as much on hits but slowed fills to 34,300 a second. |
+| In progress | Work | 15E TLS at scale | `tls`, against `plain-fast` on the same fleet: 256 MiB hits 112.4 GiB/s against 115.2 at 64 connections; 4 KiB ranges held near 1.35 million a second at 64, 256 and 1,024 connections, against 1.79, 4.61 and 5.32 million, while the gateway's workers took 69% of the client host's CPU, spinning in the kernel (`osq_lock`, 48%) on the lock of the poller every relay registered with. The fix sends a body within one TLS record from the event loop at both ends; `a_small_hit_crosses_kernel_tls_links_on_event_loops` shows it under `strace`, and three planted bugs, each sending such a body through a worker or leaving it in the socket, are caught. |
+| Not started | Gate | 15F Rerun on AWS | |

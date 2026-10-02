@@ -1097,14 +1097,25 @@ async fn read(
                 len,
             } => {
                 let want = len.min(body.unread());
+                // A body within one TLS record comes into memory whole when
+                // either link carries kernel TLS, so the event loop sends it
+                // with its head, rather than handing it to a worker; a body
+                // cut short goes on as far as it came.
+                let kernel_tls = connection.kernel_tls() || body.kernel_tls();
+                if kernel_tls && want <= zero_copy::INLINE_TLS {
+                    let _ = body.hold(want).await;
+                }
                 // Bytes that came with the node's head go from memory, with
                 // the response's head if it still waits, and `splice` moves
                 // the rest.
                 let held = body.held(want);
                 let first = held.len() as u64;
-                let (copied, relayed) = match connection.kernel_tls() {
-                    // Kernel TLS encrypts as it sends, so the body goes from
-                    // a worker, after the head.
+                // Kernel TLS encrypts as it sends: a whole body within one
+                // record goes from the event loop, and any longer one from a
+                // worker, after the head.
+                let whole = first == want && first <= zero_copy::INLINE_TLS;
+                let on_workers = connection.kernel_tls() && !whole;
+                let (copied, relayed) = match on_workers {
                     true => {
                         let held = Bytes::copy_from_slice(held);
                         body.take_held(held.len());

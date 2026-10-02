@@ -4,6 +4,12 @@
 use s3_accelerator::{config, log, server};
 use std::process::ExitCode;
 
+/// glibc's allocator took a sixth of a gateway host's CPU under small reads,
+/// much of it in locks its threads share; jemalloc gives each thread its own
+/// cache, and keeps freed blocks' memory for the next fill.
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() -> ExitCode {
     let Some(path) = std::env::args().nth(1) else {
         eprintln!("usage: s3-accelerator CONFIG");

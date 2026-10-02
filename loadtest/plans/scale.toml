@@ -230,6 +230,49 @@ verify = "edges"
 set = "large"
 limit = 1_024
 
+# One connection per client: the rate a single reader sees.
+[[steps]]
+name = "hits-large-c1"
+target = "cache"
+duration = "60s"
+warmup = "10s"
+connections = 1
+verify = "edges"
+[[steps.reads]]
+set = "large"
+limit = 1_024
+
+[[steps]]
+name = "s3-large-c1"
+target = "s3"
+duration = "60s"
+warmup = "10s"
+connections = 1
+verify = "edges"
+[[steps.reads]]
+set = "large"
+limit = 1_024
+
+[[steps]]
+name = "hits-medium-c1"
+target = "cache"
+duration = "60s"
+warmup = "10s"
+connections = 1
+verify = "edges"
+[[steps.reads]]
+set = "medium"
+
+[[steps]]
+name = "s3-medium-c1"
+target = "s3"
+duration = "60s"
+warmup = "10s"
+connections = 1
+verify = "edges"
+[[steps.reads]]
+set = "medium"
+
 # A cold set read three times, for the hit rate over time: the first pass
 # streams from S3, the second admits each block, the third hits.
 [[steps]]

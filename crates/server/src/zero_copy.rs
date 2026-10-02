@@ -151,6 +151,13 @@ pub fn workers() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// Bodies of at most this many bytes, one TLS record, go to a kernel TLS
+/// socket from the event loop when memory or the page cache holds them:
+/// encrypting them costs microseconds, and handing each to a worker costs
+/// more, in a duplicated descriptor and a registration with the workers'
+/// one poller, whose lock their threads then contend for.
+pub const INLINE_TLS: u64 = 16 << 10;
+
 /// Bodies smaller than this go out on the event loop: waking a worker
 /// costs more than the copy.
 pub const INLINE_WRITE: usize = 256 << 10;

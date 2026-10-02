@@ -44,6 +44,7 @@ PASSTHROUGH = "crates/server/src/passthrough.rs"
 SQS = "crates/server/src/sqs.rs"
 TLS = "crates/server/src/tls.rs"
 PEERS = "crates/server/src/peers.rs"
+PLACEMENT = "crates/core/src/placement.rs"
 METRICS = "crates/server/src/metrics.rs"
 ADMIN = "crates/server/src/admin.rs"
 LOG = "crates/server/src/log.rs"
@@ -477,7 +478,23 @@ MUTANTS = [
     ),
     (
         "held bytes go to a kernel TLS client from an event loop",
-        [(SERVER, "let (copied, relayed) = match connection.kernel_tls() {", "let (copied, relayed) = match false {")],
+        [(SERVER, "let on_workers = connection.kernel_tls() && !whole;", "let on_workers = whole && false;")],
+    ),
+    (
+        "small bodies go to a kernel TLS client from a worker",
+        [(SERVER, "let on_workers = connection.kernel_tls() && !whole;", "let on_workers = connection.kernel_tls() || whole && false;")],
+    ),
+    (
+        "small bodies over kernel TLS links stay in the socket",
+        [(SERVER, "if kernel_tls && want <= zero_copy::INLINE_TLS {", "if false {")],
+    ),
+    (
+        "small kernel TLS hits leave a node from a worker",
+        [(NODE_ENGINE, "true => zero_copy::INLINE_TLS,", "true => 0,")],
+    ),
+    (
+        "rings of one weight rank members by their lowest draw",
+        [(PLACEMENT, "return ranked.max().map(|(_, id)| id);", "return ranked.min().map(|(_, id)| id);")],
     ),
     (
         "nodes accept cluster links with Linux's 200 ms timers",
@@ -1061,7 +1078,7 @@ MUTANTS = [
     ),
     (
         "cached hits wake a worker",
-        [(NODE_ENGINE, "let inline = !connection.kernel_tls()", "let inline = false && !connection.kernel_tls()")],
+        [(NODE_ENGINE, "let inline = total <= most", "let inline = false && total <= most")],
     ),
     (
         "hits the page cache lacks are sent from the event loop",
@@ -1069,7 +1086,7 @@ MUTANTS = [
     ),
     (
         "kernel TLS hits are sent from the event loop",
-        [(NODE_ENGINE, "let inline = !connection.kernel_tls()", "let inline = true")],
+        [(NODE_ENGINE, "true => zero_copy::INLINE_TLS,", "true => zero_copy::INLINE_SEND,")],
     ),
     (
         "the metadata file is rewritten on the event loop",

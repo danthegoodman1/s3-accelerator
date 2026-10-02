@@ -994,6 +994,20 @@ def cmd_logs(args):
     say(f"logs in {run / 'logs'}")
 
 
+def cmd_profile(args):
+    """Samples every CPU of a host for a while, kernel and processes alike,
+    and saves perf's report of where the time went by command, library
+    and function."""
+    setup = load_setup()
+    host = setup.host(args.host)
+    out = run_dir(args.run) / "profiles" / f"{args.name or host.name}.txt"
+    record = (f"sudo perf record -a -g -F 499 -o /tmp/s3accel.perf -- sleep {args.seconds} >/dev/null 2>&1; "
+              "sudo perf report -i /tmp/s3accel.perf --stdio --no-children --sort comm,dso,sym "
+              "--percent-limit 0.2 -g none 2>/dev/null")
+    remote(setup, host, record, log=out)
+    say(f"profile: {out}")
+
+
 def cmd_ssh(args):
     setup = load_setup()
     host = setup.host(args.host)
@@ -1040,6 +1054,11 @@ def main():
                             ("logs", "fetch every process's log for a run")):
         command = commands.add_parser(name, help=help_text)
         command.add_argument("run")
+    profile = commands.add_parser("profile", help="sample a host's CPUs with perf into a run's profiles/")
+    profile.add_argument("run", help="the run whose directory takes the report")
+    profile.add_argument("host", help="its name, such as client-0")
+    profile.add_argument("--seconds", type=int, default=30)
+    profile.add_argument("--name", help="the report's name, the host's by default")
     ssh = commands.add_parser("ssh", help="log in to a host, or run a command there")
     ssh.add_argument("host")
     ssh.add_argument("remote", nargs=argparse.REMAINDER, metavar="command")
@@ -1049,7 +1068,7 @@ def main():
         "inventory": cmd_inventory, "prepare": cmd_prepare, "render": cmd_render, "deploy": cmd_deploy,
         "up": cmd_up, "status": cmd_status, "start": cmd_start, "stop": cmd_stop, "seed": cmd_seed,
         "run": cmd_run, "fault": cmd_fault, "report": cmd_report, "cloudwatch": cmd_cloudwatch,
-        "logs": cmd_logs, "ssh": cmd_ssh,
+        "logs": cmd_logs, "ssh": cmd_ssh, "profile": cmd_profile,
     }
     handlers[args.command](args)
 

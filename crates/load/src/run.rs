@@ -673,7 +673,7 @@ mod tests {
         let plan = Plan::parse(
             "[dataset]\nprefix = \"t\"\nseed = 1\n\
              [[dataset.sets]]\nname = \"small\"\ncount = 10\nsize = \"1KiB\"\n\
-             [[steps]]\nname = \"hits\"\ntarget = \"cache\"\nrequests = 200\n\
+             [[steps]]\nname = \"hits\"\ntarget = \"cache\"\nrequests = 1000\n\
              connections = 1\nverify = \"none\"\n[[steps.reads]]\nset = \"small\"\n",
         )
         .unwrap();
@@ -694,10 +694,12 @@ mod tests {
         let started = Instant::now();
         let result = run(setup).await;
         let took = started.elapsed();
-        assert_eq!(result.classes[0].statuses.get(&200), Some(&200));
+        assert_eq!(result.classes[0].statuses.get(&200), Some(&1000));
+        // A request over loopback takes about 0.5 ms on a busy CI runner,
+        // and a timer would add up to a millisecond to each.
         assert!(
-            took < Duration::from_millis(100),
-            "200 requests took {took:?}"
+            took < Duration::from_millis(700),
+            "1,000 requests took {took:?}"
         );
     }
 

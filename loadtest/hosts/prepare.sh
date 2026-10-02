@@ -14,7 +14,8 @@ monitor=${2:-}
 mount=/mnt/s3accel
 
 export DEBIAN_FRONTEND=noninteractive
-packages=(curl jq mdadm nvme-cli iproute2 sysstat prometheus-node-exporter)
+packages=(curl jq mdadm nvme-cli iproute2 ethtool sysstat prometheus-node-exporter
+          linux-tools-common "linux-tools-$(uname -r)")
 if [ "$monitor" = monitor ]; then
   packages+=(prometheus)
 fi
