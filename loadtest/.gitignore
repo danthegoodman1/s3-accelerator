@@ -1,0 +1,8 @@
+# Hosts, facts, secrets, configs and certificates for one stack.
+/out/
+# Each run's results.
+/runs/
+# Terraform's providers and state, which holds the origin's secret key.
+/terraform/.terraform/
+/terraform/terraform.tfstate*
+/terraform/*.tfvars

@@ -79,7 +79,16 @@ pub struct Origin {
     pub chunked: Cell<bool>,
     /// The access key that signed each request.
     pub keys: RefCell<Vec<String>>,
+    /// Answer the next this many reads with 503 `SlowDown`, as S3 does to
+    /// slow its clients down.
+    pub throttled: Cell<u64>,
+    /// Close the connection without answering the next this many requests.
+    pub unanswered: Cell<u64>,
 }
+
+/// The fake S3's answer to a read it throttles.
+pub const SLOW_DOWN: &str =
+    "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>";
 
 /// The access key ID a request's SigV4 `Authorization` names.
 pub fn signing_key(headers: &[(String, String)]) -> String {
@@ -108,6 +117,8 @@ impl Default for Origin {
             trickle: Cell::default(),
             chunked: Cell::default(),
             keys: RefCell::default(),
+            throttled: Cell::default(),
+            unanswered: Cell::default(),
         }
     }
 }
@@ -169,6 +180,29 @@ async fn fake_origin(listener: TcpListener, origin: Rc<Origin>) {
                 origin.queries.borrow_mut().push(head.query.clone());
                 origin.keys.borrow_mut().push(signing_key(&head.headers));
                 let mut headers = vec![("x-amz-request-id".to_string(), S3_REQUEST_ID.to_string())];
+                if origin.unanswered.get() > 0 {
+                    origin.unanswered.set(origin.unanswered.get() - 1);
+                    return;
+                }
+                if matches!(head.method.as_str(), "GET" | "HEAD") && origin.throttled.get() > 0 {
+                    origin.throttled.set(origin.throttled.get() - 1);
+                    headers.push(("content-type".to_string(), "application/xml".to_string()));
+                    let body = match head.method.as_str() {
+                        "GET" => SLOW_DOWN.as_bytes(),
+                        _ => &[][..],
+                    };
+                    let framing = Framing::Length(body.len() as u64);
+                    let written = async {
+                        connection
+                            .write_response_head(503, &headers, framing, true)
+                            .await?;
+                        connection.write_all(body).await
+                    };
+                    if written.await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 if head.method == "PUT" {
                     let etag = format!("\"written-{}\"", origin.uploads.borrow().len());
                     headers.push(("ETag".to_string(), etag.clone()));
@@ -742,8 +776,20 @@ impl Server {
         Server::start_config(&format!("{origins}\n{clients}"), dir, extra, cache).await
     }
 
-    /// Starts a server whose origins and clients `tables` name.
+    /// Starts a server whose origins and clients `tables` name, with a
+    /// gateway of two event loops.
     pub async fn start_config(tables: &str, dir: &Path, extra: &str, cache: &str) -> Server {
+        Server::start_loops(tables, dir, extra, cache, 2).await
+    }
+
+    /// As `start_config`, with a gateway of `threads` event loops.
+    pub async fn start_loops(
+        tables: &str,
+        dir: &Path,
+        extra: &str,
+        cache: &str,
+        threads: usize,
+    ) -> Server {
         let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let node = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let node_address = node.local_addr().unwrap();
@@ -761,6 +807,7 @@ impl Server {
             [gateway]
             listen = "unused"
             domains = ["s3.test"]
+            threads = {threads}
             [node]
             id = 0
             data_dir = "{}"
@@ -908,6 +955,38 @@ pub async fn send_as(
     (status, response.bytes().await.unwrap().to_vec())
 }
 
+/// A client that keeps one connection to the gateway at `port`, so every
+/// request it sends reaches the same event loop. The gateway hands a new
+/// connection to the loop with the fewest open, so clients connected at
+/// once reach different loops.
+pub struct Pinned {
+    client: reqwest::Client,
+    port: u16,
+}
+
+impl Pinned {
+    pub fn new(port: u16) -> Pinned {
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(1)
+            .build()
+            .unwrap();
+        Pinned { client, port }
+    }
+
+    /// Sends a request `reader` signed, and returns the status and body.
+    pub async fn send(&self, method: &str, path: &str, body: Vec<u8>) -> (u16, Vec<u8>) {
+        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+        let url = format!("http://127.0.0.1:{}{path}", self.port);
+        let mut request = self.client.request(method.clone(), url).body(body);
+        for (name, value) in signed(self.port, method.as_str(), path, "", &[]) {
+            request = request.header(name, value);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        (status, response.bytes().await.unwrap().to_vec())
+    }
+}
+
 /// Sends a signed request and returns the status and body.
 pub async fn send(
     port: u16,
@@ -989,7 +1068,20 @@ pub async fn try_get(port: u16, path: &str) -> Option<(u16, Vec<u8>)> {
 /// A server process, killed if the test ends first.
 pub struct Process(Child);
 
+/// The server's command, with its log lines going to `log`.
+fn logging(config: &Path, log: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_s3-accelerator"));
+    command
+        .arg(config)
+        .stderr(std::fs::File::create(log).unwrap());
+    command
+}
+
 impl Process {
+    pub fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
     pub fn start(config: &Path) -> Process {
         let child = Command::new(env!("CARGO_BIN_EXE_s3-accelerator"))
             .arg(config)
@@ -1000,12 +1092,25 @@ impl Process {
 
     /// Starts the server with its log lines going to `log`.
     pub fn logged(config: &Path, log: &Path) -> Process {
-        let child = Command::new(env!("CARGO_BIN_EXE_s3-accelerator"))
-            .arg(config)
-            .stderr(std::fs::File::create(log).unwrap())
-            .spawn()
-            .unwrap();
-        Process(child)
+        Process(logging(config, log).spawn().unwrap())
+    }
+
+    /// Starts the server with its log lines going to `log`, under soft and
+    /// hard limits of `soft` and `hard` open files.
+    pub fn limited(config: &Path, log: &Path, soft: u64, hard: u64) -> Process {
+        use rustix::process::{Resource, Rlimit, setrlimit};
+        use std::os::unix::process::CommandExt;
+        let limit = Rlimit {
+            current: Some(soft),
+            maximum: Some(hard),
+        };
+        let mut command = logging(config, log);
+        // SAFETY: the child only makes one system call before `exec`, and
+        // allocates nothing.
+        unsafe {
+            command.pre_exec(move || Ok(setrlimit(Resource::Nofile, limit)?));
+        }
+        Process(command.spawn().unwrap())
     }
 
     /// Starts the server under `strace`, which writes the system calls
@@ -1244,7 +1349,8 @@ impl Cluster {
             })
             .collect();
         let gateway = dir.join("gateway.toml");
-        let gateway_role = format!("[gateway]\nlisten = \"127.0.0.1:{gateway_port}\"\n");
+        let gateway_role =
+            format!("[gateway]\nlisten = \"127.0.0.1:{gateway_port}\"\nthreads = 4\n");
         std::fs::write(&gateway, format!("{}\n{gateway_role}", shared(false))).unwrap();
         Cluster {
             gateway_port,
@@ -1267,6 +1373,13 @@ impl Cluster {
         let process = Process::start(&self.node);
         listening(self.node_port).await;
         process
+    }
+
+    /// Runs the gateway with `threads` event loops in place of four.
+    pub fn gateway_threads(&self, threads: usize) {
+        let text = std::fs::read_to_string(&self.gateway).unwrap();
+        let text = text.replace("threads = 4", &format!("threads = {threads}"));
+        std::fs::write(&self.gateway, text).unwrap();
     }
 
     pub async fn start_gateway(&self) -> Process {

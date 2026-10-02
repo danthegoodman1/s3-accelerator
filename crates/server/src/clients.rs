@@ -2,13 +2,15 @@
 //! service, by access key ID.
 
 use crate::config::{Access, Config, Grant};
-use crate::lookups::{Invalidated, Kind, Lookups, Unresolved};
+use crate::lookups::{Kind, Lookups, Unresolved};
 use crate::metrics::Metrics;
 use crate::origin::HttpClient;
 use crate::sigv4::{self, DateKeys};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 /// What a client may do, and what checks its signatures.
@@ -58,11 +60,19 @@ pub struct Clients {
     configured: BTreeMap<String, Rc<Credential>>,
     /// The metadata service, which names every client when set.
     lookups: Option<Rc<Lookups<Rc<Credential>>>>,
-    metrics: Rc<Metrics>,
+    metrics: Arc<Metrics>,
 }
 
 impl Clients {
-    pub fn new(config: &Config, client: HttpClient, metrics: Rc<Metrics>) -> Clients {
+    /// The clients `config` names, or those its metadata service serves,
+    /// looked up with at most `MAX_IN_FLIGHT` lookups under way that
+    /// `in_flight` counts for the process.
+    pub fn new(
+        config: &Config,
+        client: HttpClient,
+        metrics: Arc<Metrics>,
+        in_flight: Arc<AtomicUsize>,
+    ) -> Clients {
         let configured = config
             .clients
             .iter()
@@ -77,7 +87,14 @@ impl Clients {
         Clients {
             configured,
             lookups: config.metadata.as_ref().map(|metadata| {
-                Lookups::new(Kind::Client, metadata, client, parse, metrics.clone())
+                Lookups::new(
+                    Kind::Client,
+                    metadata,
+                    client,
+                    parse,
+                    metrics.clone(),
+                    in_flight,
+                )
             }),
             metrics,
         }
@@ -96,19 +113,11 @@ impl Clients {
         Ok(credential)
     }
 
-    /// Checks the service's invalidation of `access_key_id`, sent to
-    /// `path`, and drops the client's entry.
-    pub fn invalidate(
-        &self,
-        access_key_id: &str,
-        path: &str,
-        time: &str,
-        signature: &str,
-        now: i64,
-    ) -> Invalidated {
-        match &self.lookups {
-            Some(lookups) => lookups.invalidate(access_key_id, path, time, signature, now),
-            None => Invalidated::NoService,
+    /// Drops the client's entry, for an invalidation the admin listener
+    /// checked.
+    pub fn forget(&self, access_key_id: &str) {
+        if let Some(lookups) = &self.lookups {
+            lookups.forget(access_key_id);
         }
     }
 }
@@ -191,8 +200,8 @@ mod tests {
             .build()
             .unwrap();
         for (name, config) in [("config", from_config), ("service", from_service)] {
-            let metrics = Rc::new(Metrics::default());
-            let clients = Clients::new(&config, crate::origin::client(), metrics);
+            let metrics = Arc::new(Metrics::default());
+            let clients = Clients::new(&config, crate::origin::client(), metrics, Arc::default());
             if let Some(lookups) = &clients.lookups {
                 for index in 0..100 {
                     let credential = Rc::new(Credential {

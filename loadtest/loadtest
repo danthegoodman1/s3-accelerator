@@ -1,0 +1,989 @@
+#!/usr/bin/env python3
+"""Drives the load test over SSH: prepares the hosts Terraform made,
+renders each process's config, deploys the binaries, seeds the dataset
+into S3, and runs a plan's steps from every client host at once, injecting
+faults and collecting each step's results, metrics and kernel counters.
+
+    loadtest/loadtest up                          # inventory, prepare, render, deploy
+    loadtest/loadtest seed PLAN [--resume]
+    loadtest/loadtest run PLAN [--steps A,B] [--name NAME]
+    loadtest/loadtest cloudwatch RUN              # S3's request metrics per step
+    loadtest/loadtest report RUN
+    loadtest/loadtest status | start | stop
+    loadtest/loadtest fault kill|stop|start|restart|leave NODE
+    loadtest/loadtest logs RUN | ssh HOST [COMMAND...]
+    loadtest/loadtest inventory [--file FILE] | prepare | render | deploy [--binaries DIR]
+
+`--dry-run` prints each remote command instead of running it, and renders
+from placeholder facts when hosts have not reported theirs. Everything it
+writes goes in loadtest/out (hosts, facts, secrets, configs) and
+loadtest/runs (each run's results). See loadtest/README.md.
+"""
+
+import argparse
+import concurrent.futures
+import datetime
+import json
+import os
+import secrets as tokens
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+REPO = ROOT.parent
+OUT = ROOT / "out"
+RUNS = ROOT / "runs"
+BIN = "/opt/s3accel/bin"
+ETC = "/opt/s3accel/etc"
+RESULTS = "/var/lib/s3accel-load"
+DATA = "/mnt/s3accel/data"
+GATEWAY_PORT = 9000
+NODE_PORT = 9400
+NODE_ADMIN = 9401
+GATEWAY_ADMIN = 9402
+PROMETHEUS = "/etc/prometheus/prometheus.yml"
+GIB = 1 << 30
+
+dry_run = False
+print_lock = threading.Lock()
+
+
+def say(*parts):
+    with print_lock:
+        print(*parts, flush=True)
+
+
+# ---------------------------------------------------------------- hosts
+
+
+@dataclass
+class Host:
+    name: str
+    public_ip: str
+    private_ip: str
+    role: str  # "node" or "client"
+    instance_type: str = ""
+    standby: bool = False
+    index: int = 0
+
+
+@dataclass
+class Process:
+    """A server process: a storage node (with a gateway when gateways run
+    on nodes), or a gateway on a client host. A node host runs
+    `nodes_per_host` storage nodes, each its own ring member."""
+    name: str
+    host: Host
+    unit: str  # the systemd instance: s3accel@node, s3accel@node-1 or s3accel@gateway
+    admin: str
+    node: bool
+    gateway: bool
+    node_id: int = 0
+    port: int = NODE_PORT
+    data_dir: str = DATA
+
+    @property
+    def service(self):
+        return f"s3accel@{self.unit}"
+
+
+@dataclass
+class Setup:
+    settings: dict
+    inventory: dict
+    nodes: list = field(default_factory=list)
+    clients: list = field(default_factory=list)
+
+    @property
+    def hosts(self):
+        return self.nodes + self.clients
+
+    @property
+    def active_nodes(self):
+        return [host for host in self.nodes if not host.standby]
+
+    @property
+    def monitor(self):
+        return self.clients[0] if self.clients else self.nodes[0]
+
+    @property
+    def nodes_per_host(self):
+        return self.settings["topology"].get("nodes_per_host", 1)
+
+    def processes(self):
+        on_nodes = self.settings["topology"]["gateways"] == "nodes"
+        per_host = self.nodes_per_host
+        processes = []
+        for host in self.nodes:
+            for slot in range(per_host):
+                one = per_host == 1
+                processes.append(Process(
+                    host.name if one else f"{host.name}.{slot}", host, "node" if one else f"node-{slot}",
+                    f"{host.private_ip}:{NODE_ADMIN + 10 * slot}", True, on_nodes and slot == 0,
+                    node_id=host.index * per_host + slot, port=NODE_PORT + 10 * slot,
+                    data_dir=DATA if one else f"{DATA}-{slot}"))
+        if not on_nodes:
+            processes += [
+                Process(f"gateway-{host.index}", host, "gateway", f"{host.private_ip}:{GATEWAY_ADMIN}", False, True)
+                for host in self.clients
+            ]
+        return processes
+
+    def node(self, name):
+        for host in self.nodes:
+            if name in (host.name, str(host.index)):
+                return host
+        sys.exit(f"no storage node {name}; the nodes are {', '.join(h.name for h in self.nodes)}")
+
+    def host(self, name):
+        for host in self.hosts:
+            if host.name == name:
+                return host
+        sys.exit(f"no host {name}")
+
+
+def load_setup():
+    settings = tomllib.loads((ROOT / "settings.toml").read_text())
+    path = OUT / "inventory.json"
+    if not path.exists():
+        sys.exit("no loadtest/out/inventory.json: run `loadtest inventory` first")
+    inventory = json.loads(path.read_text())
+    setup = Setup(settings, inventory)
+    for index, node in enumerate(inventory["nodes"]):
+        setup.nodes.append(Host(node["name"], node["public_ip"], node["private_ip"], "node",
+                                node.get("instance_type", ""), node.get("standby", False), index))
+    for index, client in enumerate(inventory["clients"]):
+        setup.clients.append(Host(client["name"], client["public_ip"], client["private_ip"], "client",
+                                  client.get("instance_type", ""), False, index))
+    if not setup.active_nodes or not setup.clients:
+        sys.exit("the inventory needs a storage node that is not on standby, and a client host")
+    return setup
+
+
+# ---------------------------------------------------------------- remote commands
+
+
+def ssh_options(setup):
+    control = Path(tempfile.gettempdir()) / "s3accel-ssh-%C"
+    options = [
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", f"UserKnownHostsFile={OUT / 'known_hosts'}",
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={control}",
+        "-o", "ControlPersist=15m",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ConnectTimeout=15",
+    ]
+    key = setup.settings.get("ssh", {}).get("key", "")
+    if key:
+        options += ["-i", str(Path(key).expanduser())]
+    return options
+
+
+def target(setup, host):
+    return f"{setup.inventory.get('ssh_user', 'ubuntu')}@{host.public_ip}"
+
+
+def remote(setup, host, command, check=True, log=None, stdin=None):
+    """Runs `command` on `host` through bash, returning its standard output.
+    With `log`, output goes to that file instead."""
+    if dry_run:
+        say(f"[{host.name}] {command}")
+        return ""
+    ssh = ["ssh", *ssh_options(setup), target(setup, host), f"bash -c {shlex.quote(command)}"]
+    if log:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "w") as out:
+            done = subprocess.run(ssh, stdout=out, stderr=subprocess.STDOUT, input=stdin, text=True)
+        output = ""
+    else:
+        done = subprocess.run(ssh, capture_output=True, input=stdin, text=True)
+        output = done.stdout
+    if check and done.returncode != 0:
+        detail = f"; see {log}" if log else f": {done.stderr.strip()[-2000:]}"
+        raise RuntimeError(f"{host.name}: `{command[:120]}` exited {done.returncode}{detail}")
+    return output
+
+
+def upload(setup, host, files, directory, mode="600", owner="root"):
+    """Copies local `files` into `directory` on `host`, as `owner` with
+    `mode`."""
+    if dry_run:
+        say(f"[{host.name}] install {' '.join(Path(f).name for f in files)} -> {directory}")
+        return
+    staging = f"/tmp/s3accel-upload-{tokens.token_hex(4)}"
+    remote(setup, host, f"mkdir -p {staging}")
+    subprocess.run(["scp", "-q", *ssh_options(setup), *map(str, files), f"{target(setup, host)}:{staging}/"],
+                   check=True)
+    names = " ".join(shlex.quote(f"{staging}/{Path(f).name}") for f in files)
+    remote(setup, host, f"sudo mkdir -p {directory} && sudo install -o {owner} -m {mode} {names} {directory}/ "
+                        f"&& rm -rf {staging}")
+
+
+def download(setup, host, path, local):
+    if dry_run:
+        say(f"[{host.name}] fetch {path} -> {local}")
+        return
+    local.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["scp", "-q", *ssh_options(setup), f"{target(setup, host)}:{path}", str(local)], check=True)
+
+
+def parallel(items, work):
+    """Runs `work` on every item at once; raises the first failure once all
+    have finished."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(64, len(items)))) as pool:
+        futures = [pool.submit(work, item) for item in items]
+        results, failures = [], []
+        for future in futures:
+            try:
+                results.append(future.result())
+            except Exception as error:  # noqa: BLE001 - reported below
+                failures.append(error)
+                results.append(None)
+    if failures:
+        raise RuntimeError("; ".join(map(str, failures)))
+    return results
+
+
+def local(command, **options):
+    say("$ " + " ".join(map(shlex.quote, command)))
+    return subprocess.run(command, check=True, **options)
+
+
+# ---------------------------------------------------------------- inventory, prepare, render
+
+
+def cmd_inventory(args):
+    OUT.mkdir(exist_ok=True)
+    secrets = read_secrets()
+    if args.file:
+        inventory = json.loads(Path(args.file).read_text())
+        for name in ("ORIGIN_ACCESS_KEY_ID", "ORIGIN_SECRET_ACCESS_KEY"):
+            if name not in os.environ:
+                sys.exit(f"with --file, {name} names the origin's key")
+        secrets["origin_access_key_id"] = os.environ["ORIGIN_ACCESS_KEY_ID"]
+        secrets["origin_secret_access_key"] = os.environ["ORIGIN_SECRET_ACCESS_KEY"]
+    else:
+        text = subprocess.run(["terraform", f"-chdir={ROOT / 'terraform'}", "output", "-json"],
+                              check=True, capture_output=True, text=True).stdout
+        outputs = json.loads(text)
+        if "inventory" not in outputs:
+            sys.exit("terraform has no outputs yet: run `terraform apply` in loadtest/terraform")
+        inventory = outputs["inventory"]["value"]
+        secrets["origin_access_key_id"] = outputs["origin_access_key_id"]["value"]
+        secrets["origin_secret_access_key"] = outputs["origin_secret_access_key"]["value"]
+    for key in ("region", "bucket", "nodes", "clients"):
+        if key not in inventory:
+            sys.exit(f"the inventory lacks {key}")
+    (OUT / "inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
+    write_secrets(secrets)
+    say(f"{len(inventory['nodes'])} storage nodes and {len(inventory['clients'])} client hosts; "
+        f"bucket {inventory['bucket']} in {inventory['region']}")
+
+
+def read_secrets():
+    path = OUT / "secrets.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def write_secrets(secrets):
+    OUT.mkdir(exist_ok=True)
+    path = OUT / "secrets.json"
+    path.touch(mode=0o600, exist_ok=True)
+    path.chmod(0o600)
+    path.write_text(json.dumps(secrets, indent=2) + "\n")
+
+
+def cmd_prepare(args):
+    setup = load_setup()
+    script = ROOT / "hosts" / "prepare.sh"
+    monitor = setup.monitor
+
+    def prepare(host):
+        flag = " monitor" if host is monitor else ""
+        output = remote(setup, host, f"sudo bash -s {host.role}{flag}", stdin=script.read_text())
+        say(f"{host.name}: prepared")
+        return host.name, json.loads(output.strip().splitlines()[-1]) if output.strip() else {}
+
+    facts = dict(parallel(setup.hosts, prepare))
+    if not dry_run:
+        (OUT / "facts.json").write_text(json.dumps(facts, indent=2) + "\n")
+        for name, fact in facts.items():
+            if not fact.get("kernel_tls"):
+                say(f"warning: {name} runs Linux {fact.get('kernel')} without kernel TLS; TLS runs in userspace")
+
+
+def facts_for(setup):
+    path = OUT / "facts.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    if not dry_run:
+        sys.exit("no loadtest/out/facts.json: run `loadtest prepare` first")
+    # Placeholders, so a dry run renders something to read.
+    return {host.name: {"cache_bytes": 3_500 * GIB if host.role == "node" else 0,
+                        "memory_bytes": 128 * GIB, "cpus": 16, "kernel": "7.0"} for host in setup.hosts}
+
+
+def size(text):
+    if isinstance(text, int):
+        return text
+    units = {"KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40, "B": 1}
+    for unit, scale in units.items():
+        if text.endswith(unit):
+            return int(text[: -len(unit)].replace("_", "")) * scale
+    return int(text)
+
+
+def toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{key} = {toml_value(item)}" for key, item in value.items()) + " }"
+    raise TypeError(value)
+
+
+def toml_table(name, values):
+    lines = [f"[{name}]"] if name else []
+    lines += [f"{key} = {toml_value(value)}" for key, value in values.items()]
+    return "\n".join(lines) + "\n"
+
+
+def cache_bytes(setup, facts, host):
+    """The cache on `host`, which its storage nodes share: `cache_gib` from
+    the settings, or the filesystem's free space less the slot tables, a
+    64th of the slabs, and a margin for the metadata files."""
+    configured = setup.settings["cache"].get("cache_gib", 0)
+    block = size(setup.settings["cache"]["block_size"])
+    if configured:
+        total = configured * GIB
+    else:
+        free = facts.get(host.name, {}).get("cache_bytes", 0)
+        total = int(free * 0.92 * 64 / 65)
+    return total // block * block
+
+
+def render(setup, facts, secrets):
+    settings, inventory = setup.settings, setup.inventory
+    cache = settings["cache"]
+    tls = settings["topology"].get("tls", False)
+    bucket, region = inventory["bucket"], inventory["region"]
+    configs = OUT / "configs"
+    shutil.rmtree(configs, ignore_errors=True)
+    configs.mkdir(parents=True)
+    if tls:
+        make_certificates(setup)
+
+    per_host = setup.nodes_per_host
+
+    def slab(host):
+        block = size(cache["block_size"])
+        return cache_bytes(setup, facts, host) // per_host // block * block
+
+    def members(extra=None):
+        hosts = setup.active_nodes + ([extra] if extra and extra.standby else [])
+        return [{"id": p.node_id, "address": f"{p.host.private_ip}:{p.port}", "weight": max(1, slab(p.host) // GIB)}
+                for p in setup.processes() if p.node and p.host in hosts]
+
+    shared_cache = {
+        "block_size": size(cache["block_size"]),
+        "chunk_blocks": cache["chunk_blocks"],
+        "read_ahead": size(cache["read_ahead"]),
+        "gateway_metadata_capacity": cache["gateway_metadata_capacity"],
+        "hot_threshold": cache["hot_threshold"],
+    }
+    policy = {"immutable": cache["immutable"], "admit_on_first_read": cache["admit_on_first_read"]}
+    if not cache["immutable"]:
+        policy = {"ttl_ms": cache.get("ttl_ms", 5_000), "admit_on_first_read": cache["admit_on_first_read"]}
+    clients = [{"access_key_id": secrets["client_access_key_id"],
+                "secret_access_key": secrets["client_secret_access_key"],
+                "grants": [{"bucket": bucket, "access": "write"}]}]
+    membership = settings.get("membership", {})
+    warned = []
+    for process in setup.processes():
+        host = process.host
+        parts = []
+        if process.node:
+            parts.append(toml_table("origin", {
+                "endpoint": f"https://s3.{region}.amazonaws.com",
+                "region": region,
+                "access_key_id": secrets["origin_access_key_id"],
+                "secret_access_key": secrets["origin_secret_access_key"],
+            }))
+        if process.gateway:
+            for client in clients:
+                parts.append("[[clients]]\n" + toml_table("", client))
+        values = dict(shared_cache)
+        if process.node:
+            values.update({
+                "extents": slab(host) // size(cache["block_size"]),
+                "fill_budget": size(cache["fill_budget"]),
+                "metadata_capacity": cache["metadata_capacity"],
+            })
+            memory = facts.get(host.name, {}).get("memory_bytes", 0)
+            cached = cache_bytes(setup, facts, host)
+            if memory and cached / 4096 * 310 > memory / 2 and not warned:
+                warned.append(host.name)
+                say(f"note: {host.name}'s index would need {cached / 4096 * 310 / GIB:.0f} GiB of its "
+                    f"{memory / GIB:.0f} GiB of memory if its {cached / GIB:.0f} GiB cache held only 4 KiB objects; "
+                    "set cache_gib lower for workloads of small objects")
+        parts.append(toml_table("cache", values))
+        parts.append(toml_table(f"cache.buckets.{json.dumps(bucket)}", policy))
+        parts.append(toml_table("cluster", {"secret": secrets["cluster_secret"],
+                                            "nodes": members(host if process.node else None)}))
+        if membership:
+            parts.append(toml_table("cluster.membership", membership))
+        if tls:
+            parts.append(toml_table("cluster.tls", {"ca": f"{ETC}/ca.pem", "cert": f"{ETC}/host.pem",
+                                                    "key": f"{ETC}/host-key.pem"}))
+        if process.node:
+            parts.append(toml_table("node", {"id": process.node_id, "data_dir": process.data_dir}))
+        if process.gateway:
+            listen = f"127.0.0.1:{GATEWAY_PORT}" if not process.node else f"0.0.0.0:{GATEWAY_PORT}"
+            parts.append(toml_table("gateway", {"listen": listen}))
+            if tls:
+                parts.append(toml_table("gateway.tls", {"cert": f"{ETC}/host.pem", "key": f"{ETC}/host-key.pem"}))
+        parts.append(toml_table("admin", {"listen": process.admin}))
+        parts.append(toml_table("log", {"level": settings.get("log", {}).get("level", "info")}))
+        path = configs / f"{process.name}.toml"
+        path.write_text("# Rendered by loadtest/loadtest render.\n\n" + "\n".join(parts))
+        path.chmod(0o600)
+    env = OUT / "env"
+    env.mkdir(exist_ok=True)
+    for name, (key_id, secret) in {
+        "cache": (secrets["client_access_key_id"], secrets["client_secret_access_key"]),
+        "s3": (secrets["origin_access_key_id"], secrets["origin_secret_access_key"]),
+    }.items():
+        path = env / f"{name}.env"
+        path.write_text(f"AWS_ACCESS_KEY_ID={key_id}\nAWS_SECRET_ACCESS_KEY={secret}\nAWS_REGION={region}\n")
+        path.chmod(0o600)
+    targets = [f"      - targets: ['{p.admin}']\n        labels: {{process: '{p.name}'}}\n"
+               for p in setup.processes()]
+    exporters = ", ".join(f"'{host.private_ip}:9100'" for host in setup.hosts)
+    (OUT / "prometheus.yml").write_text(
+        "global:\n  scrape_interval: 5s\nscrape_configs:\n  - job_name: s3accel\n    static_configs:\n"
+        + "".join(targets)
+        + f"  - job_name: hosts\n    static_configs:\n      - targets: [{exporters}]\n")
+    say(f"rendered {len(setup.processes())} configs in {configs}")
+
+
+def make_certificates(setup):
+    """A CA, and a certificate for each host naming its private address,
+    127.0.0.1 and localhost, which both its gateway and its cluster links
+    present."""
+    directory = OUT / "tls"
+    directory.mkdir(exist_ok=True)
+    ec = ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes"]
+    ca, ca_key = directory / "ca.pem", directory / "ca-key.pem"
+    if not ca.exists():
+        subprocess.run(["openssl", "req", "-x509", *ec, "-days", "30", "-subj", "/CN=s3accel load test CA",
+                        "-keyout", ca_key, "-out", ca], check=True, capture_output=True)
+    for host in setup.hosts:
+        cert, key = directory / f"{host.name}.pem", directory / f"{host.name}-key.pem"
+        if cert.exists():
+            continue
+        csr, ext = directory / f"{host.name}.csr", directory / f"{host.name}.ext"
+        subprocess.run(["openssl", "req", *ec, "-subj", f"/CN={host.name}", "-keyout", key, "-out", csr],
+                       check=True, capture_output=True)
+        ext.write_text(f"subjectAltName=IP:{host.private_ip},IP:127.0.0.1,DNS:localhost\n"
+                       "basicConstraints=critical,CA:FALSE\n")
+        subprocess.run(["openssl", "x509", "-req", "-in", csr, "-CA", ca, "-CAkey", ca_key, "-days", "30",
+                        "-extfile", ext, "-out", cert], check=True, capture_output=True)
+        csr.unlink()
+        ext.unlink()
+    for key in directory.glob("*key.pem"):
+        key.chmod(0o600)
+
+
+def cmd_render(args):
+    setup = load_setup()
+    secrets = read_secrets()
+    for name in ("origin_access_key_id", "origin_secret_access_key"):
+        if name not in secrets:
+            sys.exit("no origin key in loadtest/out/secrets.json: run `loadtest inventory` first")
+    secrets.setdefault("cluster_secret", tokens.token_hex(32))
+    secrets.setdefault("client_access_key_id", "loadtest")
+    secrets.setdefault("client_secret_access_key", tokens.token_hex(20))
+    write_secrets(secrets)
+    render(setup, facts_for(setup), secrets)
+
+
+# ---------------------------------------------------------------- deploy, start, stop
+
+
+def binaries(args):
+    if getattr(args, "binaries", None):
+        directory = Path(args.binaries)
+    else:
+        local(["cargo", "build", "--release", "-p", "s3-accelerator", "-p", "s3-accelerator-load"], cwd=REPO)
+        directory = REPO / "target" / "release"
+    found = [directory / "s3-accelerator", directory / "s3-accelerator-load"]
+    for path in found:
+        if not path.exists() and not dry_run:
+            sys.exit(f"no {path}")
+    return found
+
+
+def cmd_deploy(args):
+    setup = load_setup()
+    built = binaries(args)
+    tls = setup.settings["topology"].get("tls", False)
+    processes = setup.processes()
+    stop(setup, processes)
+
+    def install(host):
+        upload(setup, host, built, BIN, mode="755")
+        renamed = []
+        staging = Path(tempfile.mkdtemp())
+        for process in [p for p in processes if p.host is host]:
+            copy = staging / f"{process.unit}.toml"
+            shutil.copy(OUT / "configs" / f"{process.name}.toml", copy)
+            renamed.append(copy)
+        if host.role == "client":
+            renamed += [OUT / "env" / "cache.env", OUT / "env" / "s3.env"]
+        if tls:
+            for source, name in ((OUT / "tls" / "ca.pem", "ca.pem"),
+                                 (OUT / "tls" / f"{host.name}.pem", "host.pem"),
+                                 (OUT / "tls" / f"{host.name}-key.pem", "host-key.pem")):
+                copy = staging / name
+                shutil.copy(source, copy)
+                renamed.append(copy)
+        if renamed:
+            upload(setup, host, renamed, ETC)
+        if tls and host.role == "client":
+            # The load generator reads the CA as the login user.
+            remote(setup, host, f"sudo chmod 644 {ETC}/ca.pem")
+        if host.role == "client":
+            remote(setup, host, f"sudo chown $(id -u) {ETC}/cache.env {ETC}/s3.env {RESULTS}")
+        shutil.rmtree(staging)
+        say(f"{host.name}: installed")
+
+    parallel(setup.hosts, install)
+    upload(setup, setup.monitor, [OUT / "prometheus.yml"], str(Path(PROMETHEUS).parent), mode="644")
+    remote(setup, setup.monitor, "sudo systemctl restart prometheus", check=False)
+    start(setup, processes)
+
+
+def ready(setup, process, limit=600):
+    """Waits until `process` answers /readyz, and returns how long it took."""
+    started = time.monotonic()
+    command = f"curl -s -o /dev/null -w '%{{http_code}}' http://{process.admin}/readyz"
+    while True:
+        code = remote(setup, process.host, command, check=False).strip()
+        if dry_run or code == "200":
+            return time.monotonic() - started
+        if time.monotonic() - started > limit:
+            raise RuntimeError(f"{process.name} is not ready after {limit} s")
+        time.sleep(1)
+
+
+def start(setup, processes):
+    """Starts storage nodes that are not on standby, then gateways."""
+    nodes = [p for p in processes if p.node and not p.host.standby]
+    gateways = [p for p in processes if not p.node]
+
+    def begin(process):
+        remote(setup, process.host, f"sudo systemctl reset-failed {process.service} 2>/dev/null; "
+                                    f"sudo systemctl start {process.service}")
+        seconds = ready(setup, process)
+        say(f"{process.name}: ready after {seconds:.1f} s")
+
+    parallel(nodes, begin)
+    parallel(gateways, begin)
+
+
+def stop(setup, processes):
+    parallel(processes, lambda p: remote(setup, p.host, f"sudo systemctl stop {p.service}", check=False))
+
+
+def cmd_start(args):
+    setup = load_setup()
+    start(setup, setup.processes())
+
+
+def cmd_stop(args):
+    setup = load_setup()
+    stop(setup, setup.processes())
+
+
+def cmd_up(args):
+    if args.file or not (OUT / "inventory.json").exists() or args.refresh:
+        cmd_inventory(args)
+    cmd_prepare(args)
+    cmd_render(args)
+    cmd_deploy(args)
+
+
+def cmd_status(args):
+    setup = load_setup()
+
+    def check(process):
+        active = remote(setup, process.host, f"systemctl is-active {process.service}", check=False).strip()
+        code = remote(setup, process.host,
+                      f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 5 http://{process.admin}/readyz",
+                      check=False).strip()
+        ring = remote(setup, process.host,
+                      f"curl -s --max-time 5 http://{process.admin}/metrics | grep '^s3accel_ring_nodes'",
+                      check=False).strip().replace("\n", " ")
+        return f"{process.name:<12} {active:<9} readyz {code or '-':<4} {ring}"
+
+    for line in parallel(setup.processes(), check):
+        say(line)
+
+
+# ---------------------------------------------------------------- faults
+
+
+def fault(setup, action, host):
+    """Carries out `action` on every storage node on host `host`, and says
+    how it went."""
+    processes = [p for p in setup.processes() if p.host is host and p.node]
+    service = " ".join(p.service for p in processes)
+    if action == "kill":
+        remote(setup, host, f"sudo systemctl kill -s SIGKILL {service}")
+        return "killed"
+    if action == "stop":
+        remote(setup, host, f"sudo systemctl stop {service}")
+        return "stopped"
+    if action == "leave":
+        remote(setup, host, f"sudo systemctl kill -s SIGUSR1 --kill-whom=main {service}")
+        return "leaving"
+    if action == "restart":
+        remote(setup, host, f"sudo systemctl stop {service}")
+    if action in ("start", "restart"):
+        started = time.monotonic()
+        remote(setup, host, f"sudo systemctl reset-failed {service} 2>/dev/null; sudo systemctl start {service}")
+        for process in processes:
+            ready(setup, process)
+        return f"ready after {time.monotonic() - started:.1f} s"
+    raise ValueError(action)
+
+
+def cmd_fault(args):
+    setup = load_setup()
+    say(fault(setup, args.action, setup.node(args.node)))
+
+
+def restore(setup):
+    """Starts every storage node not on standby that a fault left stopped."""
+    def check(process):
+        state = remote(setup, process.host, f"systemctl is-active {process.service}", check=False).strip()
+        if state != "active" and not dry_run:
+            say(f"{process.name} is {state}; starting it")
+            remote(setup, process.host, f"sudo systemctl reset-failed {process.service} 2>/dev/null; "
+                                        f"sudo systemctl start {process.service}")
+            ready(setup, process)
+
+    parallel([p for p in setup.processes() if p.node and not p.host.standby], check)
+
+
+# ---------------------------------------------------------------- seed and run
+
+
+def load_binary():
+    path = REPO / "target" / "release" / "s3-accelerator-load"
+    if not path.exists():
+        local(["cargo", "build", "--release", "-p", "s3-accelerator-load"], cwd=REPO)
+    return path
+
+
+def push_plan(setup, plan, name):
+    staging = Path(tempfile.mkdtemp())
+    copy = staging / f"{name}.toml"
+    shutil.copy(plan, copy)
+    parallel(setup.clients, lambda host: upload(setup, host, [copy], f"{ETC}/plans", mode="644"))
+    shutil.rmtree(staging)
+    return f"{ETC}/plans/{name}.toml"
+
+
+def cmd_seed(args):
+    setup = load_setup()
+    plan = Path(args.plan)
+    local([str(load_binary()), "check", str(plan)])
+    remote_plan = push_plan(setup, plan, plan.stem)
+    region, bucket = setup.inventory["region"], setup.inventory["bucket"]
+    hosts = len(setup.clients)
+    logs = RUNS / "seed"
+
+    def seed(host):
+        command = (f"set -a; . {ETC}/s3.env; set +a; exec {BIN}/s3-accelerator-load seed {remote_plan} "
+                   f"--bucket {bucket} --endpoint https://s3.{region}.amazonaws.com "
+                   f"--host {host.index} --hosts {hosts} --connections {args.connections}"
+                   + (" --resume" if args.resume else ""))
+        remote(setup, host, command, log=logs / f"{host.name}.log")
+        say(f"{host.name}: seeded its share; log in {logs / (host.name + '.log')}")
+
+    parallel(setup.clients, seed)
+
+
+def snapshot(setup, run, step, moment):
+    """Saves every process's /metrics and every host's kernel counters."""
+    counters = ("echo '== time'; date +%s.%N; echo '== cpu'; head -1 /proc/stat; echo '== net'; cat /proc/net/dev; "
+                f"echo '== devices'; cat {ETC}/cache-devices 2>/dev/null; echo '== disk'; cat /proc/diskstats")
+
+    def metrics(process):
+        text = remote(setup, process.host, f"curl -s --max-time 10 http://{process.admin}/metrics", check=False)
+        path = run / "metrics" / step / f"{process.name}.{moment}.prom"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def kernel(host):
+        path = run / "hosts" / step / f"{host.name}.{moment}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(remote(setup, host, counters, check=False))
+
+    parallel(setup.processes(), metrics)
+    parallel(setup.hosts, kernel)
+
+
+def endpoints(setup, target):
+    if target == "s3":
+        return [f"https://s3.{setup.inventory['region']}.amazonaws.com"]
+    scheme = "https" if setup.settings["topology"].get("tls", False) else "http"
+    if setup.settings["topology"]["gateways"] == "nodes":
+        return [f"{scheme}://{host.private_ip}:{GATEWAY_PORT}" for host in setup.active_nodes]
+    return [f"{scheme}://127.0.0.1:{GATEWAY_PORT}"]
+
+
+def git_summary():
+    try:
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO, capture_output=True,
+                                text=True, check=True).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain"], cwd=REPO, capture_output=True,
+                               text=True).stdout.strip()
+        return commit + (" with uncommitted changes" if dirty else "")
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def cmd_run(args):
+    setup = load_setup()
+    plan = Path(args.plan)
+    binary = load_binary()
+    steps = json.loads(subprocess.run([str(binary), "steps", str(plan)], check=True, capture_output=True,
+                                      text=True).stdout)
+    if args.steps:
+        wanted = args.steps.split(",")
+        missing = set(wanted) - {step["name"] for step in steps}
+        if missing:
+            sys.exit(f"the plan has no step {', '.join(sorted(missing))}")
+        steps = [step for step in steps if step["name"] in wanted]
+    name = args.name or f"{plan.stem}-{datetime.datetime.now():%Y%m%d-%H%M%S}"
+    run = RUNS / name
+    run.mkdir(parents=True, exist_ok=bool(args.name))
+    shutil.copy(plan, run / "plan.toml")
+    remote_plan = push_plan(setup, plan, name)
+    settings, facts = setup.settings, facts_for(setup)
+    node_type = setup.nodes[0].instance_type
+    cache_gib = sum(cache_bytes(setup, facts, host) for host in setup.active_nodes) / GIB
+    info = {
+        "name": name,
+        "plan": str(plan),
+        "summary": [
+            f"Commit {git_summary()}.",
+            f"{len(setup.active_nodes)} storage nodes ({node_type}), {cache_gib:,.0f} GiB of cache in all; "
+            f"{len(setup.nodes) - len(setup.active_nodes)} on standby.",
+            f"{len(setup.clients)} client hosts ({setup.clients[0].instance_type}); gateways on "
+            f"{settings['topology']['gateways']}, TLS {'on' if settings['topology'].get('tls') else 'off'}.",
+            f"Bucket {setup.inventory['bucket']} in {setup.inventory['region']}; block size "
+            f"{settings['cache']['block_size']}, admit on first read "
+            f"{'on' if settings['cache']['admit_on_first_read'] else 'off'}.",
+            "Kernels: " + ", ".join(sorted({fact.get('kernel', '?') for fact in facts.values()})) + ".",
+        ],
+        "steps": [],
+    }
+    (run / "run.json").write_text(json.dumps(info, indent=2) + "\n")
+    hosts = len(setup.clients)
+    tls = settings["topology"].get("tls", False)
+    for step in steps:
+        say(f"== {step['name']}")
+        restore(setup)
+        if step["drop_page_cache"]:
+            parallel(setup.nodes, lambda host: remote(
+                setup, host, "sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null"))
+        snapshot(setup, run, step["name"], "before")
+        start_at = int(time.time() * 1000) + 15_000
+        record = {"name": step["name"], "start_unix_ms": start_at + int(step["warmup"] * 1000), "faults": []}
+
+        def inject(planned):
+            time.sleep(max(0.0, start_at / 1000 + planned["at"] - time.time()))
+            host = setup.nodes[planned["node"]]
+            try:
+                outcome = fault(setup, planned["action"], host)
+            except Exception as error:  # noqa: BLE001 - recorded in the run
+                outcome = f"failed: {error}"
+            say(f"{step['name']}: {planned['action']} {host.name} at {planned['at']:.0f} s: {outcome}")
+            record["faults"].append({"at_seconds": planned["at"], "action": planned["action"],
+                                     "node": host.name, "outcome": outcome})
+
+        injectors = [threading.Thread(target=inject, args=(planned,), daemon=True) for planned in step["faults"]]
+        for injector in injectors:
+            injector.start()
+        flags = " ".join(f"--endpoint {url}" for url in endpoints(setup, step["target"]))
+        if tls and step["target"] == "cache":
+            flags += f" --ca {ETC}/ca.pem"
+        env = "cache" if step["target"] == "cache" else "s3"
+        out = f"{RESULTS}/{name}/{step['name']}.json"
+
+        def generate(host):
+            command = (f"set -a; . {ETC}/{env}.env; set +a; exec {BIN}/s3-accelerator-load run {remote_plan} "
+                       f"{step['name']} --bucket {setup.inventory['bucket']} {flags} --host {host.index} "
+                       f"--hosts {hosts} --start-at {start_at} --run {name} --out {out}")
+            remote(setup, host, command, log=run / "logs" / step["name"] / f"{host.name}.log")
+            download(setup, host, out, run / "results" / step["name"] / f"{host.name}.json")
+
+        try:
+            parallel(setup.clients, generate)
+        except KeyboardInterrupt:
+            parallel(setup.clients, lambda host: remote(setup, host, "pkill -f s3-accelerator-load", check=False))
+            raise
+        record["end_unix_ms"] = int(time.time() * 1000)
+        for injector in injectors:
+            injector.join()
+        snapshot(setup, run, step["name"], "after")
+        info["steps"].append(record)
+        (run / "run.json").write_text(json.dumps(info, indent=2) + "\n")
+    report(run)
+    say(f"results in {run}; S3's own request counts arrive in CloudWatch within minutes: "
+        f"`loadtest cloudwatch {name}` then `loadtest report {name}`")
+
+
+def report(run):
+    if dry_run:
+        return
+    subprocess.run([str(load_binary()), "report", str(run)], check=True, stdout=subprocess.DEVNULL)
+    say(f"report: {run / 'report.md'}")
+
+
+def run_dir(name):
+    path = Path(name) if Path(name).is_dir() else RUNS / name
+    if not path.is_dir():
+        sys.exit(f"no run {name}")
+    return path
+
+
+def cmd_report(args):
+    report(run_dir(args.run))
+
+
+def cmd_cloudwatch(args):
+    """Sums S3's CloudWatch request metrics over each step's minutes, from
+    the bucket's `EntireBucket` filter."""
+    setup = load_setup()
+    run = run_dir(args.run)
+    info = json.loads((run / "run.json").read_text())
+    names = ["AllRequests", "GetRequests", "PutRequests", "HeadRequests", "BytesDownloaded", "BytesUploaded",
+             "4xxErrors", "5xxErrors"]
+    for step in info["steps"]:
+        start = datetime.datetime.fromtimestamp(step["start_unix_ms"] // 60_000 * 60, datetime.timezone.utc)
+        end = datetime.datetime.fromtimestamp(-(-step["end_unix_ms"] // 60_000) * 60, datetime.timezone.utc)
+        sums = {}
+        for metric in names:
+            output = subprocess.run([
+                "aws", "cloudwatch", "get-metric-statistics", "--region", setup.inventory["region"],
+                "--namespace", "AWS/S3", "--metric-name", metric,
+                "--dimensions", f"Name=BucketName,Value={setup.inventory['bucket']}", "Name=FilterId,Value=EntireBucket",
+                "--start-time", start.isoformat(), "--end-time", end.isoformat(),
+                "--period", "60", "--statistics", "Sum", "--output", "json",
+            ], check=True, capture_output=True, text=True).stdout
+            sums[metric] = sum(point["Sum"] for point in json.loads(output).get("Datapoints", []))
+        path = run / "cloudwatch" / f"{step['name']}.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(sums, indent=2) + "\n")
+        say(f"{step['name']}: {sums['GetRequests']:.0f} GETs, {sums['BytesDownloaded'] / GIB:.2f} GiB downloaded")
+    report(run)
+
+
+def cmd_logs(args):
+    setup = load_setup()
+    run = run_dir(args.run)
+    info = json.loads((run / "run.json").read_text())
+    since = min((step["start_unix_ms"] for step in info["steps"]), default=0) // 1000 - 60
+
+    def fetch(process):
+        text = remote(setup, process.host, f"journalctl -u {process.service} --since @{since} -o cat --no-pager",
+                      check=False)
+        path = run / "logs" / f"{process.name}.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    parallel(setup.processes(), fetch)
+    say(f"logs in {run / 'logs'}")
+
+
+def cmd_ssh(args):
+    setup = load_setup()
+    host = setup.host(args.host)
+    command = ["ssh", *ssh_options(setup), target(setup, host), *args.remote]
+    os.execvp("ssh", command)
+
+
+# ---------------------------------------------------------------- main
+
+
+def main():
+    global dry_run
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    parser.add_argument("--dry-run", action="store_true", help="print remote commands instead of running them")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    inventory = commands.add_parser("inventory", help="read Terraform's outputs, or --file, into loadtest/out")
+    inventory.add_argument("--file", help="a hand-written inventory; ORIGIN_ACCESS_KEY_ID and "
+                                          "ORIGIN_SECRET_ACCESS_KEY name the origin's key")
+    commands.add_parser("prepare", help="prepare every host and gather its facts")
+    commands.add_parser("render", help="render every process's config")
+    deploy = commands.add_parser("deploy", help="build, install, and start every process")
+    deploy.add_argument("--binaries", help="a directory holding s3-accelerator and s3-accelerator-load")
+    up = commands.add_parser("up", help="inventory, prepare, render and deploy")
+    up.add_argument("--file")
+    up.add_argument("--binaries")
+    up.add_argument("--refresh", action="store_true", help="read Terraform's outputs again")
+    commands.add_parser("status", help="each process's state, readiness and ring")
+    commands.add_parser("start", help="start every process")
+    commands.add_parser("stop", help="stop every process")
+    seed = commands.add_parser("seed", help="write the plan's dataset to the bucket from every client host")
+    seed.add_argument("plan")
+    seed.add_argument("--resume", action="store_true", help="skip objects S3 already holds")
+    seed.add_argument("--connections", type=int, default=64)
+    run = commands.add_parser("run", help="run the plan's steps")
+    run.add_argument("plan")
+    run.add_argument("--steps", help="only these steps, comma-separated")
+    run.add_argument("--name", help="the run's directory in loadtest/runs")
+    fault_parser = commands.add_parser("fault", help="kill, stop, start, restart or make leave a storage node")
+    fault_parser.add_argument("action", choices=["kill", "stop", "start", "restart", "leave"])
+    fault_parser.add_argument("node", help="its name, such as node-1, or its index")
+    for name, help_text in (("report", "rewrite a run's report"), ("cloudwatch", "fetch S3's request metrics"),
+                            ("logs", "fetch every process's log for a run")):
+        command = commands.add_parser(name, help=help_text)
+        command.add_argument("run")
+    ssh = commands.add_parser("ssh", help="log in to a host, or run a command there")
+    ssh.add_argument("host")
+    ssh.add_argument("remote", nargs=argparse.REMAINDER, metavar="command")
+    args = parser.parse_args()
+    dry_run = args.dry_run
+    handlers = {
+        "inventory": cmd_inventory, "prepare": cmd_prepare, "render": cmd_render, "deploy": cmd_deploy,
+        "up": cmd_up, "status": cmd_status, "start": cmd_start, "stop": cmd_stop, "seed": cmd_seed,
+        "run": cmd_run, "fault": cmd_fault, "report": cmd_report, "cloudwatch": cmd_cloudwatch,
+        "logs": cmd_logs, "ssh": cmd_ssh,
+    }
+    handlers[args.command](args)
+
+
+if __name__ == "__main__":
+    main()

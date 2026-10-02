@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::rc::Rc;
 use std::time::Duration;
+use tokio::io::Interest;
 use tokio::net::TcpStream;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -173,6 +174,7 @@ impl Peers {
     /// Keeps a connection whose last answer was read in full for the next
     /// request.
     pub fn keep(&self, node: NodeId, connection: Connection) {
+        settle(&connection);
         self.idle
             .borrow_mut()
             .entry(node)
@@ -191,6 +193,7 @@ impl Peers {
     /// in full, and otherwise closes it.
     pub fn idle(&self, body: NodeBody) {
         if body.len == 0 {
+            settle(&body.connection);
             self.idle
                 .borrow_mut()
                 .entry(body.node)
@@ -220,6 +223,14 @@ fn open(connection: &Connection) -> bool {
         rustix::net::recv(connection.stream(), &mut byte, flags),
         Err(Errno::AGAIN)
     )
+}
+
+/// Forgets that `connection` turned readable: its last answer was read in
+/// full, so the next request waits for the node's answer rather than first
+/// trying a read that finds nothing. Costs no syscall.
+fn settle(connection: &Connection) {
+    let nothing = || Err::<(), _>(io::Error::from(io::ErrorKind::WouldBlock));
+    let _ = connection.stream().try_io(Interest::READABLE, nothing);
 }
 
 /// A request's method, target and headers, which name the client request

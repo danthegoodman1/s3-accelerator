@@ -52,6 +52,12 @@ pub struct Reply {
 }
 
 impl Reply {
+    /// Whether S3 sent no usable answer, or the node could not ask it:
+    /// the node's own failure, which another node may get past.
+    pub fn is_failure(&self) -> bool {
+        self.answered.is_none() && self.head.status >= 500
+    }
+
     /// The node's answer when S3 sent none.
     pub fn failed() -> Reply {
         Reply {

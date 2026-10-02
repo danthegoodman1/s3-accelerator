@@ -1,0 +1,105 @@
+# Where the time goes on hits: small and large objects at one connection
+# per client host, for latency without queueing, and at 64, to profile the
+# gateways and nodes under load. Reads the full plan's dataset, so seed
+# that first. The warm steps store the working sets the later steps read;
+# the large fill's window is four times its connections, so each key's
+# second read starts after its first has finished.
+#
+#   loadtest/loadtest run loadtest/plans/profile.toml
+
+[dataset]
+prefix = "full/v1"
+seed = 1
+
+# Request rate: manifests, indexes, thumbnails.
+[[dataset.sets]]
+name = "small"
+count = 2_000_000
+size = { log_uniform = ["4KiB", "256KiB"] }
+
+# A working set larger than the cache.
+[[dataset.sets]]
+name = "medium"
+count = 100_000
+size = { log_uniform = ["1MiB", "32MiB"] }
+
+# Throughput: dataset shards, checkpoints.
+[[dataset.sets]]
+name = "large"
+count = 2_048
+size = "256MiB"
+
+# Analytics: a reader takes the footer, then row groups.
+[[dataset.sets]]
+name = "tables"
+count = 4_000
+size = { log_uniform = ["64MiB", "512MiB"] }
+format = "parquet"
+footer = "4MiB"
+
+[[steps]]
+name = "warm-small"
+target = "cache"
+requests = 400_000
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 200_000
+keys = "sequential"
+passes = 2
+window = 10_000
+
+[[steps]]
+name = "warm-large"
+target = "cache"
+requests = 256
+connections = 8
+[[steps.reads]]
+set = "large"
+limit = 128
+keys = "sequential"
+passes = 2
+window = 32
+
+[[steps]]
+name = "latency-small"
+target = "cache"
+duration = "60s"
+warmup = "10s"
+connections = 1
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 200_000
+
+[[steps]]
+name = "latency-large"
+target = "cache"
+duration = "60s"
+warmup = "10s"
+connections = 1
+[[steps.reads]]
+set = "large"
+limit = 128
+
+[[steps]]
+name = "profile-small"
+target = "cache"
+duration = "2m"
+warmup = "20s"
+connections = 64
+verify = "edges"
+[[steps.reads]]
+set = "small"
+limit = 200_000
+
+[[steps]]
+name = "profile-large"
+target = "cache"
+duration = "2m"
+warmup = "20s"
+connections = 64
+[[steps.reads]]
+set = "large"
+limit = 128

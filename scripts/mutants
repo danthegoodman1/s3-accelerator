@@ -52,6 +52,9 @@ ORIGINS = "crates/server/src/origins.rs"
 LOOKUPS = "crates/server/src/lookups.rs"
 CLIENTS = "crates/server/src/clients.rs"
 METADATA_SERVICE = "crates/server/src/metadata_service.rs"
+PROTOCOL = "crates/server/src/protocol.rs"
+MAIN = "crates/server/src/main.rs"
+LOAD_RUN = "crates/load/src/run.rs"
 STEP_TIMEOUT = 600
 
 MUTANTS = [
@@ -196,7 +199,8 @@ MUTANTS = [
     ),
     (
         "gateways learn no addresses from rings",
-        [(GATEWAY_ENGINE, "peers.learn(&addresses);", "let _ = &addresses;")],
+        [(GATEWAY_ENGINE, "peers.idle(body);\n                        peers.learn(&addresses);",
+          "peers.idle(body);\n                        let _ = &addresses;")],
     ),
     (
         "a joining node's previous ring gives way to its startup ring",
@@ -381,6 +385,143 @@ MUTANTS = [
     (
         "failover candidates cache metadata the home's writes never reach",
         [(NODE, "} if direct || !self.is_home(&request.key) => {", "} if direct => {")],
+    ),
+    (
+        "gateways fail over from S3's own errors",
+        [(GATEWAY, "if head.status >= 500 && !s3_error {", "if head.status >= 500 {")],
+    ),
+    (
+        "a node's own failure passes as S3's error",
+        [(NODE, "request.failed = true;", "let _ = request;")],
+    ),
+    (
+        "a node that times out on S3 passes it off as S3's error",
+        [(NODE, "false => self.on_origin_failed(now, origin),",
+          "false => self.on_origin_response(now, origin, ResponseHead::status(503)),")],
+    ),
+    (
+        "a fill's S3 error passes as the node's own",
+        [(NODE, "let s3_error = self.s3_error(origin, error);", "let s3_error = false;")],
+    ),
+    (
+        "the protocol drops the mark on S3's errors",
+        [(PROTOCOL, "let s3_error = header(headers, S3_ERROR).is_some();", "let s3_error = false;")],
+    ),
+    (
+        "a node takes S3's silence for its answer",
+        [(NODE_ENGINE, "true => this.node.on_origin_failed(now, origin),",
+          "true => this.node.on_origin_response(now, origin, reply.head),")],
+    ),
+    (
+        "a fill's error body is read after its plan is released",
+        [(NODE, """let mut holds = Holds::default();
+        let mut body = Vec::new();
+        if error.content_length > 0 {
+            self.read(origin, &mut holds);
+            body.push(Segment::Origin {
+                origin,
+                offset: 0,
+                len: error.content_length,
+            });
+        }
+        if let Some(plan) = waiting.plan {
+            self.release(plan.holds);
+        }""", """if let Some(plan) = waiting.plan {
+            self.release(plan.holds);
+        }
+        let mut holds = Holds::default();
+        let mut body = Vec::new();
+        if error.content_length > 0 {
+            self.read(origin, &mut holds);
+            body.push(Segment::Origin {
+                origin,
+                offset: 0,
+                len: error.content_length,
+            });
+        }""")],
+    ),
+    (
+        "a failed fill keeps its blocks in flight",
+        [(NODE, "let blocks = std::mem::take(&mut self.origins.get_mut(&origin).expect(\"fill\").blocks);",
+          "let blocks: Vec<BlockKey> = Vec::new();")],
+    ),
+    (
+        "a throttled revalidation drops the metadata",
+        [(NODE, "(status, _) if status >= 500 => {", "(status, _) if status >= 500 && false => {")],
+    ),
+    (
+        "the gateway's listener stops at its first failure",
+        [(SERVER, 'stream = http::accept(&listener, "client") => stream,',
+          "accepted = listener.accept() => accepted?.0,")],
+    ),
+    (
+        "a node's listener stops at its first failure",
+        [(NODE_ENGINE, 'stream = http::accept(&listener, "cluster") => stream,',
+          "accepted = listener.accept() => accepted?.0,")],
+    ),
+    (
+        "listeners queue 128 connections",
+        [(HTTP, "const BACKLOG: u32 = 4_096;", "const BACKLOG: u32 = 128;")],
+    ),
+    (
+        "a process keeps its soft limit on open files",
+        [(MAIN, "raise_open_file_limit();\n    let runtime", "let runtime")],
+    ),
+    (
+        "the scrape leaves out the limit on open files",
+        [(METRICS, '"process_max_fds",', '"process_fd_limit",')],
+    ),
+    (
+        "a closed loop waits for the next millisecond",
+        [(LOAD_RUN, "if interval.is_some() {\n            tokio::time::sleep_until", "if true {\n            tokio::time::sleep_until")],
+    ),
+    (
+        "every connection goes to one gateway loop",
+        [(SERVER, "        let chosen = &loops[chosen];", "        let chosen = &loops[0];")],
+    ),
+    (
+        "a scrape renders one gateway loop's counts",
+        [(ADMIN, "loops.extend(gateways.iter().map(", "loops.extend(gateways.iter().take(1).map(")],
+    ),
+    (
+        "an invalidation reaches one gateway loop",
+        [(ADMIN, "for gateway in self.gateways.borrow().iter() {", "for gateway in self.gateways.borrow().iter().take(1) {")],
+    ),
+    (
+        "readiness from the first gateway loop alone",
+        [(ADMIN, "gateways.iter().all(|gateway| gateway.observed().heard)", "gateways.iter().take(1).all(|gateway| gateway.observed().heard)")],
+    ),
+    (
+        "a write through one gateway loop reaches no other",
+        [(GATEWAY_ENGINE, "let siblings = engine.borrow().siblings.clone();", "let siblings: Vec<mpsc::UnboundedSender<Shared>> = Vec::new();")],
+    ),
+    (
+        "each gateway loop caps its own lookups",
+        [(SERVER, "metrics.clone(), client_lookups);", "metrics.clone(), Arc::default());")],
+    ),
+    (
+        "a throttled revalidation passes its length on as a body",
+        [(NODE, "let error = ResponseHead {\n                    content_length: 0,\n                    ..head\n                };", "let error = head;")],
+    ),
+    (
+        "a hit's head goes out alone",
+        [(HTTP, "false => SendFlags::MORE,", "false => SendFlags::empty(),")],
+    ),
+    (
+        "a sibling's ring replaces any other",
+        [(GATEWAY_ENGINE, "if own == from || own == ring.version() {", "if own != ring.version() {")],
+    ),
+    (
+        "a sibling's ring brings no nodes down",
+        [(GATEWAY_ENGINE, "if own == from || own == ring.version() {", "if own == from {")],
+    ),
+    (
+        "the gateway's ring is its first loop's",
+        [(ADMIN, ".rev()\n            .max_by_key(|ring| held(ring.0))", ".take(1)\n            .max_by_key(|ring| held(ring.0))")],
+    ),
+    (
+        "gateway loops keep the rings they fetch to themselves",
+        [(GATEWAY_ENGINE, "this.share(|| Shared::Ring {", "let _ = (|| Shared::Ring {")],
     ),
     (
         "metadata never forgotten",
@@ -671,7 +812,7 @@ MUTANTS = [
     ),
     (
         "sessions among members stay in userspace",
-        [(SERVER, "let kernel = kernel.as_ref().filter(|_| tls.kernel);\n            let members",
+        [(SERVER, "let kernel = kernel.as_ref().as_ref().filter(|_| tls.kernel);\n            let members",
                   "let kernel = None;\n            let members")],
     ),
     (
@@ -1121,12 +1262,12 @@ MUTANTS = [
     ),
     (
         "a forged invalidation is taken",
-        [(LOOKUPS, "if !signed || now.abs_diff(stamped) > INVALIDATION_SKEW {",
-                   "if now.abs_diff(stamped) > INVALIDATION_SKEW {")],
+        [(LOOKUPS, "signed && now.abs_diff(stamped) <= INVALIDATION_SKEW",
+                   "now.abs_diff(stamped) <= INVALIDATION_SKEW")],
     ),
     (
         "a stale invalidation is taken",
-        [(LOOKUPS, "if !signed || now.abs_diff(stamped) > INVALIDATION_SKEW {", "if !signed {")],
+        [(LOOKUPS, "signed && now.abs_diff(stamped) <= INVALIDATION_SKEW", "signed")],
     ),
     (
         "every bucket goes to the default origin",
@@ -1162,11 +1303,12 @@ MUTANTS = [
     ),
     (
         "lookups past the cap are asked anyway",
-        [(LOOKUPS, "if capped && self.in_flight >= MAX_IN_FLIGHT {", "if false {")],
+        [(LOOKUPS, "if capped && self.in_flight.fetch_update(Relaxed, Relaxed, room).is_err() {",
+          "if capped && self.in_flight.fetch_add(1, Relaxed) == usize::MAX {")],
     ),
     (
         "lookups under way are never counted done",
-        [(LOOKUPS, "if pending.capped {\n            self.in_flight -= 1;\n        }", "")],
+        [(LOOKUPS, "if pending.capped {\n            self.in_flight.fetch_sub(1, Relaxed);\n        }", "")],
     ),
     (
         "names the cache knows count toward the cap",
@@ -1207,8 +1349,7 @@ MUTANTS = [
     ),
     (
         "a client's invalidation drops nothing",
-        [(ADMIN, "Some(clients) => clients.invalidate(&id, path, time, signature, now),",
-                 "Some(_) => Invalidated::Dropped,")],
+        [(SERVER, "forgetting.forget(&access_key_id);", "let _ = &access_key_id;")],
     ),
     (
         "an invalidation's signature leaves out its path",
@@ -1309,6 +1450,7 @@ def catch(copy, target, seeds):
     layers = [
         ("core unit tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator-core"]),
         ("server tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator"]),
+        ("load generator tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator-load"]),
         ("kernel TLS tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator", "--test", "tls",
                               "--", "--ignored"]),
         ("sim tests", ["cargo", "test", "-q", "--release", "-p", "s3-accelerator-sim"]),

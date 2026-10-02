@@ -51,6 +51,7 @@ const FIRST: &str = "x-accel-first";
 const LAST: &str = "x-accel-last";
 const ANSWER: &str = "x-accel-answer";
 const LENGTH: &str = "x-accel-content-length";
+const S3_ERROR: &str = "x-accel-s3-error";
 const META_ETAG: &str = "x-accel-meta-etag";
 const META_SIZE: &str = "x-accel-meta-size";
 const META_AGE: &str = "x-accel-meta-age";
@@ -137,10 +138,13 @@ pub struct Hint {
 /// placements they read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeAnswer {
+    /// `s3_error` marks a 5xx that S3 gave, which the gateway passes to
+    /// its client rather than asking another node.
     Respond {
         head: ResponseHead,
         meta: Option<ObjectMeta>,
         hot: Vec<Hint>,
+        s3_error: bool,
     },
     Metadata(ObjectMeta, Vec<Hint>),
     Stale,
@@ -392,10 +396,18 @@ pub fn encode_answer(answer: &NodeAnswer, versions: Versions) -> (u16, Vec<(Stri
         (DOWN.to_string(), format!("{:016x}", versions.down)),
     ];
     let status = match answer {
-        NodeAnswer::Respond { head, meta, hot } => {
+        NodeAnswer::Respond {
+            head,
+            meta,
+            hot,
+            s3_error,
+        } => {
             encode_hints(hot, &mut headers);
             headers.push((ANSWER.to_string(), "respond".into()));
             headers.push((LENGTH.to_string(), head.content_length.to_string()));
+            if *s3_error {
+                headers.push((S3_ERROR.to_string(), "1".into()));
+            }
             if let Some(etag) = &head.etag {
                 headers.push(("etag".to_string(), etag.0.clone()));
             }
@@ -512,7 +524,13 @@ pub fn decode_answer(status: u16, headers: &[(String, String)]) -> Result<NodeAn
                 None => None,
             };
             let hot = decode_hints(headers)?;
-            Ok(NodeAnswer::Respond { head, meta, hot })
+            let s3_error = header(headers, S3_ERROR).is_some();
+            Ok(NodeAnswer::Respond {
+                head,
+                meta,
+                hot,
+                s3_error,
+            })
         }
         "metadata" => Ok(NodeAnswer::Metadata(
             decode_meta(headers)?,
@@ -801,6 +819,13 @@ mod tests {
                 head: head.clone(),
                 meta: Some(meta.clone()),
                 hot: Vec::new(),
+                s3_error: false,
+            },
+            NodeAnswer::Respond {
+                head: ResponseHead::status(503),
+                meta: None,
+                hot: Vec::new(),
+                s3_error: true,
             },
             NodeAnswer::Respond {
                 head,
@@ -817,6 +842,7 @@ mod tests {
                         left: 1,
                     },
                 ],
+                s3_error: false,
             },
             NodeAnswer::Metadata(meta, Vec::new()),
             NodeAnswer::Stale,

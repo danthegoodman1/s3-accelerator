@@ -307,6 +307,55 @@ async fn a_cached_hit_is_sent_from_the_event_loop() {
         .await;
 }
 
+/// A hit's head goes out with `MSG_MORE`, so the kernel sends it in one
+/// packet with the first bytes of the `sendfile` that follows.
+#[tokio::test(flavor = "current_thread")]
+async fn a_hits_head_shares_its_bodys_first_packet() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            origin.size.set(OBJECT_SIZE);
+            let dir = data_dir();
+            let cluster = Cluster::new(&dir, origin_port, "block_size = 65536");
+            let trace = dir.join("node.trace");
+            let node = Process::traced(&cluster.node, &trace, "sendto,sendfile");
+            common::listening(cluster.node_port).await;
+            let _gateway = cluster.start_gateway().await;
+            let body = origin.object("/bucket/k");
+            assert!(cluster.get("k").await == (200, body.clone()));
+            let slots = dir.join("disk-0/slots");
+            for tries in 0.. {
+                assert!(tries < 500, "the blocks were never recorded");
+                if recorded(&slots) == 3 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let hit = now();
+            assert!(cluster.get("k").await == (200, body));
+            node.stop();
+            // "HTTP/1.1 ", as `strace -xx` prints it.
+            const HEAD: &str = "\\x48\\x54\\x54\\x50\\x2f\\x31\\x2e\\x31\\x20";
+            let calls = read_trace(&trace, hit, f64::MAX);
+            let heads: Vec<&str> = calls
+                .iter()
+                .filter(|call| call.name == "sendto" && call.args.contains(HEAD))
+                .map(|call| call.args.rsplit(", ").nth(2).unwrap_or_default())
+                .collect();
+            assert!(!heads.is_empty(), "no head went out");
+            assert!(
+                heads.iter().all(|flags| flags.contains("MSG_MORE")),
+                "{heads:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| call.name == "sendfile" && call.result > 0)
+            );
+        })
+        .await;
+}
+
 /// A home rewrites its metadata file on a blocking thread, off the event
 /// loop that owns its core: the rename that swaps in the new file runs on
 /// another thread.

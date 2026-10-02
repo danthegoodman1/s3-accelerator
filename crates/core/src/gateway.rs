@@ -478,12 +478,17 @@ impl Gateway {
         }
     }
 
+    /// A node answered `from` with `head`. `s3_error` marks a 5xx that S3
+    /// gave the node, which the client gets like any other answer of S3's:
+    /// another node would only ask S3 again. Any other 5xx is the node's
+    /// own failure, and the read goes to the next candidate.
     pub fn on_node_response(
         &mut self,
         now: Time,
         from: NodeRequestId,
         head: ResponseHead,
         meta: Option<ObjectMeta>,
+        s3_error: bool,
     ) {
         self.now = self.now.max(now);
         let Some(part) = self.parts.get_mut(&from) else {
@@ -493,7 +498,7 @@ impl Gateway {
         if part.answer.is_some() {
             return;
         }
-        if head.status >= 500 {
+        if head.status >= 500 && !s3_error {
             // The node could not serve it; the next candidate may.
             self.actions.push(Action::Discard { id: from });
             return self.fail_over(now, from, Some(head), false);
@@ -1439,11 +1444,11 @@ mod tests {
         gateway.on_request(Time(2), ClientRequestId(2), Request::head(key("other")));
         let other = home_read(gateway.drain()).expect("the home is asked");
         let (head, meta) = answer("other");
-        gateway.on_node_response(Time(3), other, head, meta);
+        gateway.on_node_response(Time(3), other, head, meta, false);
         gateway.drain();
         // The home's answer from before the write arrives last.
         let (head, meta) = answer("old");
-        gateway.on_node_response(Time(4), racing, head, meta);
+        gateway.on_node_response(Time(4), racing, head, meta, false);
         gateway.drain();
         gateway.on_request(Time(5), ClientRequestId(3), Request::head(key("k")));
         assert!(home_read(gateway.drain()).is_some());
@@ -1546,7 +1551,7 @@ mod tests {
             content_length: 256,
             headers: Vec::new(),
         };
-        gateway.on_node_response(Time(1), home, head.clone(), None);
+        gateway.on_node_response(Time(1), home, head.clone(), None, false);
         let forward = Action::Forward {
             request: client,
             from: home,
@@ -1563,7 +1568,7 @@ mod tests {
             ]
         );
         for status in [200, 503] {
-            gateway.on_node_response(Time(2), home, ResponseHead::status(status), None);
+            gateway.on_node_response(Time(2), home, ResponseHead::status(status), None, false);
             assert_eq!(gateway.drain(), Vec::new());
         }
         gateway.on_forwarded(Time(3), home, 256);
@@ -1653,7 +1658,7 @@ mod tests {
                 content_length: last - first + 1,
                 headers: Vec::new(),
             };
-            gateway.on_node_response(Time(3), id, answer, None);
+            gateway.on_node_response(Time(3), id, answer, None, false);
         }
         gateway.drain();
         // The first part forwarded, the window has room for the next.
@@ -1720,7 +1725,7 @@ mod tests {
             content_length: 5,
             headers: Vec::new(),
         };
-        gateway.on_node_response(Time(3), part, wrong, None);
+        gateway.on_node_response(Time(3), part, wrong, None, false);
         let actions = gateway.drain();
         assert_eq!(actions[0], Action::Discard { id: part });
         assert!(matches!(actions[1], Action::Send { id, .. } if id != part));

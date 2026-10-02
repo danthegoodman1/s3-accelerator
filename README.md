@@ -46,6 +46,10 @@ Nodes poll the queue with `[origin]`'s credentials, or with the `access_key_id` 
 
 To remove an object from the cache, as a retention rule may require after it is deleted, send `POST /bucket/key?x-accel-purge` with a credential whose grants cover the key. Every node drops and erases the object's blocks; a node that is down drops them once it is back.
 
+A gateway runs an event loop on each of the machine's cores, and `[gateway] threads` sets how many. Each loop serves the connections handed to it, so give a gateway at least as many connections as loops; the loops share every write, so a client's read sees its write on any connection.
+
+Every client, peer and S3 connection holds a file descriptor. A process raises its soft limit on open files to its hard limit when it starts, so raise the hard limit: `LimitNOFILE=1048576` in a systemd unit, or `--ulimit nofile=1048576` for Docker. `process_max_fds` and `process_open_fds` show how close a process runs to it. A listener that runs out of descriptors logs it and serves again once connections close.
+
 To watch a process, name an address for its admin listener, which serves Prometheus metrics at `/metrics`, `/healthz`, and `/readyz` for load balancers, and takes a metadata service's invalidations. Only invalidations carry credentials, so keep it on a private address:
 
 ```toml
@@ -58,6 +62,8 @@ listen = "10.0.0.1:9090"
 - `crates/core`: gateway and storage-node logic as deterministic state machines that do no I/O.
 - `crates/server`: the `s3-accelerator` binary, which runs the core over sockets and disks: HTTP/1.1, SigV4 validation and grants for clients, the cluster protocol between gateways and nodes, the node's slab file, slot table and metadata file, and signed requests to each bucket's origin. Bodies stream: nodes send stored blocks with `sendfile`, and gateways relay them with `splice`. It also builds `s3-accelerator-metadata`, the reference metadata service.
 - `crates/sim`: a deterministic simulator that runs gateways, storage nodes, clients and a model of S3 on one thread.
+- `crates/load`: the `s3-accelerator-load` binary, which seeds a dataset into S3 and drives a cluster, or S3 itself, from many client hosts.
+- `loadtest`: the load test on EC2: a Terraform stack, host preparation, plans, and the driver that runs them.
 - `tests`: the S3 conformance suite, which runs against s3proxy and through the accelerator.
 
 ## Testing
@@ -99,6 +105,10 @@ CONFORMANCE_ENDPOINT=https://127.0.0.1:9000 SSL_CERT_FILE=$PWD/target/cluster/tl
 cargo build --release -p s3-accelerator -p s3-accelerator-bench
 target/release/s3-accelerator-bench [--scale X] [--clients N] [--only hits|scan|shift|transports] [--extent-mib N]
 ```
+
+### Load test
+
+`loadtest/README.md` runs the cluster on EC2 hosts with local NVMe, in front of a real S3 bucket, from several client hosts at once, and reports each step as clients, S3, the processes and the hosts' kernels saw it. `loadtest/plans/smoke.toml` checks every part in 12 minutes; `full.toml` characterizes the cluster; `soak.toml` runs four hours with rolling restarts.
 
 ### Simulator
 

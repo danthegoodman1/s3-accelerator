@@ -153,6 +153,18 @@ pub struct GatewayConfig {
     pub domains: Vec<String>,
     /// Clients connect over TLS when set, and over plaintext otherwise.
     pub tls: Option<TlsConfig>,
+    /// Event loops, each on a thread of its own: the machine's cores by
+    /// default.
+    pub threads: Option<usize>,
+}
+
+impl GatewayConfig {
+    /// The gateway's event loops.
+    pub fn threads(&self) -> usize {
+        self.threads.unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(1, |threads| threads.get())
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +200,9 @@ impl Config {
         }
         if self.cluster.secret.is_empty() {
             return Err("cluster.secret is empty".into());
+        }
+        if self.gateway.as_ref().and_then(|gateway| gateway.threads) == Some(0) {
+            return Err("gateway.threads is 0".into());
         }
         let mut keys = BTreeSet::new();
         for client in &self.clients {

@@ -2160,6 +2160,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "s3-accelerator-load"
+version = "0.1.0"
+dependencies = [
+ "httparse",
+ "rustix",
+ "rustls 0.23.45",
+ "rustls-pki-types",
+ "rustls-platform-verifier",
+ "s3-accelerator",
+ "s3-accelerator-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls 0.26.5",
+ "toml",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "s3-accelerator-sim"
 version = "0.1.0"
 dependencies = [

@@ -18,11 +18,11 @@ pub struct Origins {
     default: Option<Arc<Origin>>,
     /// The metadata service, which names every bucket's origin when set.
     lookups: Option<Rc<Lookups<Arc<Origin>>>>,
-    metrics: Rc<Metrics>,
+    metrics: Arc<Metrics>,
 }
 
 impl Origins {
-    pub fn new(config: &Config, client: HttpClient, metrics: Rc<Metrics>) -> Origins {
+    pub fn new(config: &Config, client: HttpClient, metrics: Arc<Metrics>) -> Origins {
         let open = |origin: &OriginConfig| {
             let credentials = Credentials {
                 access_key_id: origin.access_key_id.clone(),
@@ -44,7 +44,14 @@ impl Origins {
             default: config.origin.as_ref().map(open),
             lookups: config.metadata.as_ref().map(|metadata| {
                 let client = client.clone();
-                Lookups::new(Kind::Origin, metadata, client, parse, metrics.clone())
+                Lookups::new(
+                    Kind::Origin,
+                    metadata,
+                    client,
+                    parse,
+                    metrics.clone(),
+                    Arc::default(),
+                )
             }),
             metrics,
         }
@@ -169,7 +176,7 @@ mod tests {
             let origins = Rc::new(Origins::new(
                 &config,
                 origin::client(),
-                Rc::new(Metrics::default()),
+                Arc::new(Metrics::default()),
             ));
             let origin = Arc::new(Origin::new(
                 origin::client(),

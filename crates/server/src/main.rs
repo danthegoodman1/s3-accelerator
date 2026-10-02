@@ -21,6 +21,7 @@ fn main() -> ExitCode {
         }
     };
     log::set_level(config.log.level);
+    raise_open_file_limit();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -32,5 +33,26 @@ fn main() -> ExitCode {
             log!(Error, "the process stopped", error = error);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Raises the soft limit on open files to the hard limit. Every client,
+/// peer and S3 connection holds a descriptor, and service managers often
+/// start processes with a soft limit of 1,024.
+fn raise_open_file_limit() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let Rlimit { current, maximum } = getrlimit(Resource::Nofile);
+    if current == maximum {
+        return;
+    }
+    // Linux bounds the hard limit on open files, so neither is unlimited.
+    let (from, to) = (current.unwrap_or(u64::MAX), maximum.unwrap_or(u64::MAX));
+    let raised = Rlimit {
+        current: maximum,
+        maximum,
+    };
+    match setrlimit(Resource::Nofile, raised) {
+        Ok(()) => log!(Info, "raised the open file limit", from = from, to = to),
+        Err(error) => log!(Warn, "raising the open file limit failed", error = error),
     }
 }

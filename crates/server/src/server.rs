@@ -2,12 +2,12 @@
 //! `GetObject` and `HeadObject` through the core. Other operations pass
 //! through a storage node, which signs them for S3.
 
-use crate::admin::{self, Admin};
+use crate::admin::{self, Admin, GatewayLoop, Observed};
 use crate::clients::{Clients, Credential};
 use crate::config::{Access, Config};
 use crate::disk::Disk;
-use crate::gateway_engine::{Event, GatewayEngine, SharedGateway};
-use crate::http::{Connection, Framing, RequestHead, Response};
+use crate::gateway_engine::{Event, GatewayEngine, Shared, SharedGateway};
+use crate::http::{self, Connection, Framing, RequestHead, Response};
 use crate::http::{etag_condition, format_content_range, header, parse_range, split_path};
 use crate::log;
 use crate::lookups::Unresolved;
@@ -35,15 +35,17 @@ use std::cell::Cell;
 use std::io;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 
+/// What one gateway event loop serves its clients with.
 struct Context {
     gateway: SharedGateway,
-    metrics: Rc<Metrics>,
+    metrics: Arc<Metrics>,
     /// The state that gives each client request a random ID.
     request_ids: Cell<u64>,
     clients: Rc<Clients>,
@@ -58,18 +60,18 @@ const MAX_DELETE_BODY: u64 = 8 << 20;
 pub async fn serve(config: Config) -> io::Result<()> {
     let mut listeners = Listeners::default();
     if let Some(admin) = &config.admin {
-        let listener = TcpListener::bind(&admin.listen).await?;
+        let listener = http::listen(&admin.listen).await?;
         log!(Info, "admin listening", address = listener.local_addr()?);
         listeners.admin = Some(listener);
     }
     if let Some(gateway) = &config.gateway {
-        let listener = TcpListener::bind(&gateway.listen).await?;
+        let listener = http::listen(&gateway.listen).await?;
         log!(Info, "gateway listening", address = listener.local_addr()?);
         listeners.gateway = Some(listener);
     }
     if let Some(node) = &config.node {
         let address = &config.addresses()[&NodeId(node.id)];
-        let listener = TcpListener::bind(address).await?;
+        let listener = http::listen(address).await?;
         log!(
             Info,
             "node listening",
@@ -121,6 +123,7 @@ pub async fn run_with(
     stop: impl Future<Output = ()> + 'static,
     leave: impl Future<Output = ()> + 'static,
 ) -> io::Result<()> {
+    let config = Arc::new(config);
     let secret: Rc<str> = config.cluster.secret.as_str().into();
     let client_tls = config
         .gateway
@@ -128,10 +131,10 @@ pub async fn run_with(
         .and_then(|gateway| gateway.tls.as_ref());
     let wants_kernel = client_tls.is_some_and(|tls| tls.kernel)
         || config.cluster.tls.as_ref().is_some_and(|tls| tls.kernel);
-    let kernel = tls::kernel(wants_kernel).await;
+    let kernel = Arc::new(tls::kernel(wants_kernel).await);
     let (members, connector) = match &config.cluster.tls {
         Some(tls) => {
-            let kernel = kernel.as_ref().filter(|_| tls.kernel);
+            let kernel = kernel.as_ref().as_ref().filter(|_| tls.kernel);
             let members = Rc::new(Tls::members(tls, kernel)?);
             (Some(members), Some(Connector::new(tls, kernel)?))
         }
@@ -139,8 +142,8 @@ pub async fn run_with(
     };
     let clients = match client_tls {
         Some(tls) => {
-            let kernel = kernel.as_ref().filter(|_| tls.kernel);
-            Some(Rc::new(Tls::clients(tls, kernel)?))
+            let kernel = kernel.as_ref().as_ref().filter(|_| tls.kernel);
+            Some(Arc::new(Tls::clients(tls, kernel)?))
         }
         None => None,
     };
@@ -301,29 +304,19 @@ pub async fn run_with(
         }
         _ => None,
     };
-    if let (Some(_), Some(listener)) = (&config.gateway, listeners.gateway) {
-        let gateway = GatewayEngine::new(
-            config.ring(),
-            config.cache.gateway_config(),
-            peers,
-            metrics.clone(),
-        );
-        admin.serving(gateway.clone());
-        let domains = config
-            .gateway
+    if let (Some(gateway), Some(listener)) = (&config.gateway, listeners.gateway) {
+        let loops = spawn_loops(gateway.threads(), &config, &kernel, clients, &stopped)?;
+        let handles = loops.iter().map(|each| each.handle.clone()).collect();
+        let client_token = config
+            .metadata
             .as_ref()
-            .map(|gateway| gateway.domains.clone())
-            .unwrap_or_default();
-        let credentials = Rc::new(Clients::new(&config, http.clone(), metrics.clone()));
-        admin.clients(credentials.clone());
-        let context = Rc::new(Context {
-            gateway,
-            metrics,
-            request_ids: Cell::new(random_seed()),
-            clients: credentials,
-            domains,
-        });
-        serve_clients(listener, context, clients, stopped_signal(stopped)).await?;
+            .map(|metadata| metadata.token.clone());
+        admin.serving(handles, client_token);
+        accept_clients(listener, &loops, stopped_signal(stopped)).await;
+        for each in loops {
+            drop(each.connections);
+            let _ = tokio::task::spawn_blocking(move || each.thread.join()).await;
+        }
     }
     let stopped = match node {
         Some(node) => node.await.map_err(io::Error::other)?,
@@ -340,7 +333,7 @@ pub async fn run_with(
 const DELAY_PERIOD: Duration = Duration::from_millis(100);
 
 /// Measures how late the event loop runs a timer, for as long as it runs.
-async fn measure_loop_delay(metrics: Rc<Metrics>) {
+async fn measure_loop_delay(metrics: Arc<Metrics>) {
     loop {
         let due = Instant::now() + DELAY_PERIOD;
         tokio::time::sleep_until(due.into()).await;
@@ -374,41 +367,245 @@ async fn stopped_signal(mut stopped: watch::Receiver<bool>) {
     let _ = stopped.wait_for(|stopped| *stopped).await;
 }
 
-/// Serves S3 clients on `listener` until `stop` completes.
-async fn serve_clients(
-    listener: TcpListener,
-    context: Rc<Context>,
-    tls: Option<Rc<Tls>>,
-    stop: impl Future<Output = ()>,
-) -> io::Result<()> {
-    let ticking = context.gateway.clone();
+/// A gateway event loop, as the thread that accepts clients holds it.
+struct Loop {
+    /// Takes the connections the loop serves, and counts those still open.
+    connections: mpsc::UnboundedSender<std::net::TcpStream>,
+    open: Arc<AtomicUsize>,
+    handle: GatewayLoop,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// What a gateway event loop starts with.
+struct LoopStart {
+    config: Arc<Config>,
+    connector: Option<Connector>,
+    tls: Option<Arc<Tls>>,
+    metrics: Arc<Metrics>,
+    observed: Arc<Mutex<Observed>>,
+    open: Arc<AtomicUsize>,
+    incoming: mpsc::UnboundedReceiver<std::net::TcpStream>,
+    forgotten: mpsc::UnboundedReceiver<(String, oneshot::Sender<()>)>,
+    /// What the gateway's other loops share with this one, and how this one
+    /// reaches them.
+    shared: mpsc::UnboundedReceiver<Shared>,
+    siblings: Vec<mpsc::UnboundedSender<Shared>>,
+    /// Lookups of clients under way, which every loop counts.
+    client_lookups: Arc<AtomicUsize>,
+    stopped: watch::Receiver<bool>,
+    request_ids: u64,
+}
+
+/// Starts `threads` gateway event loops, each on a thread of its own with
+/// its own gateway core, node connections and cache of clients.
+fn spawn_loops(
+    threads: usize,
+    config: &Arc<Config>,
+    kernel: &Arc<Option<ktls::CompatibleCiphers>>,
+    tls: Option<Arc<Tls>>,
+    stopped: &watch::Receiver<bool>,
+) -> io::Result<Vec<Loop>> {
+    let (sharing, shared): (Vec<_>, Vec<_>) =
+        (0..threads).map(|_| mpsc::unbounded_channel()).unzip();
+    let client_lookups = Arc::new(AtomicUsize::new(0));
+    let mut loops = Vec::new();
+    for (index, shared) in shared.into_iter().enumerate() {
+        let siblings = sharing
+            .iter()
+            .enumerate()
+            .filter(|&(other, _)| other != index)
+            .map(|(_, sender)| sender.clone())
+            .collect();
+        let connector = match &config.cluster.tls {
+            Some(cluster) => {
+                let kernel = kernel.as_ref().as_ref().filter(|_| cluster.kernel);
+                Some(Connector::new(cluster, kernel)?)
+            }
+            None => None,
+        };
+        let (connections, incoming) = mpsc::unbounded_channel();
+        let (forget, forgotten) = mpsc::unbounded_channel();
+        let open = Arc::new(AtomicUsize::new(0));
+        let metrics = Arc::new(Metrics::default());
+        let observed = Arc::new(Mutex::new(Observed::default()));
+        let start = LoopStart {
+            config: config.clone(),
+            connector,
+            tls: tls.clone(),
+            metrics: metrics.clone(),
+            observed: observed.clone(),
+            open: open.clone(),
+            incoming,
+            forgotten,
+            shared,
+            siblings,
+            client_lookups: client_lookups.clone(),
+            stopped: stopped.clone(),
+            request_ids: random_seed() ^ index as u64,
+        };
+        let thread = std::thread::Builder::new()
+            .name(format!("gateway-{index}"))
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime");
+                tokio::task::LocalSet::new().block_on(&runtime, serve_loop(start));
+            })?;
+        loops.push(Loop {
+            connections,
+            open,
+            handle: GatewayLoop {
+                metrics,
+                observed,
+                forget,
+            },
+            thread,
+        });
+    }
+    Ok(loops)
+}
+
+/// Takes S3 clients' connections on `listener` until `stop` completes, and
+/// hands each to the loop with the fewest open, so a few connections spread
+/// across the loops as evenly as many do.
+async fn accept_clients(listener: TcpListener, loops: &[Loop], stop: impl Future<Output = ()>) {
+    tokio::pin!(stop);
+    let mut next = 0;
+    loop {
+        let stream = tokio::select! {
+            stream = http::accept(&listener, "client") => stream,
+            () = &mut stop => break,
+        };
+        // A socket that refuses the option still serves, only slower.
+        let _ = stream.set_nodelay(true);
+        let Ok(stream) = stream.into_std() else {
+            continue;
+        };
+        // Ties go to the first loop after the last one chosen. A loop that
+        // stopped takes no more, and the next takes its connection.
+        let mut stream = stream;
+        for _ in 0..loops.len() {
+            let chosen = (0..loops.len())
+                .map(|offset| (next + offset) % loops.len())
+                .min_by_key(|&index| loops[index].open.load(Ordering::Relaxed))
+                .expect("a gateway runs a loop");
+            next = chosen + 1;
+            let chosen = &loops[chosen];
+            chosen.open.fetch_add(1, Ordering::Relaxed);
+            match chosen.connections.send(stream) {
+                Ok(()) => break,
+                Err(returned) => {
+                    chosen.open.store(usize::MAX / 2, Ordering::Relaxed);
+                    stream = returned.0;
+                }
+            }
+        }
+    }
+}
+
+/// A connection a loop holds, counted among its open ones until it ends,
+/// however it ends.
+struct Opened(Arc<AtomicUsize>);
+
+impl Drop for Opened {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Runs a gateway event loop until the process stops: serves the
+/// connections the acceptor hands it, applies its siblings' writes and the
+/// metadata service's invalidations, and publishes its ring and readiness
+/// each tick.
+async fn serve_loop(start: LoopStart) {
+    let LoopStart {
+        config,
+        connector,
+        tls,
+        metrics,
+        observed,
+        open,
+        mut incoming,
+        mut forgotten,
+        mut shared,
+        siblings,
+        client_lookups,
+        stopped,
+        request_ids,
+    } = start;
+    let delays = tokio::task::spawn_local(measure_loop_delay(metrics.clone()));
+    let secret: Rc<str> = config.cluster.secret.as_str().into();
+    let peers = Peers::new(config.addresses(), secret, connector);
+    let gateway = GatewayEngine::new(
+        config.ring(),
+        config.cache.gateway_config(),
+        peers,
+        metrics.clone(),
+        siblings,
+    );
+    let clients = Clients::new(&config, origin::client(), metrics.clone(), client_lookups);
+    let clients = Rc::new(clients);
+    let forgetting = clients.clone();
+    tokio::task::spawn_local(async move {
+        while let Some((access_key_id, done)) = forgotten.recv().await {
+            forgetting.forget(&access_key_id);
+            let _ = done.send(());
+        }
+    });
+    let taking = gateway.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(shared) = shared.recv().await {
+            GatewayEngine::take_shared(&taking, shared);
+        }
+    });
+    let ticking = gateway.clone();
     let ticker = tokio::task::spawn_local(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
             interval.tick().await;
             GatewayEngine::tick(&ticking);
+            let (ring, heard) = GatewayEngine::observe(&ticking);
+            *observed.lock().unwrap_or_else(PoisonError::into_inner) = Observed { ring, heard };
         }
     });
+    let domains = config
+        .gateway
+        .as_ref()
+        .map(|gateway| gateway.domains.clone())
+        .unwrap_or_default();
+    let context = Rc::new(Context {
+        gateway,
+        metrics,
+        request_ids: Cell::new(request_ids),
+        clients,
+        domains,
+    });
+    let stop = stopped_signal(stopped);
     tokio::pin!(stop);
     loop {
-        let (stream, _) = tokio::select! {
-            accepted = listener.accept() => accepted?,
-            () = &mut stop => break,
+        let stream = tokio::select! {
+            stream = incoming.recv() => stream,
+            () = &mut stop => None,
         };
-        stream.set_nodelay(true)?;
-        let (context, tls) = (context.clone(), tls.clone());
+        let Some(stream) = stream else {
+            break;
+        };
+        let (context, tls, opened) = (context.clone(), tls.clone(), Opened(open.clone()));
         tokio::task::spawn_local(async move {
-            let accepted = tls::accept(tls.as_deref(), stream, &context.metrics, Link::Client);
-            let Some(connection) = accepted.await else {
-                return;
-            };
-            if let Err(error) = serve_connection(connection, &context).await {
-                log!(Debug, "a client connection failed", error = error);
+            let _opened = opened;
+            if let Ok(stream) = TcpStream::from_std(stream) {
+                let accepted = tls::accept(tls.as_deref(), stream, &context.metrics, Link::Client);
+                if let Some(connection) = accepted.await
+                    && let Err(error) = serve_connection(connection, &context).await
+                {
+                    log!(Debug, "a client connection failed", error = error);
+                }
             }
         });
     }
     ticker.abort();
-    Ok(())
+    delays.abort();
 }
 
 async fn serve_connection(mut connection: Connection, context: &Context) -> io::Result<()> {
@@ -772,6 +969,7 @@ async fn purge(
             }) => {
                 peers.idle(body);
                 GatewayEngine::written_via(&context.gateway, &key, node);
+                GatewayEngine::tell_writes(&context.gateway, vec![(key, Some(node))]).await;
                 let response = Response {
                     status: 204,
                     headers: Vec::new(),
@@ -1222,11 +1420,13 @@ async fn pass(
                         key,
                     })
                     .collect();
-                GatewayEngine::written(&context.gateway, keys).await;
+                let applied = GatewayEngine::written(&context.gateway, keys).await;
+                GatewayEngine::tell_writes(&context.gateway, applied).await;
             }
             None => {
                 if let Some(key) = passthrough::written_key(&head.method, &head.path) {
                     GatewayEngine::written_via(&context.gateway, &key, node);
+                    GatewayEngine::tell_writes(&context.gateway, vec![(key, Some(node))]).await;
                 }
             }
         }

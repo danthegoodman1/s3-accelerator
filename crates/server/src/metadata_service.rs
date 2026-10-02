@@ -305,7 +305,7 @@ pub async fn serve(listener: TcpListener, service: Rc<MetadataService>) {
     http::serve_heads(
         listener,
         "metadata",
-        Rc::new(move |head| service.answer(head)),
+        Rc::new(move |head| Box::pin(std::future::ready(service.answer(head)))),
     )
     .await;
 }

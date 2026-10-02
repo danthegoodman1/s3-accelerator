@@ -4,8 +4,8 @@
 mod common;
 
 use common::{
-    CLUSTER_CACHE, Cluster, LISTING, Process, data_dir, listening, object, object_of, send,
-    send_for_headers, start_origin, start_queue, try_get,
+    CLUSTER_CACHE, Cluster, LISTING, Process, SLOW_DOWN, data_dir, listening, object, object_of,
+    send, send_for_headers, start_origin, start_queue, try_get,
 };
 use s3_accelerator::http::header;
 use s3_accelerator::peers::Peers;
@@ -284,6 +284,47 @@ async fn a_gateway_reaches_nodes_its_config_never_named() {
         .await;
 }
 
+/// S3's 503, which asks clients to slow down, reaches the client from the
+/// node that asked, whether it fetched for the home or filled a chunk: every
+/// other node would ask S3 again. A node that gets no answer from S3 has
+/// failed on its own, and the gateway reads from the next candidate.
+#[tokio::test(flavor = "current_thread")]
+async fn s3s_errors_reach_the_client_and_a_nodes_own_go_to_the_next_candidate() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, origin) = start_origin().await;
+            let cluster =
+                Cluster::with_nodes(&data_dir(), origin_port, CLUSTER_CACHE, 3, GOSSIP, &[]);
+            let _nodes = [
+                cluster.start(0).await,
+                cluster.start(1).await,
+                cluster.start(2).await,
+            ];
+            let _gateway = cluster.start_gateway().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            origin.throttled.set(10);
+            let (status, body) = cluster.get("throttled").await;
+            assert_eq!(status, 503);
+            assert_eq!(String::from_utf8_lossy(&body), SLOW_DOWN);
+            assert_eq!(origin.requests.get(), 1);
+            origin.throttled.set(0);
+            origin.unanswered.set(1);
+            assert_eq!(cluster.get("unanswered").await, (200, object()));
+            assert_eq!(origin.requests.get(), 3);
+            // Eight chunks: with the metadata, the gateway reads the middle
+            // six from their owners, which fill them from S3.
+            origin.size.set(8 << 20);
+            let large = origin.object("/bucket/large");
+            assert_eq!(cluster.get("large").await, (200, large.clone()));
+            origin.throttled.set(1);
+            let (status, body) = cluster.get("large").await;
+            assert_eq!(status, 503);
+            assert_eq!(String::from_utf8_lossy(&body), SLOW_DOWN);
+            assert_eq!(cluster.get("large").await, (200, large));
+        })
+        .await;
+}
+
 /// A node starts and serves while its config names another node whose
 /// address does not resolve, as when that node's DNS name is gone.
 #[tokio::test(flavor = "current_thread")]
@@ -461,6 +502,10 @@ async fn a_hot_key_is_read_from_its_replicas() {
                 "{CLUSTER_CACHE}\nhot_threshold = 5\nhot_window_ms = 10000\nlease_ms = 60000"
             );
             let cluster = Cluster::with_nodes(&data_dir(), origin_port, &cache, 3, "", &[]);
+            // One loop, whose cached metadata the reads keep fresh. A loop
+            // whose entry expired would ask the home, which is down, and a
+            // replica would ask S3.
+            cluster.gateway_threads(1);
             let mut nodes: Vec<_> = Vec::new();
             for id in 0..3 {
                 nodes.push(Some(cluster.start(id).await));

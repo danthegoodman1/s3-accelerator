@@ -1,0 +1,142 @@
+# A short pass over every part of the harness and the cluster: S3
+# baselines, fills, hits, ranges and Parquet footers, writes through the
+# gateways, and a crash and restart under load. About 22 GiB in S3 and
+# twelve minutes of steps. Run it first on a new stack.
+#
+#   loadtest/loadtest seed loadtest/plans/smoke.toml
+#   loadtest/loadtest run loadtest/plans/smoke.toml
+
+[dataset]
+prefix = "smoke/v1"
+seed = 1
+
+[[dataset.sets]]
+name = "small"
+count = 20_000
+size = { log_uniform = ["4KiB", "256KiB"] }
+
+[[dataset.sets]]
+name = "large"
+count = 64
+size = "256MiB"
+
+[[dataset.sets]]
+name = "tables"
+count = 64
+size = { log_uniform = ["16MiB", "256MiB"] }
+format = "parquet"
+footer = "1MiB"
+
+# S3 itself, for comparison.
+
+[[steps]]
+name = "s3-small"
+target = "s3"
+duration = "60s"
+warmup = "10s"
+connections = 64
+[[steps.reads]]
+set = "small"
+
+[[steps]]
+name = "s3-large"
+target = "s3"
+duration = "60s"
+warmup = "10s"
+connections = 16
+[[steps.reads]]
+set = "large"
+
+# Fills: each window of keys twice, so the doorkeeper stores them.
+
+[[steps]]
+name = "fill-small"
+target = "cache"
+requests = 40_000
+connections = 64
+[[steps.reads]]
+set = "small"
+keys = "sequential"
+passes = 2
+window = 2_000
+
+[[steps]]
+name = "fill-large"
+target = "cache"
+requests = 128
+connections = 16
+[[steps.reads]]
+set = "large"
+keys = "sequential"
+passes = 2
+window = 32
+
+# Hits.
+
+[[steps]]
+name = "hits-small"
+target = "cache"
+duration = "60s"
+warmup = "10s"
+connections = 64
+[[steps.reads]]
+set = "small"
+
+[[steps]]
+name = "hits-large"
+target = "cache"
+duration = "60s"
+warmup = "10s"
+connections = 16
+[[steps.reads]]
+set = "large"
+
+# Ranges: small ranges of large objects, and a Parquet reader's footers and
+# row groups, which homes prefetch.
+
+[[steps]]
+name = "ranges"
+target = "cache"
+duration = "60s"
+warmup = "10s"
+connections = 64
+[[steps.reads]]
+set = "large"
+range = { size = "64KiB" }
+weight = 2
+[[steps.reads]]
+set = "tables"
+range = { suffix = "1MiB" }
+[[steps.reads]]
+set = "tables"
+range = { size = "8MiB" }
+
+[[steps]]
+name = "writes"
+target = "cache"
+duration = "30s"
+connections = 16
+[[steps.writes]]
+size = { log_uniform = ["64KiB", "16MiB"] }
+
+# A storage node crashes under load and comes back: its reads fail over,
+# and once it restarts it serves its blocks again.
+
+[[steps]]
+name = "crash"
+target = "cache"
+duration = "120s"
+connections = 32
+[[steps.reads]]
+set = "small"
+weight = 4
+[[steps.reads]]
+set = "large"
+[[steps.faults]]
+at = "30s"
+action = "kill"
+node = 1
+[[steps.faults]]
+at = "60s"
+action = "start"
+node = 1
