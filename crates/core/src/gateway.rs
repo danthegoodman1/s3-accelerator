@@ -527,8 +527,14 @@ impl Gateway {
                 self.abandon_parts_except(id, from);
                 self.start(id, head, VecDeque::from([from]));
             }
+            // The response starts once its first part answers, and the
+            // others' bodies follow in order. One that fails afterwards
+            // ends the response early, and the client's retry reads again.
             Stage::Parts { head, parts } => {
-                if parts.iter().all(|part| self.parts[part].answer.is_some()) {
+                if parts
+                    .front()
+                    .is_some_and(|first| self.parts[first].answer.is_some())
+                {
                     let (head, parts) = (head.clone(), parts.clone());
                     self.start(id, head, parts);
                 }
@@ -1685,6 +1691,61 @@ mod tests {
             .map(|(_, first, last)| (first, last))
             .collect();
         assert_eq!(whole, [(0, 255)]);
+    }
+
+    /// A response starts once its first part answers, while the others are
+    /// on their way, so a large read's first byte waits for one node.
+    #[test]
+    fn a_response_starts_on_its_first_parts_answer() {
+        let mut gateway = gateway();
+        let key = ObjectKey {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        let etag = ETag("\"v1\"".into());
+        gateway.on_request(Time(0), ClientRequestId(1), Request::head(key.clone()));
+        let home = sends(&gateway.drain())[0];
+        let meta = ObjectMeta {
+            etag: etag.clone(),
+            size: 256,
+            headers: Vec::new(),
+            age: 0,
+        };
+        gateway.on_node_metadata(Time(1), home, meta);
+        gateway.drain();
+        let client = ClientRequestId(2);
+        gateway.on_request(Time(2), client, Request::get(key));
+        let parts = sends(&gateway.drain());
+        assert!(parts.len() > 1, "the read asks several nodes: {parts:?}");
+        let (first, last) = match &gateway.parts[&parts[0]].what {
+            What::Range { runs, .. } => (runs[0].1, runs[runs.len() - 1].2),
+            What::Object(..) => unreachable!("a read of known metadata asks for ranges"),
+        };
+        let answer = ResponseHead {
+            status: 206,
+            etag: Some(etag),
+            content_range: Some(ContentRange {
+                first,
+                last,
+                size: 256,
+            }),
+            content_length: last - first + 1,
+            headers: Vec::new(),
+        };
+        gateway.on_node_response(Time(3), parts[0], answer, None, false);
+        let actions = gateway.drain();
+        assert!(
+            matches!(actions.first(), Some(Action::Start { request, .. }) if *request == client),
+            "{actions:?}"
+        );
+        assert_eq!(
+            actions.get(1),
+            Some(&Action::Forward {
+                request: client,
+                from: parts[0],
+                len: last - first + 1,
+            })
+        );
     }
 
     /// A node answers a part with other bytes than it asked for, as a node

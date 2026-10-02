@@ -493,6 +493,11 @@ MUTANTS = [
         [(NODE_ENGINE, "true => zero_copy::INLINE_TLS,", "true => 0,")],
     ),
     (
+        "a response waits for every part of its first window",
+        [(GATEWAY, "if parts.front().is_some_and(|first| self.parts[first].answer.is_some()) {",
+          "if parts.iter().all(|part| self.parts[part].answer.is_some()) {")],
+    ),
+    (
         "rings of one weight rank members by their lowest draw",
         [(PLACEMENT, "return ranked.max().map(|(_, id)| id);", "return ranked.min().map(|(_, id)| id);")],
     ),

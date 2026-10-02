@@ -354,8 +354,10 @@ async fn a_gateway_reaches_nodes_its_config_never_named() {
 
 /// S3's 503, which asks clients to slow down, reaches the client from the
 /// node that asked, whether it fetched for the home or filled a chunk: every
-/// other node would ask S3 again. A node that gets no answer from S3 has
-/// failed on its own, and the gateway reads from the next candidate.
+/// other node would ask S3 again. A response that started before a chunk's
+/// fill was refused ends early instead, and the client reads again. A node
+/// that gets no answer from S3 has failed on its own, and the gateway reads
+/// from the next candidate.
 #[tokio::test(flavor = "current_thread")]
 async fn s3s_errors_reach_the_client_and_a_nodes_own_go_to_the_next_candidate() {
     LocalSet::new()
@@ -385,9 +387,18 @@ async fn s3s_errors_reach_the_client_and_a_nodes_own_go_to_the_next_candidate() 
             let large = origin.object("/bucket/large");
             assert_eq!(cluster.get("large").await, (200, large.clone()));
             origin.throttled.set(1);
-            let (status, body) = cluster.get("large").await;
-            assert_eq!(status, 503);
-            assert_eq!(String::from_utf8_lossy(&body), SLOW_DOWN);
+            match try_get(cluster.gateway_port, "/bucket/large").await {
+                Some((503, body)) => assert_eq!(String::from_utf8_lossy(&body), SLOW_DOWN),
+                // The first chunk answered, and the response started, before
+                // the throttled fill: it ends early.
+                None => {}
+                Some((status, body)) => {
+                    panic!(
+                        "a throttled read answered {status} with {} bytes",
+                        body.len()
+                    )
+                }
+            }
             assert_eq!(cluster.get("large").await, (200, large));
         })
         .await;
