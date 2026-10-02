@@ -19,9 +19,9 @@ A distributed NVMe read cache in front of S3. Clients keep their S3 SDKs and poi
 - [Operator guide](#operator-guide)
 - [Development](#development)
 
-![The scale test, over time: each storage node's throughput, each gateway's latency, each storage node's requests per second and block hit rate](docs/scale-test.png)
+![256 MiB objects through the cache, over time: each storage node host's throughput, reads per second and block hit rate, and each client host's time to first byte](docs/scale-test.png)
 
-*The scale test over time. Each line is one storage node host, except in the latency panel, where each pair is one client host. Shaded bands read S3 directly, so the latency lines there are S3's. In `cold-medium` the clients read a cold set three times: the hit rate falls to zero while the first pass streams and the second admits, then returns to 100%. The last segment ran large reads with one node process per host; see [the scale test](#the-scale-test).*
+*Six storage nodes serve 256 MiB objects to ten client hosts. In `warm-large` the cache starts cold: nodes fetch from S3, admit each block on its second read, and the hit rate climbs to 100%. Then each client reads with 64 connections, and every node sends about 170 Gb/s, its share of the clients' 1 Tb/s, at 4% CPU, while first byte holds near 3 ms at p50. The p99 spikes near 210 ms are TCP retransmission timeouts. Each line is one storage node host, except in the latency panel, where each pair is one client host.*
 
 ## The scale test
 

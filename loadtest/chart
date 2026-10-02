@@ -7,15 +7,15 @@
 - each storage node host's block hit rate: blocks served from disk over
   blocks read.
 
-    loadtest/chart OUTPUT.png [--label RUN=TEXT]... RUN [RUN...]
+    loadtest/chart OUTPUT.png [--title TEXT] [--steps A,B] [--label RUN=TEXT]... RUN [RUN...]
 
 The node panels come from the samples `loadtest run` records on every host
 every 5 seconds (RUN/samples), and the latency panel from the load
 generator's per-second timelines (RUN/results). Shaded bands mark steps that
 read S3 directly, where the latency lines are S3's. Several runs, such as a
 plan and its follow-up, follow one another on the time axis, with the idle
-time between them left out; `--label` names a run's segment. Needs
-matplotlib.
+time between them left out; `--steps` draws only the named steps, and
+`--label` names a run's segment. Needs matplotlib.
 """
 import json
 import math
@@ -163,7 +163,17 @@ def gaps(points, limit):
 
 def main():
     args = sys.argv[1:]
-    labels = {}
+    labels, only = {}, None
+    title = None
+    if "--title" in args:
+        index = args.index("--title")
+        title = args[index + 1]
+        del args[index:index + 2]
+    if "--steps" in args:
+        # --steps A,B draws only those steps.
+        index = args.index("--steps")
+        only = set(args[index + 1].split(","))
+        del args[index:index + 2]
     if "--label" in args:
         # --label RUN=TEXT names a run's segment, such as a different layout.
         while "--label" in args:
@@ -184,9 +194,11 @@ def main():
         nodes = [host for host in samples if host.startswith("node") and samples[host]]
         if not nodes:
             sys.exit(f"no node samples in {run}/samples")
-        steps = read_steps([run])
-        first = max(min(min(samples[host]) for host in nodes), min(start for _, start, _, _ in steps) - 30)
-        last = min(max(max(samples[host]) for host in nodes), max(end for _, _, end, _ in steps) + 30)
+        steps = [step for step in read_steps([run]) if only is None or step[0] in only]
+        if not steps:
+            continue
+        first = max(min(min(samples[host]) for host in nodes), min(start for _, start, _, _ in steps))
+        last = min(max(max(samples[host]) for host in nodes), max(end for _, _, end, _ in steps))
         segments.append({"run": run, "samples": samples, "steps": steps, "latency": read_latency([run]),
                          "first": first, "last": last, "offset": offset})
         offset += (last - first) / 60 + GAP
@@ -252,16 +264,21 @@ def main():
     reads.set_ylim(bottom=0)
     hits.set_ylim(-2, 102)
     for axis in (reads, hits):
-        axis.set_xlabel("minutes of load, idle time between runs left out", color=MUTED, fontsize=9)
+        axis.set_xlabel("minutes of load, idle time between runs left out" if len(segments) > 1 else "minutes",
+                        color=MUTED, fontsize=9)
     reads.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v / 1000:g}k" if v else "0"))
 
-    band = Patch(color=S3_BAND, label="S3 directly")
+    # The S3 band joins the legends only when a step read S3 directly.
+    direct = any(target == "s3" for segment in segments for _, _, _, target in segment["steps"])
+    band = [Patch(color=S3_BAND)] if direct else []
     handles, names = throughput.get_legend_handles_labels()
-    throughput.legend(handles + [band], names + ["S3 directly"], loc="upper left", bbox_to_anchor=(0, -0.02),
-                      ncol=len(hosts) + 1, frameon=False, fontsize=8, labelcolor=INK)
-    delay.legend([plt.Line2D([], [], color=SERIES[0]), plt.Line2D([], [], color=SERIES[1]), band],
-                 [f"p50, each of {clients} client hosts", "p99", "S3 directly"], loc="upper left",
+    throughput.legend(handles + band, names + ["S3 directly"] * len(band), loc="upper left",
+                      bbox_to_anchor=(0, -0.02), ncol=len(hosts) + 1, frameon=False, fontsize=8, labelcolor=INK)
+    delay.legend([plt.Line2D([], [], color=SERIES[0]), plt.Line2D([], [], color=SERIES[1])] + band,
+                 [f"p50, each of {clients} client hosts", "p99"] + ["S3 directly"] * len(band), loc="upper left",
                  bbox_to_anchor=(0, -0.02), ncol=3, frameon=False, fontsize=8, labelcolor=INK)
+    if title:
+        figure.suptitle(title, x=0.01, ha="left", fontsize=13, color=INK)
     figure.tight_layout(h_pad=3.2, w_pad=2.5)
     figure.savefig(output, dpi=150, facecolor=SURFACE)
     print(output)
