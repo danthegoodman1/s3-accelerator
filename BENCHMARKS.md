@@ -213,7 +213,7 @@ Each node's figure counts object bytes; TCP, IP and Ethernet headers add about 0
 - **A cold set read three times** (`cold-medium`, about 870 GiB a pass): 20.5 GiB/s over the three passes; the block hit rate stays at zero while the first pass streams and the second admits, then holds at 100%.
 - **Errors:** S3 answered 67 of the 4.0 million direct requests with a 500, and one timed out; the cache passed on S3's 500s for 14 fills.
 
-`docs/scale-test.png` draws `scale-1proc`'s `warm-large` and `hits-large-c64` over time: `loadtest/chart docs/scale-test.png --steps warm-large,hits-large-c64 loadtest/runs/scale-1proc`. At p99, first byte spikes to about 210 ms several times a minute: Linux's 200 ms minimum retransmission timeout, so packets were lost.
+`docs/scale-test.png` draws `scale-1proc`'s `hits-large-c64` and `scale`'s `ranges-4k-c64` over their measured windows: `loadtest/chart docs/scale-test.png "loadtest/runs/scale-1proc:hits-large-c64:TITLE" "loadtest/runs/scale:ranges-4k-c64:TITLE"`. In the large reads, first byte spikes to about 210 ms at p99 several times a minute: Linux's 200 ms minimum retransmission timeout, so packets were lost.
 
 ### What limits each workload
 

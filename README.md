@@ -19,9 +19,9 @@ A distributed NVMe read cache in front of S3. Clients keep their S3 SDKs and poi
 - [Operator guide](#operator-guide)
 - [Development](#development)
 
-![256 MiB objects through the cache, over time: each storage node host's throughput, reads per second and block hit rate, and each client host's time to first byte](docs/scale-test.png)
+![Two tests over time: 256 MiB objects and 4 KiB ranges, each with every storage node host's throughput, reads per second and block hit rate, and every client host's time to first byte](docs/scale-test.png)
 
-*Six storage nodes serve 256 MiB objects to ten client hosts. In `warm-large` the cache starts cold: nodes fetch from S3, admit each block on its second read, and the hit rate climbs to 100%. Then each client reads with 64 connections, and every node sends about 170 Gb/s, its share of the clients' 1 Tb/s, at 4% CPU, while first byte holds near 3 ms at p50. The p99 spikes near 210 ms are TCP retransmission timeouts. Each line is one storage node host, except in the latency panel, where each pair is one client host.*
+*Two tests from the scale run, each over its measured 100 seconds. Top: 256 MiB objects at 64 connections per client host, with one node process per storage host. Every node sends about 170 Gb/s, its share of the clients' 1 Tb/s, while first byte holds near 3 ms at p50; the p99 spikes near 210 ms are TCP retransmission timeouts. Bottom: 4 KiB ranges at 64 connections per client host, with 32 node processes per storage host: 1.64 million reads a second, first byte 0.38 ms at p50 and 0.65 ms at p99. Each line is one storage node host, except in the latency panels, where each pair is one client host.*
 
 ## The scale test
 

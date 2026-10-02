@@ -788,7 +788,10 @@ def fetch_samples(setup, run):
 def snapshot(setup, run, step, moment):
     """Saves every process's /metrics and every host's kernel counters."""
     counters = ("echo '== time'; date +%s.%N; echo '== cpu'; head -1 /proc/stat; echo '== net'; cat /proc/net/dev; "
-                f"echo '== devices'; cat {ETC}/cache-devices 2>/dev/null; echo '== disk'; cat /proc/diskstats")
+                f"echo '== devices'; cat {ETC}/cache-devices 2>/dev/null; echo '== disk'; cat /proc/diskstats; "
+                "echo '== tcp'; cat /proc/net/snmp /proc/net/netstat; echo '== nic'; "
+                "for card in $(ls /sys/class/net | grep -v '^lo$'); do "
+                "sudo ethtool -S $card 2>/dev/null | grep -E 'allowance_exceeded|drop'; done")
 
     def metrics(process):
         text = remote(setup, process.host, f"curl -s --max-time 10 http://{process.admin}/metrics", check=False)

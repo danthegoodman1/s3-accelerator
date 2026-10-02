@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Draws a load test over time, in four panels:
+"""Draws load test steps over time, a row of four panels for each:
 
 - each storage node host's network throughput, in Gb/s;
 - each client host's time to first byte, p50 and p99, in ms;
@@ -7,15 +7,14 @@
 - each storage node host's block hit rate: blocks served from disk over
   blocks read.
 
-    loadtest/chart OUTPUT.png [--title TEXT] [--steps A,B] [--label RUN=TEXT]... RUN [RUN...]
+    loadtest/chart OUTPUT.png RUN[:STEP,STEP...[:TITLE]]...
 
-The node panels come from the samples `loadtest run` records on every host
-every 5 seconds (RUN/samples), and the latency panel from the load
-generator's per-second timelines (RUN/results). Shaded bands mark steps that
-read S3 directly, where the latency lines are S3's. Several runs, such as a
-plan and its follow-up, follow one another on the time axis, with the idle
-time between them left out; `--steps` draws only the named steps, and
-`--label` names a run's segment. Needs matplotlib.
+Each argument is a row: a run, optionally the steps to draw (all of them
+otherwise) and the row's title. A step's warmup is left out. The node
+panels come from the samples `loadtest run` records on every host every 5
+seconds (RUN/samples), and the latency panel from the load generator's
+per-second timelines (RUN/results). Shaded bands mark steps that read S3
+directly, where the latency lines are S3's. Needs matplotlib.
 """
 import json
 import math
@@ -35,8 +34,6 @@ INK = "#2b2b29"
 MUTED = "#6b6a63"
 GRID = "#e4e3dd"
 S3_BAND = "#efe9df"
-# Minutes between runs on the time axis.
-GAP = 0.6
 
 
 def highest(bits, bucket):
@@ -138,9 +135,9 @@ def read_latency(runs):
 
 def style(axis, title, unit):
     axis.set_facecolor(SURFACE)
-    axis.set_title(title, loc="left", fontsize=11, color=INK, pad=8)
+    axis.set_title(title, loc="left", fontsize=10, color=INK, pad=6)
     axis.set_ylabel(unit, color=MUTED, fontsize=9)
-    axis.grid(True, axis="y", color=GRID, linewidth=0.8)
+    axis.grid(True, axis="y", which="major", color=GRID, linewidth=0.8)
     axis.tick_params(colors=MUTED, labelsize=8, length=0)
     for side in ("top", "right", "left"):
         axis.spines[side].set_visible(False)
@@ -148,7 +145,7 @@ def style(axis, title, unit):
 
 
 def gaps(points, limit):
-    """Splits a line where samples are more than `limit` seconds apart."""
+    """Splits a line where points are more than `limit` apart."""
     xs, ys = [], []
     last = None
     for x, y in points:
@@ -161,125 +158,100 @@ def gaps(points, limit):
     return xs, ys
 
 
-def main():
-    args = sys.argv[1:]
-    labels, only = {}, None
-    title = None
-    if "--title" in args:
-        index = args.index("--title")
-        title = args[index + 1]
-        del args[index:index + 2]
-    if "--steps" in args:
-        # --steps A,B draws only those steps.
-        index = args.index("--steps")
-        only = set(args[index + 1].split(","))
-        del args[index:index + 2]
-    if "--label" in args:
-        # --label RUN=TEXT names a run's segment, such as a different layout.
-        while "--label" in args:
-            index = args.index("--label")
-            run, text = args[index + 1].split("=", 1)
-            labels[Path(run).name] = text
-            del args[index:index + 2]
-    if len(args) < 2:
-        sys.exit(__doc__)
-    output, runs = Path(args[0]), [Path(arg) for arg in args[1:]]
+def milliseconds(value, _):
+    return f"{value:g} ms"
 
-    # Each run takes the span its samples cover, and the runs follow one
-    # another on the time axis with a short gap where the idle time between
-    # them was.
-    segments, offset = [], 0.0
-    for run in runs:
-        samples = read_samples([run])
-        nodes = [host for host in samples if host.startswith("node") and samples[host]]
-        if not nodes:
-            sys.exit(f"no node samples in {run}/samples")
-        steps = [step for step in read_steps([run]) if only is None or step[0] in only]
-        if not steps:
-            continue
-        first = max(min(min(samples[host]) for host in nodes), min(start for _, start, _, _ in steps))
-        last = min(max(max(samples[host]) for host in nodes), max(end for _, _, end, _ in steps))
-        segments.append({"run": run, "samples": samples, "steps": steps, "latency": read_latency([run]),
-                         "first": first, "last": last, "offset": offset})
-        offset += (last - first) / 60 + GAP
 
-    figure, axes = plt.subplots(2, 2, figsize=(15, 8.6), sharex=True, facecolor=SURFACE)
-    (throughput, delay), (reads, hits) = axes
-    hosts = sorted({host for segment in segments for host in segment["samples"] if host.startswith("node")},
+def row(figure, run, only, title, nodes_legend):
+    """Draws one row: a run's steps, from the first's measured start to the
+    last's end."""
+    samples = read_samples([run])
+    steps = [step for step in read_steps([run]) if only is None or step[0] in only]
+    if not steps:
+        sys.exit(f"no such steps in {run}")
+    nodes = sorted((host for host in samples if host.startswith("node") and samples[host]),
                    key=lambda host: int(host.split("-")[1]))
-    labelled = set()
-    for segment in segments:
-        first, last = segment["first"], segment["last"]
-        minutes = lambda t, segment=segment: segment["offset"] + (t - segment["first"]) / 60  # noqa: E731
-        steps = [(name, max(start, first), min(end, last), target) for name, start, end, target in segment["steps"]
-                 if end > first and start < last]
-        for axis in axes.flat:
-            if segment["offset"] > 0:
-                axis.axvline(segment["offset"] - GAP / 2, color=MUTED, linewidth=0.8, linestyle=(0, (2, 2)))
-            for name, start, end, target in steps:
-                if target == "s3":
-                    axis.axvspan(minutes(start), minutes(end), color=S3_BAND, linewidth=0, zorder=0)
-                axis.axvline(minutes(start), color=GRID, linewidth=0.8, zorder=0)
-        for axis in (throughput, delay):
-            top = axis.get_xaxis_transform()
-            for name, start, end, target in steps:
-                axis.text(minutes(start) + 0.12, 0.99, name, transform=top, rotation=90, va="top", ha="left",
-                          fontsize=6.5, color=MUTED, zorder=3)
-            text = labels.get(segment["run"].name)
-            if text:
-                axis.text(segment["offset"] + 0.1, 1.035, text, transform=top, fontsize=7.5, color=INK,
-                          ha="left", va="bottom")
+    first, last = min(start for _, start, _, _ in steps), max(end for _, _, end, _ in steps)
+    seconds = lambda t: t - first  # noqa: E731
+    latency = read_latency([run])
+    (throughput, delay, reads, hits) = figure.subplots(1, 4, sharex=True)
+    if title:
+        figure.suptitle(title, x=0.01, ha="left", fontsize=12, color=INK)
+    for axis in (throughput, delay, reads, hits):
+        for name, start, end, target in steps:
+            if target == "s3":
+                axis.axvspan(seconds(start), seconds(end), color=S3_BAND, linewidth=0, zorder=0)
+            if len(steps) > 1:
+                axis.axvline(seconds(start), color=GRID, linewidth=0.8, zorder=0)
+                axis.text(seconds(start) + 1, 0.99, name, transform=axis.get_xaxis_transform(), rotation=90,
+                          va="top", ha="left", fontsize=6.5, color=MUTED)
+        axis.set_xlim(0, last - first)
+        axis.set_xlabel("seconds", color=MUTED, fontsize=9)
 
-        for index, host in enumerate(hosts):
-            if host not in segment["samples"]:
-                continue
-            color = SERIES[index % len(SERIES)]
-            intervals = [(t, e, d) for t, e, d in rates(segment["samples"][host]) if first <= t <= last]
-            lines = {
-                throughput: [(minutes(t), d["tx"] * 8 / e / 1e9) for t, e, d in intervals if "tx" in d],
-                reads: [(minutes(t), d["reads"] / e) for t, e, d in intervals if "reads" in d],
-                hits: [(minutes(t), 100 * d["hit"] / (d["hit"] + d["fetched"])) for t, e, d in intervals
-                       if d.get("hit", 0) + d.get("fetched", 0) >= 50],
-            }
-            for axis, points in lines.items():
-                xs, ys = gaps(points, 0.5)
-                label = host if (axis, host) not in labelled else None
-                labelled.add((axis, host))
-                axis.plot(xs, ys, color=color, linewidth=1.4, label=label)
+    for index, host in enumerate(nodes):
+        color = SERIES[index % len(SERIES)]
+        # Only intervals wholly inside the window, so its edges don't dip.
+        intervals = [(t, e, d) for t, e, d in rates(samples[host]) if first <= t - e / 2 and t + e / 2 <= last]
+        lines = {
+            throughput: [(seconds(t), d["tx"] * 8 / e / 1e9) for t, e, d in intervals if "tx" in d],
+            reads: [(seconds(t), d["reads"] / e) for t, e, d in intervals if "reads" in d],
+            hits: [(seconds(t), 100 * d["hit"] / (d["hit"] + d["fetched"])) for t, e, d in intervals
+                   if d.get("hit", 0) + d.get("fetched", 0) >= 50],
+        }
+        for axis, points in lines.items():
+            xs, ys = gaps(points, 30)
+            axis.plot(xs, ys, color=color, linewidth=1.4, label=host)
 
-        for host, points in sorted(segment["latency"].items()):
-            inside = [(minutes(t), p50, p99) for t, p50, p99 in points if first <= t <= last]
-            for column, color in ((1, SERIES[0]), (2, SERIES[1])):
-                xs, ys = gaps([(row[0], row[column]) for row in inside], 0.1)
-                delay.plot(xs, ys, color=color, linewidth=0.7, alpha=0.55)
-    clients = max(len(segment["latency"]) for segment in segments)
-
+    lowest = 1.0
+    for host, points in sorted(latency.items()):
+        # A step's last second is partial, so it's left out.
+        inside = [(seconds(t), p50, p99) for t, p50, p99 in points if first <= t <= last - 1]
+        lowest = min([lowest] + [p50 for _, p50, _ in inside])
+        for column, color in ((1, SERIES[0]), (2, SERIES[1])):
+            xs, ys = gaps([(row_[0], row_[column]) for row_ in inside], 2)
+            delay.plot(xs, ys, color=color, linewidth=0.7, alpha=0.6)
     delay.set_yscale("log")
-    delay.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}"))
-    style(throughput, "Network throughput, each storage node host", "Gb/s")
-    style(delay, "Time to first byte, each client host", "ms, log scale")
+    # Every row spans the same decades, so rows compare at a glance.
+    highest = max([1000.0] + [p99 for points in latency.values() for t, _, p99 in points if first <= t <= last - 1])
+    delay.set_ylim(min(0.1, lowest / 1.5), highest * 1.2)
+    delay.yaxis.set_major_locator(matplotlib.ticker.LogLocator(base=10, numticks=12))
+    delay.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+    delay.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(milliseconds))
+    delay.axhline(1, color=MUTED, linewidth=1.0, linestyle=(0, (4, 3)), zorder=1)
+
+    style(throughput, "Throughput, each storage node host", "Gb/s")
+    style(delay, "Time to first byte, each client host", "")
     style(reads, "Reads, each storage node host", "reads/s")
     style(hits, "Block hit rate, each storage node host", "%")
     throughput.set_ylim(bottom=0)
     reads.set_ylim(bottom=0)
     hits.set_ylim(-2, 102)
-    for axis in (reads, hits):
-        axis.set_xlabel("minutes of load, idle time between runs left out" if len(segments) > 1 else "minutes",
-                        color=MUTED, fontsize=9)
-    reads.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v / 1000:g}k" if v else "0"))
-
-    # The S3 band joins the legends only when a step read S3 directly.
-    direct = any(target == "s3" for segment in segments for _, _, _, target in segment["steps"])
+    reads.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(
+        lambda v, _: f"{v / 1000:g}k" if v >= 1000 else f"{v:g}"))
+    direct = any(target == "s3" for _, _, _, target in steps)
     band = [Patch(color=S3_BAND)] if direct else []
-    handles, names = throughput.get_legend_handles_labels()
-    throughput.legend(handles + band, names + ["S3 directly"] * len(band), loc="upper left",
-                      bbox_to_anchor=(0, -0.02), ncol=len(hosts) + 1, frameon=False, fontsize=8, labelcolor=INK)
     delay.legend([plt.Line2D([], [], color=SERIES[0]), plt.Line2D([], [], color=SERIES[1])] + band,
-                 [f"p50, each of {clients} client hosts", "p99"] + ["S3 directly"] * len(band), loc="upper left",
-                 bbox_to_anchor=(0, -0.02), ncol=3, frameon=False, fontsize=8, labelcolor=INK)
-    if title:
-        figure.suptitle(title, x=0.01, ha="left", fontsize=13, color=INK)
-    figure.tight_layout(h_pad=3.2, w_pad=2.5)
+                 [f"p50, each of {len(latency)} client hosts", "p99"] + ["S3 directly"] * len(band),
+                 loc="upper left", bbox_to_anchor=(0, -0.13), ncol=3, frameon=False, fontsize=8, labelcolor=INK)
+    if nodes_legend:
+        throughput.legend(loc="upper left", bbox_to_anchor=(0, -0.13), ncol=3, frameon=False, fontsize=8,
+                          labelcolor=INK)
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit(__doc__)
+    output, rows = Path(sys.argv[1]), sys.argv[2:]
+    figure = plt.figure(figsize=(18, 4.6 * len(rows)), facecolor=SURFACE, layout="constrained")
+    figure.get_layout_engine().set(h_pad=0.15, hspace=0.12)
+    subfigures = figure.subfigures(len(rows), 1) if len(rows) > 1 else [figure]
+    for index, (subfigure, argument) in enumerate(zip(subfigures, rows)):
+        parts = argument.split(":", 2)
+        run = Path(parts[0])
+        only = set(parts[1].split(",")) if len(parts) > 1 and parts[1] else None
+        title = parts[2] if len(parts) > 2 else None
+        subfigure.set_facecolor(SURFACE)
+        row(subfigure, run, only, title, nodes_legend=True)
     figure.savefig(output, dpi=150, facecolor=SURFACE)
     print(output)
 

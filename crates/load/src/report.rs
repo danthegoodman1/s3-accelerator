@@ -670,13 +670,32 @@ struct HostCounters {
     sent: f64,
     read: f64,
     written: f64,
+    /// The kernel's TCP counters (`/proc/net/snmp` and `/proc/net/netstat`),
+    /// as `Tcp:RetransSegs` or `TcpExt:TCPTimeouts`.
+    tcp: BTreeMap<String, f64>,
+    /// The network cards' drop counters (`ethtool -S`), summed over cards.
+    nic: BTreeMap<String, f64>,
 }
+
+/// TCP counters the report shows, and their columns.
+const TCP_SHOWN: [(&str, &str); 7] = [
+    ("Tcp:RetransSegs", "Segments retransmitted"),
+    ("TcpExt:TCPTimeouts", "Retransmission timeouts"),
+    ("TcpExt:TCPLossProbes", "Tail loss probes"),
+    ("TcpExt:TCPRcvQDrop", "Receive queue drops"),
+    ("TcpExt:TCPMemoryPressures", "Memory pressure"),
+    ("TcpExt:DelayedACKs", "Delayed ACKs"),
+    ("TcpExt:TCPBacklogDrop", "Backlog drops"),
+];
 
 fn host_counters(text: &str) -> HostCounters {
     let mut counters = HostCounters::default();
     let mut section = "";
     let mut devices: Vec<String> = Vec::new();
     let mut disks: Vec<(String, f64, f64)> = Vec::new();
+    // `/proc/net/snmp` and `/proc/net/netstat` give each table as a line
+    // of names, then a line of values, under one prefix.
+    let mut names: Option<(String, Vec<String>)> = None;
     for line in text.lines() {
         if let Some(name) = line.strip_prefix("== ") {
             section = name.trim();
@@ -711,6 +730,31 @@ fn host_counters(text: &str) -> HostCounters {
                     }
                 }
             }
+            "tcp" => {
+                let Some(prefix) = fields.first().filter(|field| field.ends_with(':')) else {
+                    continue;
+                };
+                match names.take() {
+                    Some((named, keys)) if named == *prefix && fields[1].parse::<f64>().is_ok() => {
+                        for (key, value) in keys.iter().zip(&fields[1..]) {
+                            if let Ok(value) = value.parse::<f64>() {
+                                counters.tcp.insert(format!("{prefix}{key}"), value);
+                            }
+                        }
+                    }
+                    _ => {
+                        let keys = fields[1..].iter().map(|key| key.to_string()).collect();
+                        names = Some((prefix.to_string(), keys));
+                    }
+                }
+            }
+            "nic" => {
+                if let Some((name, value)) = line.split_once(':')
+                    && let Ok(value) = value.trim().parse::<f64>()
+                {
+                    *counters.nic.entry(name.trim().to_string()).or_default() += value;
+                }
+            }
             "devices" => devices.extend(fields.iter().map(|field| field.to_string())),
             "disk" if fields.len() >= 10 => {
                 let sectors = |index: usize| fields[index].parse::<f64>().unwrap_or(0.0) * 512.0;
@@ -738,6 +782,7 @@ fn host_counters(text: &str) -> HostCounters {
 /// snapshot without its time counts the measured `seconds`.
 fn hosts(out: &mut String, dir: &Path, seconds: f64) {
     let mut rows = Vec::new();
+    let mut tcp_rows = Vec::new();
     for name in listed(dir) {
         let Some(host) = name.strip_suffix(".after.txt") else {
             continue;
@@ -753,6 +798,28 @@ fn hosts(out: &mut String, dir: &Path, seconds: f64) {
             (Some(before), Some(after)) if after > before => after - before,
             _ => seconds,
         };
+        if !after.tcp.is_empty() {
+            let delta = |map: &BTreeMap<String, f64>, old: &BTreeMap<String, f64>, key: &str| {
+                map.get(key).copied().unwrap_or(0.0) - old.get(key).copied().unwrap_or(0.0)
+            };
+            let tcp: Vec<String> = TCP_SHOWN
+                .iter()
+                .map(|(key, _)| format!("{:.0}", delta(&after.tcp, &before.tcp, key)))
+                .collect();
+            let sent = delta(&after.tcp, &before.tcp, "Tcp:OutSegs").max(1.0);
+            let retransmitted = delta(&after.tcp, &before.tcp, "Tcp:RetransSegs");
+            let nic: f64 = after
+                .nic
+                .keys()
+                .filter(|key| key.contains("allowance_exceeded"))
+                .map(|key| delta(&after.nic, &before.nic, key))
+                .sum();
+            tcp_rows.push(format!(
+                "| {host} | {} | {:.3}% | {nic:.0} |",
+                tcp.join(" | "),
+                100.0 * retransmitted / sent
+            ));
+        }
         let busy = after.cpu_busy - before.cpu_busy;
         let total = (after.cpu_total - before.cpu_total).max(1.0);
         rows.push(format!(
@@ -774,11 +841,36 @@ fn hosts(out: &mut String, dir: &Path, seconds: f64) {
     for row in rows {
         let _ = writeln!(out, "{row}");
     }
+    if tcp_rows.is_empty() {
+        return;
+    }
+    let columns: Vec<&str> = TCP_SHOWN.iter().map(|(_, column)| *column).collect();
+    let _ = writeln!(
+        out,
+        "\nTCP and network cards over the same time: the kernel's counts, the share of segments sent again, and packets the network card held back past its allowances:\n\n| Host | {} | Retransmitted | Card allowance drops |\n|---|{}--:|--:|",
+        columns.join(" | "),
+        "--:|".repeat(columns.len())
+    );
+    for row in tcp_rows {
+        let _ = writeln!(out, "{row}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_snapshot_gives_tcp_and_network_card_counters() {
+        let text = "== tcp\nTcp: RtoAlgorithm OutSegs RetransSegs\nTcp: 1 1000 7\n\
+                    TcpExt: DelayedACKs TCPTimeouts\nTcpExt: 40 3\n\
+                    == nic\n     bw_in_allowance_exceeded: 5\n     bw_in_allowance_exceeded: 2\n";
+        let counters = host_counters(text);
+        assert_eq!(counters.tcp["Tcp:RetransSegs"], 7.0);
+        assert_eq!(counters.tcp["Tcp:OutSegs"], 1000.0);
+        assert_eq!(counters.tcp["TcpExt:TCPTimeouts"], 3.0);
+        assert_eq!(counters.nic["bw_in_allowance_exceeded"], 7.0);
+    }
 
     #[test]
     fn a_scrape_sums_by_labels() {
