@@ -4,8 +4,8 @@
 mod common;
 
 use common::{
-    CLUSTER_CACHE, Cluster, LISTING, Process, SLOW_DOWN, data_dir, listening, object, object_of,
-    send, send_for_headers, start_origin, start_queue, try_get,
+    CLUSTER_CACHE, Cluster, LISTING, Pinned, Process, SLOW_DOWN, data_dir, listening, object,
+    object_of, send, send_for_headers, start_origin, start_queue, try_get,
 };
 use s3_accelerator::http::header;
 use s3_accelerator::peers::Peers;
@@ -79,6 +79,69 @@ async fn a_node_restart_keeps_the_cache_warm() {
         .await;
 }
 
+/// Links between gateways and nodes resend a lost segment within
+/// milliseconds: from its handshake on, each end's retransmission timeout
+/// sits near the cluster's 5 ms floor, as `ss` shows, while clients' links
+/// keep Linux's 200 ms. Timers of 0 keep Linux's on cluster links too.
+#[tokio::test(flavor = "current_thread")]
+async fn cluster_links_resend_lost_segments_within_milliseconds() {
+    LocalSet::new()
+        .run_until(async {
+            let (origin_port, _origin) = start_origin().await;
+            let cluster = Cluster::new(&data_dir(), origin_port, CLUSTER_CACHE);
+            let _node = cluster.start_node().await;
+            let _gateway = cluster.start_gateway().await;
+            let client = Pinned::new(cluster.gateway_port);
+            let read = client.send("GET", "/bucket/k", Vec::new()).await;
+            assert_eq!(read, (200, object()));
+            let node = cluster.node_port;
+            let links = timeouts(&format!("( sport = :{node} or dport = :{node} )"));
+            assert!(
+                links.len() >= 2,
+                "ss found {} ends of links to the node",
+                links.len()
+            );
+            assert!(
+                links.iter().all(|rto| *rto < 50),
+                "retransmission timeouts on links to the node: {links:?} ms"
+            );
+            let clients = timeouts(&format!("( sport = :{} )", cluster.gateway_port));
+            assert!(
+                !clients.is_empty() && clients.iter().all(|rto| *rto >= 200),
+                "retransmission timeouts on client links: {clients:?} ms"
+            );
+
+            let linux = "[cluster.tcp]\nrto_min_us = 0\ndelack_max_us = 0";
+            let cluster =
+                Cluster::with_nodes(&data_dir(), origin_port, CLUSTER_CACHE, 1, linux, &[]);
+            let _node = cluster.start_node().await;
+            let _gateway = cluster.start_gateway().await;
+            assert_eq!(cluster.get("k").await, (200, object()));
+            let node = cluster.node_port;
+            let links = timeouts(&format!("( sport = :{node} or dport = :{node} )"));
+            assert!(
+                !links.is_empty() && links.iter().all(|rto| *rto >= 200),
+                "retransmission timeouts with Linux's timers: {links:?} ms"
+            );
+        })
+        .await;
+}
+
+/// The retransmission timeout, in ms, of each established TCP socket that
+/// `ss` matches with `filter`.
+fn timeouts(filter: &str) -> Vec<u32> {
+    let out = std::process::Command::new("ss")
+        .args(["-tin", "state", "established", filter])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .filter_map(|field| field.strip_prefix("rto:"))
+        .filter_map(|rto| rto.parse::<f64>().ok())
+        .map(|rto| rto as u32)
+        .collect()
+}
+
 /// A node killed while it fills many objects comes back serving every one
 /// correctly: blocks whose writes it finished, verified first, and the rest
 /// from S3. Each round kills it at a different moment, so some land while
@@ -146,7 +209,12 @@ async fn a_process_without_the_clusters_secret_can_not_join() {
             let _node = cluster.start(0).await;
             let ring_of_node_0 = |secret: &str| {
                 let address = format!("127.0.0.1:{}", cluster.nodes[0].0);
-                let peers = Peers::new(BTreeMap::from([(NodeId(0), address)]), secret.into(), None);
+                let peers = Peers::new(
+                    BTreeMap::from([(NodeId(0), address)]),
+                    secret.into(),
+                    None,
+                    Default::default(),
+                );
                 async move {
                     match peers.exchange(NodeId(0), &NodeRequest::Ring).await?.answer {
                         NodeAnswer::Ring { ring, .. } => Ok(members(&ring)),

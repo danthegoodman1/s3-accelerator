@@ -429,6 +429,7 @@ def render(setup, facts, secrets):
                 "secret_access_key": secrets["client_secret_access_key"],
                 "grants": [{"bucket": bucket, "access": "write"}]}]
     membership = settings.get("membership", {})
+    tcp = settings.get("tcp", {})
     warned = []
     for process in setup.processes():
         host = process.host
@@ -463,6 +464,8 @@ def render(setup, facts, secrets):
                                             "nodes": members(host if process.node else None)}))
         if membership:
             parts.append(toml_table("cluster.membership", membership))
+        if tcp:
+            parts.append(toml_table("cluster.tcp", tcp))
         if tls:
             parts.append(toml_table("cluster.tls", {"ca": f"{ETC}/ca.pem", "cert": f"{ETC}/host.pem",
                                                     "key": f"{ETC}/host-key.pem"}))

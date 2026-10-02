@@ -2,6 +2,7 @@
 //! nodes both speak to storage nodes: connections kept idle between
 //! requests, and answers whose bodies stay in their connections until read.
 
+use crate::config::TcpConfig;
 use crate::http::{Connection, header};
 use crate::protocol::{self, NodeAnswer, NodeRequest, RequestId, Versions};
 use crate::tls::Connector;
@@ -12,12 +13,50 @@ use s3_accelerator_core::placement::NodeId;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
+use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::Duration;
 use tokio::io::Interest;
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Linux 6.15's socket options for those timers, which the libc crate
+/// lacks.
+const TCP_RTO_MIN_US: libc::c_int = 45;
+const TCP_DELACK_MAX_US: libc::c_int = 46;
+
+/// Sets the cluster's TCP timers on a socket for links between gateways and
+/// nodes, or between nodes, before its handshake: the handshake's round
+/// trip starts the timeout's estimate, which falls only slowly to a floor
+/// set later. A kernel that refuses them keeps its defaults, which only
+/// recover from losses more slowly.
+pub fn cluster_timers(socket: &impl AsRawFd, tcp: TcpConfig) {
+    let fd = socket.as_raw_fd();
+    for (option, value) in [
+        (TCP_RTO_MIN_US, tcp.rto_min_us),
+        (TCP_DELACK_MAX_US, tcp.delack_max_us),
+    ] {
+        let Ok(value) = libc::c_int::try_from(value) else {
+            continue;
+        };
+        if value == 0 {
+            continue;
+        }
+        // SAFETY: `fd` is open for the call, and the option's value is the
+        // `c_int` whose size it passes.
+        let _ = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                option,
+                (&raw const value).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+    }
+}
 
 pub struct Peers {
     /// Where each node listens, as the config and rings tell, and the
@@ -26,6 +65,7 @@ pub struct Peers {
     secret: Rc<str>,
     /// Nodes take members over mutual TLS when set.
     tls: Option<Connector>,
+    tcp: TcpConfig,
     idle: RefCell<BTreeMap<NodeId, Vec<Connection>>>,
 }
 
@@ -84,11 +124,13 @@ impl Peers {
         addresses: BTreeMap<NodeId, String>,
         secret: Rc<str>,
         tls: Option<Connector>,
+        tcp: TcpConfig,
     ) -> Rc<Peers> {
         Rc::new(Peers {
             addresses: RefCell::new(addresses),
             secret,
             tls,
+            tcp,
             idle: RefCell::new(BTreeMap::new()),
         })
     }
@@ -171,7 +213,7 @@ impl Peers {
     /// A new connection to the node at `address`, with its handshake done.
     async fn connect(&self, address: &str) -> io::Result<Connection> {
         let connecting = async {
-            let stream = TcpStream::connect(address).await?;
+            let stream = connect_tuned(address, self.tcp).await?;
             stream.set_nodelay(true)?;
             match &self.tls {
                 Some(tls) => Ok(Connection::tls(tls.connect(stream, address).await?)),
@@ -223,6 +265,24 @@ impl Peers {
         self.idle(body);
         Ok(bytes.into())
     }
+}
+
+/// Connects to the first of `address`'s addresses that answers, with the
+/// cluster's TCP timers set before the handshake.
+async fn connect_tuned(address: &str, tcp: TcpConfig) -> io::Result<TcpStream> {
+    let mut failure = io::Error::new(io::ErrorKind::InvalidInput, "no address to connect to");
+    for address in tokio::net::lookup_host(address).await? {
+        let socket = match address {
+            SocketAddr::V4(_) => TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => TcpSocket::new_v6()?,
+        };
+        cluster_timers(&socket, tcp);
+        match socket.connect(address).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => failure = error,
+        }
+    }
+    Err(failure)
 }
 
 /// Whether an idle connection is still open, with nothing unread: a node

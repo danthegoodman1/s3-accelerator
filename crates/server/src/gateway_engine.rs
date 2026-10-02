@@ -629,7 +629,7 @@ mod tests {
         let config: crate::config::Config =
             toml::from_str("[cluster]\nsecret = \"s\"\nnodes = []\n[gateway]\nlisten = \"x\"\n")
                 .unwrap();
-        let peers = Peers::new(BTreeMap::new(), "s".into(), None);
+        let peers = Peers::new(BTreeMap::new(), "s".into(), None, Default::default());
         let metrics = Arc::new(Metrics::default());
         let engine = GatewayEngine::new(
             ring(1, &[0, 1]),

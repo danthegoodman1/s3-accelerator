@@ -45,5 +45,9 @@ hot_threshold = 1000
 # probe_rtt_ms, suspect_to_down_ms, down_grace_ms, gossip_period_ms.
 [membership]
 
+# TCP timers on links among gateways and nodes, when other than the
+# server's 5 ms: rto_min_us, delack_max_us; 0 keeps Linux's.
+[tcp]
+
 [log]
 level = "info"

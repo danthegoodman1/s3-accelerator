@@ -67,6 +67,31 @@ pub struct ClusterConfig {
     /// Gateways and nodes reach nodes over mutual TLS when set, and over
     /// plaintext otherwise.
     pub tls: Option<ClusterTlsConfig>,
+    #[serde(default)]
+    pub tcp: TcpConfig,
+}
+
+/// TCP timers on links among gateways and nodes, in microseconds; 0 keeps
+/// Linux's. A round trip within a zone takes well under a millisecond,
+/// while Linux waits at least 200 ms to resend a lost segment, and as long
+/// for a loss probe when an answer's last segment is lost: one lost packet
+/// would stall a read.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TcpConfig {
+    /// The least time before a lost segment is sent again.
+    pub rto_min_us: u32,
+    /// The most time an acknowledgement waits.
+    pub delack_max_us: u32,
+}
+
+impl Default for TcpConfig {
+    fn default() -> TcpConfig {
+        TcpConfig {
+            rto_min_us: 5_000,
+            delack_max_us: 5_000,
+        }
+    }
 }
 
 /// Mutual TLS among cluster members. Each presents a certificate the

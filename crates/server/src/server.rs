@@ -17,7 +17,7 @@ use crate::node_engine::{self, NodeEngine};
 use crate::origin;
 use crate::origins::Origins;
 use crate::passthrough::{self, ToNode};
-use crate::peers::{Exchanged, Peers};
+use crate::peers::{self, Exchanged, Peers};
 use crate::protocol::{self, NodeAnswer, NodeRequest, RequestId};
 use crate::sigv4::{self, AuthError, Credentials, Signable};
 use crate::sqs::Queue;
@@ -73,6 +73,8 @@ pub async fn serve(config: Config) -> io::Result<()> {
     if let Some(node) = &config.node {
         let address = &config.addresses()[&NodeId(node.id)];
         let listener = http::listen(address).await?;
+        // Connections it accepts inherit the timers from their handshake on.
+        peers::cluster_timers(&listener, config.cluster.tcp);
         log!(
             Info,
             "node listening",
@@ -148,7 +150,12 @@ pub async fn run_with(
         }
         None => None,
     };
-    let peers = Peers::new(config.addresses(), secret.clone(), connector);
+    let peers = Peers::new(
+        config.addresses(),
+        secret.clone(),
+        connector,
+        config.cluster.tcp,
+    );
     let admin = Admin::new(config.node.is_some());
     // One connection pool for origins and the metadata service.
     let http = origin::client();
@@ -537,7 +544,7 @@ async fn serve_loop(start: LoopStart) {
     } = start;
     let delays = tokio::task::spawn_local(measure_loop_delay(metrics.clone()));
     let secret: Rc<str> = config.cluster.secret.as_str().into();
-    let peers = Peers::new(config.addresses(), secret, connector);
+    let peers = Peers::new(config.addresses(), secret, connector, config.cluster.tcp);
     let gateway = GatewayEngine::new(
         config.ring(),
         config.cache.gateway_config(),

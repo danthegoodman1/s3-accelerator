@@ -480,6 +480,14 @@ MUTANTS = [
         [(SERVER, "let (copied, relayed) = match connection.kernel_tls() {", "let (copied, relayed) = match false {")],
     ),
     (
+        "nodes accept cluster links with Linux's 200 ms timers",
+        [(SERVER, "peers::cluster_timers(&listener, config.cluster.tcp);", "")],
+    ),
+    (
+        "gateways reach nodes with Linux's 200 ms timers",
+        [(PEERS, "cluster_timers(&socket, tcp);", "")],
+    ),
+    (
         "a client's signing key is kept across days",
         [(CLIENTS, "held.date.as_str(),\n                held.region.as_str(),", "date,\n                held.region.as_str(),")],
     ),

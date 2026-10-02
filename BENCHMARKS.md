@@ -209,11 +209,46 @@ Each node's figure counts object bytes; TCP, IP and Ethernet headers add about 0
 
 - **Small objects and ranges:** 21 times S3's request rate for small objects and 79 times for 4 KiB ranges at 64 connections, first byte under a millisecond. Nothing ran out: at 3.7 million ranges a second the client hosts were 42-44% busy and the node hosts 12%, while p99 rose to 22 ms. Small hits at 256 connections climbed from 407,000 to 632,000 a second over the step without a host near its limit. Both point at queueing in the request path, not at a resource.
 - **Large objects:** with one node process per host, the cache gave the clients 104 GiB/s at 16 connections and 115 GiB/s at 64, the clients' 1 Tb/s, each node sending about 170 Gb/s at 4% CPU; S3 gave 54 GiB/s at 64 connections and 109 at 256. At 256 connections the cache's reads queue at the clients' network cards, so its first byte waits 211 ms.
-- **Large objects across 192 ring members:** with 32 node processes per host, 256 MiB hits gave 43 GiB/s at 16 connections, 58 at 64, 50 at 128 and 13.5 at 256, where 667 reads timed out, with clients at 5-6% CPU and nodes at 1-2%. A gateway held 35,744 connections to nodes, most with receive windows near 250 KB. Phase 14 finds and fixes the cause.
+- **Large objects across 192 ring members:** with 32 node processes per host, 256 MiB hits gave 43 GiB/s at 16 connections, 58 at 64, 50 at 128 and 13.5 at 256, where 667 reads timed out, with clients at 5-6% CPU and nodes at 1-2%. A gateway held 35,744 connections to nodes, most with receive windows near 250 KB. A rerun on fresh hosts with the same layout did not collapse; see the next section.
 - **A cold set read three times** (`cold-medium`, about 870 GiB a pass): 20.5 GiB/s over the three passes; the block hit rate stays at zero while the first pass streams and the second admits, then holds at 100%.
 - **Errors:** S3 answered 67 of the 4.0 million direct requests with a 500, and one timed out; the cache passed on S3's 500s for 14 fills.
 
-`docs/scale-test.png` draws `scale-1proc`'s `hits-large-c64` and `scale`'s `ranges-4k-c64` over their measured windows: `loadtest/chart docs/scale-test.png "loadtest/runs/scale-1proc:hits-large-c64:TITLE" "loadtest/runs/scale:ranges-4k-c64:TITLE"`. In the large reads, first byte spikes to about 210 ms at p99 several times a minute: Linux's 200 ms minimum retransmission timeout, so packets were lost.
+`docs/scale-test.png` draws `ab-cluster`'s `hits-large-c64` and `ranges-4k-c64` over their measured windows: `loadtest/chart docs/scale-test.png "loadtest/runs/ab-cluster:hits-large-c64:TITLE" "loadtest/runs/ab-cluster:ranges-4k-c64:TITLE"`.
+
+### Cluster TCP timers, and a rerun on fresh hosts
+
+`ab-linux`, `ab-cluster` and `ab-20ms`: the scale test's hardware again, on new instances, with 32 node processes per host for every workload. The three runs share one deploy and differ only in the timers on links among gateways and nodes: Linux's (a 200 ms minimum retransmission timeout, and loss probes that allow for a 200 ms delayed ACK), the cluster's 5 ms for both, and a 20 ms floor with the 5 ms delayed ACK.
+
+| Workload | Timers | GiB/s | First byte p50 | p99 | p99.9 | Segments resent | Retransmission timeouts |
+|---|---|--:|--:|--:|--:|--:|--:|
+| 256 MiB objects, 16 connections | Linux | 110.63 | 1.40 ms | 3.57 ms | 7.17 ms | | |
+| | 5 ms | 115.84 | 1.81 ms | 6.01 ms | 9.79 ms | | |
+| | 20 ms floor | 115.79 | 1.72 ms | 5.47 ms | 24 ms | | |
+| 256 MiB objects, 64 connections | Linux | 115.22 | 2.90 ms | 15 ms | 213 ms | 14.8 million | 6,057 |
+| | 5 ms | 115.23 | 3.10 ms | 13 ms | 19 ms | 24.0 million | 13,562 |
+| | 20 ms floor | 115.30 | 3.01 ms | 18 ms | 31 ms | 25.4 million | 15,674 |
+| 256 MiB objects, 256 connections | Linux | 112.57 | 2.45 ms | 209 ms | 229 ms | 47.6 million | 176,917 |
+| | 5 ms | 105.99 | 3.52 ms | 24 ms | 42 ms | 85.9 million | 1,526,360 |
+| | 20 ms floor | 109.19 | 3.42 ms | 36 ms | 1,044 ms | 87.3 million | 1,101,104 |
+
+- **The tail at full network cards:** at 64 and 256 connections per client, the clients' cards drop packets past their allowance, and with Linux's timers each loss that a timeout recovers costs 200 ms: p99.9 of 213 ms at 64 connections, and p99 of 209 ms at 256. The 5 ms timers bring those to 19 ms and 24 ms. They resend about 1.8 times the segments, 4.7-5.6% of what each node sent at 256 connections against 2.7-2.9%, which costs 6% of throughput there.
+- **A 20 ms floor** resends as much as 5 ms but recovers more slowly: backed-off timeouts start from 20 ms, and p99.9 reached a second at 256 connections. The cluster keeps 5 ms.
+- **Small objects and ranges** lose nothing and see no change: no allowance drops, a few hundred resent segments a step, and rates within 6% across the three runs, which is the runs' own spread.
+
+With the 5 ms timers, the current defaults:
+
+| Workload | Requests/s | GiB/s | First byte p50 | p90 | p99 | p99.9 |
+|---|--:|--:|--:|--:|--:|--:|
+| 4-256 KiB objects, 64 connections | 1,383,218 | 79.90 | 0.39 ms | 0.53 ms | 0.68 ms | 0.88 ms |
+| 4-256 KiB objects, 256 connections | 1,977,807 | 114.25 | 0.80 ms | 1.94 ms | 4.00 ms | 6.82 ms |
+| 4 KiB ranges, 64 connections | 1,836,670 | 7.01 | 0.34 ms | 0.46 ms | 0.59 ms | 0.71 ms |
+| 4 KiB ranges, 256 connections | 4,621,169 | 17.63 | 0.52 ms | 0.74 ms | 1.07 ms | 1.62 ms |
+| 4 KiB ranges, 1,024 connections | 6,053,848 | 23.09 | 1.43 ms | 2.85 ms | 4.77 ms | 6.62 ms |
+| 256 MiB objects, 16 connections | 463 | 115.84 | 1.81 ms | 3.26 ms | 6.01 ms | 9.79 ms |
+| 256 MiB objects, 64 connections | 461 | 115.23 | 3.10 ms | 7.10 ms | 13 ms | 19 ms |
+| 256 MiB objects, 256 connections | 424 | 105.99 | 3.52 ms | 11 ms | 24 ms | 42 ms |
+
+**The first scale run's slowness did not recur.** With the same layout and Linux's timers, `ab-linux` served 3.9 times the small hits (1,472,009 a second against 373,341) and 1.7 times the 4 KiB ranges at 1,024 connections, with p99 under a millisecond at 64 connections where the first run saw 20 ms. Its large reads held 112.6 GiB/s at 256 connections, where the first run fell to 13.5 GiB/s with 667 timeouts. Every process's event loop ran on time in both runs, and the code differed only in the timers, which `ab-linux` left at Linux's. The first run's hosts are the likeliest difference, through the network between them, but nothing measured shows it: that run predates the report's TCP and network card counters.
 
 ### What limits each workload
 

@@ -17,31 +17,33 @@ A distributed NVMe read cache in front of S3. Clients keep their S3 SDKs and poi
   - [Admission on the second read](#admission-on-the-second-read)
   - [Consistency](#consistency)
 - [Operator guide](#operator-guide)
+  - [Tuning](#tuning)
 - [Development](#development)
 
 ![Two tests over time: 256 MiB objects and 4 KiB ranges, each with every storage node host's throughput, reads per second and block hit rate, and every client host's time to first byte](docs/scale-test.png)
 
-*Two tests from the scale run, each over its measured 100 seconds. Top: 256 MiB objects at 64 connections per client host, with one node process per storage host. Every node sends about 170 Gb/s, its share of the clients' 1 Tb/s, while first byte holds near 3 ms at p50; the p99 spikes near 210 ms are TCP retransmission timeouts. Bottom: 4 KiB ranges at 64 connections per client host, with 32 node processes per storage host: 1.64 million reads a second, first byte 0.38 ms at p50 and 0.65 ms at p99. Each line is one storage node host, except in the latency panels, where each pair is one client host.*
+*Two tests with the current defaults, each over its measured 100 seconds, on six storage hosts running 32 node processes each. Top: 256 MiB objects at 64 connections per client host. Every node sends about 170 Gb/s, its share of the clients' 1 Tb/s, with first byte near 3 ms at p50. Bottom: 4 KiB ranges at 64 connections per client host: 1.84 million reads a second, first byte 0.34 ms at p50 and 0.59 ms at p99. Each line is one storage node host, except in the latency panels, where each pair is one client host.*
 
 ## The scale test
 
-Ten c8in.16xlarge client hosts (64 vCPUs, 100 Gb/s each) read one dataset from S3 directly and through six m8idn.32xlarge storage nodes (128 vCPUs, 200 Gb/s and two NVMe drives each), in us-east-1. Each client host ran its own gateway as a sidecar. Connections are per client host; rates are totals over the ten.
+Ten c8in.16xlarge client hosts (64 vCPUs, 100 Gb/s each) read one dataset from S3 directly and through six m8idn.32xlarge storage hosts (128 vCPUs, 200 Gb/s and two NVMe drives each), each running 32 node processes, in us-east-1. Each client host ran its own gateway as a sidecar. Connections are per client host; rates are totals over the ten.
 
-| Workload | S3 directly | Through the cache |
-|---|---|---|
-| 4–256 KiB objects, 1 connection | 218/s; first byte p50 35 ms, p99 120 ms | 13,591/s; p50 0.66 ms, p99 1.2 ms |
-| 4–256 KiB objects, 64 connections | 17,595/s, 1.0 GiB/s; p50 25 ms, p99 110 ms | 373,341/s, 21.6 GiB/s; p50 0.49 ms, p99 20 ms |
-| 4 KiB ranges, 64 connections | 20,694/s; p50 26 ms, p99 98 ms | 1,642,343/s; p50 0.38 ms, p99 0.65 ms |
-| 4 KiB ranges, 1,024 connections | | 3,696,502/s; p50 1.0 ms, p99 22 ms |
-| 256 MiB objects, 16 connections | | 103.9 GiB/s; p50 1.2 ms, p99 3.3 ms |
-| 256 MiB objects, 64 connections | 54.3 GiB/s; p50 87 ms, p99 176 ms | 114.7 GiB/s; p50 2.8 ms, p99 11 ms |
-| 256 MiB objects, 256 connections | 109.5 GiB/s; p50 34 ms, p99 143 ms | 112.9 GiB/s; p50 211 ms, p99 420 ms |
+| Workload | S3 directly | Through the cache | Gain |
+|---|---|---|--:|
+| 4–256 KiB objects, 1 connection | 218/s; first byte p50 35 ms, p99 120 ms | 13,591/s; p50 0.66 ms, p99 1.2 ms | 62× |
+| 4–256 KiB objects, 64 connections | 17,595/s, 1.0 GiB/s; p50 25 ms, p99 110 ms | 1,383,218/s, 79.9 GiB/s; p50 0.39 ms, p99 0.68 ms | 79× |
+| 4 KiB ranges, 64 connections | 20,694/s; p50 26 ms, p99 98 ms | 1,836,670/s; p50 0.34 ms, p99 0.59 ms | 89× |
+| 4 KiB ranges, 1,024 connections | | 6,053,848/s; p50 1.4 ms, p99 4.8 ms | |
+| 256 MiB objects, 16 connections | | 115.8 GiB/s; p50 1.8 ms, p99 6.0 ms | |
+| 256 MiB objects, 64 connections | 54.3 GiB/s; p50 87 ms, p99 176 ms | 115.2 GiB/s; p50 3.1 ms, p99 13 ms | 2.1× |
+| 256 MiB objects, 256 connections | 109.5 GiB/s; p50 34 ms, p99 143 ms | 106.0 GiB/s; p50 3.5 ms, p99 24 ms | |
 
-- **Small objects and ranges:** 21 to 79 times S3's request rate at the same connections, with first bytes under a millisecond. These steps ran 32 node processes per host. Neither side ran out of CPU: at 3.7 million requests a second the client hosts were 44% busy and the storage hosts 12%, so the limit lies in queueing that the next phase looks into.
-- **Large objects:** the cache nearly fills the clients' 1 Tb/s of network at 16 connections per host and fills it at 64, with a first byte near a millisecond; S3 needs 256 connections to come close. At 256 connections both wait on the clients' network cards. These steps ran one node process per host: with 32 per host, a large read spreads over 192 ring members, and throughput fell from 43 GiB/s at 16 connections to 13.5 GiB/s at 256, with reads timing out. [PLAN.md](PLAN.md) Phase 14 fixes this.
-- **Errors:** S3 answered 67 of the 4.0 million direct requests with a 500, and one timed out. The cache passed on S3's 500s for 14 of its fills; apart from those and the large reads that timed out with 32 node processes per host, it answered every request.
+- **Small objects and ranges:** 79 to 89 times S3's request rate at the same connections, with p99 under a millisecond. At 6 million ranges a second the client hosts, each running a gateway and the load generator, were 80% busy and the storage hosts 18%: the clients set the limit.
+- **Large objects:** the cache fills the clients' 1 Tb/s of network at 16 connections per host, with first byte under 2 ms; S3 needs 256 connections to come close, at 34 ms. At 256 connections the clients' network cards drop packets past their allowance, and the cluster's [TCP timers](#tuning) keep the cost of each loss to milliseconds.
+- **Runs:** the S3 figures and the one-connection row come from the first scale run; the cache's other figures from a rerun on fresh hosts with the current defaults. The first run's cache was slower, with tails to 20 ms at 64 connections, and the rerun's was not; [BENCHMARKS.md](BENCHMARKS.md) has both and what differed.
+- **Errors:** S3 answered 67 of the 4.0 million direct requests with a 500, and one timed out. The cache answered every request of the rerun.
 
-[BENCHMARKS.md](BENCHMARKS.md) has every step, and `loadtest/plans/scale.toml` reruns it.
+`loadtest/plans/scale.toml` reruns it.
 
 ## What sets it apart
 
@@ -228,7 +230,7 @@ Blocks a previous owner supplies, blocks of a leased hot placement and blocks wa
 ### Sizing
 
 - **Storage nodes:** local NVMe and the largest network card you can buy. Large objects make a node network-bound: in the scale test each node sent about 170 Gb/s, its share of the clients' 1 Tb/s, at 4% CPU.
-- **Small requests:** a storage node runs its core on one thread, so small-request rates need several node processes per host, each with its own `id`, data directory, ports and a share of the host's weight. Until Phase 14 lands, many ring members slow large reads, so keep the count low where large objects dominate.
+- **Small requests:** a storage node runs its core on one thread, so small-request rates need several node processes per host, each with its own `id`, data directory, ports and a share of the host's weight. The scale test ran 32 on each 128-vCPU host for every workload.
 - **Gateways:** an event loop per core (`[gateway] threads`). Give a gateway at least as many client connections as loops.
 - **Memory:** a node's index takes about 390 bytes per 1 MiB block, so 4 TB of cache needs about 1.6 GB.
 
@@ -338,6 +340,34 @@ The admin listener serves Prometheus metrics at `/metrics`, and `/healthz` and `
 | `s3accel_node_admissions_total{result}` | Blocks admitted to disk (`stored`), and those the doorkeeper, the fill budget or a full disk refused |
 | `s3accel_ring_nodes`, `s3accel_ring_changes_total` | Membership as each process sees it |
 | `process_open_fds`, `process_max_fds` | How close a process runs to its descriptor limit |
+
+### Tuning
+
+**TCP timers on cluster links.** Network cards drop packets past their allowance, as client hosts' cards do once the cluster fills them, and Linux waits at least 200 ms to resend a lost segment. `[cluster.tcp]` shortens that on links among gateways and nodes, in microseconds; 0 keeps Linux's timers:
+
+```toml
+[cluster.tcp]
+rto_min_us = 5000      # the least time before a lost segment is sent again
+delack_max_us = 5000   # the most time an acknowledgement waits
+```
+
+256 MiB reads on the scale test's hardware, with the clients' network cards full:
+
+| Timers | 64 connections per client | 256 connections per client |
+|---|---|---|
+| 5 ms, the default | 115.2 GiB/s; p99 13 ms, p99.9 19 ms | 106.0 GiB/s; p99 24 ms, p99.9 42 ms |
+| Linux's (`0`) | 115.2 GiB/s; p99 15 ms, p99.9 213 ms | 112.6 GiB/s; p99 209 ms, p99.9 229 ms |
+| 20 ms floor | 115.3 GiB/s; p99 18 ms, p99.9 31 ms | 109.2 GiB/s; p99 36 ms, p99.9 1,044 ms |
+
+- Keep the default wherever a read's latency matters. Under loss it resends about twice as many segments as Linux's timers, which cost 6% of throughput with the cards full.
+- Set `0` for batch reads that only need throughput and can wait out a 200 ms tail.
+- Skip values in between: a 20 ms floor resends as much as 5 ms and recovers more slowly.
+- Small requests lose almost no packets, and saw no difference.
+- `ss -ti` shows each link's `rto:`, and the load test's report counts each host's resent segments, timeouts and dropped packets. The socket options need Linux 6.15 or later; an older kernel keeps its own timers.
+
+**Node processes per host.** A node process runs its core on one thread, so small-request rates grow with processes. The scale test ran 32 on each 128-vCPU storage host: 6 million 4 KiB reads a second with those hosts 18% busy, and large reads at the clients' network limit.
+
+**Gateways.** A gateway runs an event loop per core by default. At 6 million reads a second, the client hosts, each running a gateway beside the load generator, were 80% busy; give a sidecar gateway the cores its client's request rate needs.
 
 ## Development
 
